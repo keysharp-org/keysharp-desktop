@@ -186,9 +186,17 @@ static bool perform_handshake(client_context *client)
 
     if (read_line(client->descriptor, line, sizeof(line)) <= 0
         || sscanf(line, "%31s %15s %31s %8[0-9A-Fa-f] %15s %c",
-                  prefix, hello, backend_name, capability_text, mode, &extra) != 5
-        || strcmp(prefix, KSD_HANDSHAKE_PREFIX) != 0
-        || strcmp(hello, "HELLO") != 0
+                  prefix, hello, backend_name, capability_text, mode, &extra) != 5) {
+        (void)write_handshake_error(client->descriptor, "protocol", "invalid handshake");
+        return false;
+    }
+    if (strcmp(prefix, KSD_HANDSHAKE_PREFIX) != 0) {
+        (void)write_handshake_error(client->descriptor, "protocol",
+            strncmp(prefix, "KSDP/", sizeof("KSDP/") - 1u) == 0
+                ? "incompatible protocol version" : "invalid handshake");
+        return false;
+    }
+    if (strcmp(hello, "HELLO") != 0
         || strlen(capability_text) != 8u
         || sscanf(capability_text, "%x%c", &capabilities, &extra) != 1) {
         (void)write_handshake_error(client->descriptor, "protocol", "invalid handshake");
