@@ -140,6 +140,7 @@ signal.
 
 Clients speak the session protocol over the per-user broker socket. The wire
 contract is the installed header `keysharp_desktop/protocol.h`, and
+[docs/integrating.md](docs/integrating.md) is the integration guide, and
 [docs/protocol.md](docs/protocol.md) documents the handshake, message set, and
 compatibility rules. `src/desktopctl.c` is a complete worked client.
 
@@ -181,6 +182,7 @@ authenticated CLI above.
 
 | Document | Contents |
 |---|---|
+| [docs/integrating.md](docs/integrating.md) | Depending on and writing a client for the service |
 | [docs/protocol.md](docs/protocol.md) | Session protocol and compatibility rules |
 | [SECURITY.md](SECURITY.md) | Security boundary and reporting |
 | [docs/permission-store.md](docs/permission-store.md) | Shared on-disk grant contract |
