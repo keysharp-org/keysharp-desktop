@@ -28,6 +28,7 @@ refresh_invoking_user_manager() {
     invoking_runtime=/run/user/$invoking_uid
     runtime_metadata=$(/usr/bin/stat -Lc '%u %a' -- "$invoking_runtime" \
         2>/dev/null) || return 1
+    # shellcheck disable=SC2086 # deliberate split into uid and mode
     set -- $runtime_metadata
     [ "$1" = "$invoking_uid" ] && [ $((0$2 & 022)) -eq 0 ] \
         && [ ! -L "$invoking_runtime" ] \

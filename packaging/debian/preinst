@@ -28,6 +28,7 @@ case "${1:-}" in
             "/usr/local/share/systemd/user/keysharp-desktop.socket /usr/lib/systemd/user/keysharp-desktop.socket" \
             "/usr/local/lib/systemd/system/keysharp-desktop-authority.service /usr/lib/systemd/system/keysharp-desktop-authority.service" \
             "/usr/local/lib/systemd/system/keysharp-desktop-authority.socket /usr/lib/systemd/system/keysharp-desktop-authority.socket"; do
+            # shellcheck disable=SC2086 # deliberate split into portable and packaged paths
             set -- $mapping
             portable=$1
             portable_path_conflicts "$portable" "$2" || continue

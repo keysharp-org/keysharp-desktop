@@ -20,6 +20,7 @@ is_root_protected_chain() {
     current=$1
     while :; do
         metadata=$(stat -Lc '%u %a' -- "$current" 2>/dev/null) || return 1
+        # shellcheck disable=SC2086 # deliberate split into uid and mode
         set -- $metadata
         [ "$1" = 0 ] || return 1
         # Multi-user Nix uses a sticky, group-writable store root. Sticky-bit
@@ -219,6 +220,7 @@ refresh_invoking_user_manager() {
     invoking_runtime=/run/user/$invoking_uid
     runtime_metadata=$(/usr/bin/stat -Lc '%u %a' -- "$invoking_runtime" \
         2>/dev/null) || return 1
+    # shellcheck disable=SC2086 # deliberate split into uid and mode
     set -- $runtime_metadata
     [ "$1" = "$invoking_uid" ] && [ $((0$2 & 022)) -eq 0 ] \
         && [ ! -L "$invoking_runtime" ] \
@@ -545,6 +547,7 @@ if layered_install_present; then
     exit 1
 fi
 
+# shellcheck disable=SC1007 # CDPATH= is a prefix assignment scoped to cd
 archive_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 payload="$archive_root/payload/usr/local"
 policy="$archive_root/payload/usr/share/polkit-1/actions/org.keysharp.desktop.policy"
