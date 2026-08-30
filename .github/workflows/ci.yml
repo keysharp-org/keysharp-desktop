@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Detect locked Nix packaging
+        id: nix_lock
+        shell: bash
+        run: echo "present=$([[ -f flake.lock ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: cachix/install-nix-action@v31
+        if: steps.nix_lock.outputs.present == 'true'
+      - name: Validate Nix flake
+        if: steps.nix_lock.outputs.present == 'true'
+        run: nix flake check --no-write-lock-file
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: Linux ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build gcc pkg-config libglib2.0-dev polkitd shellcheck
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=/usr/local
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Validate provider JavaScript
+        run: |
+          node --input-type=module --check < providers/gnome/extension.js
+          node --input-type=module --check < providers/cinnamon/extension.js
+
+      - name: Check lifecycle scripts
+        run: >-
+          shellcheck install.sh uninstall.sh packaging/install-release.sh
+          packaging/debian/preinst packaging/debian/postinst
+          packaging/debian/prerm packaging/debian/postrm
+
+      - name: Validate install tree and Debian package
+        env:
+          DESTDIR: ${{ runner.temp }}/keysharp-desktop-install
+        run: |
+          chmod +x install.sh uninstall.sh packaging/install-release.sh \
+            packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
+          cmake --install build
+          test -x "$DESTDIR/usr/local/bin/keysharp-desktop"
+          for resource in \
+            lib/systemd/user/keysharp-desktop.service \
+            lib/systemd/user/keysharp-desktop.socket \
+            lib/systemd/system/keysharp-desktop-authority.service \
+            lib/systemd/system/keysharp-desktop-authority.socket \
+            lib/tmpfiles.d/keysharp-desktop-permissions.conf; do
+            test -f "$DESTDIR/usr/local/$resource"
+          done
+          cmake -S . -B build-deb -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_TESTING=OFF
+          cmake --build build-deb --parallel
+          cpack -G DEB --config build-deb/CPackConfig.cmake -B build-deb/packages
+          dpkg-deb --info build-deb/packages/*.deb
+          dpkg-deb --contents build-deb/packages/*.deb | grep -q './usr/bin/keysharp-desktop'
+          if dpkg-deb --contents build-deb/packages/*.deb | grep -q './usr/local/'; then
+            echo 'Debian package unexpectedly contains /usr/local paths.' >&2
+            exit 1
+          fi

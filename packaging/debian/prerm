@@ -1,0 +1,65 @@
+#!/bin/sh
+set -e
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
+
+stop_invoking_user_manager() {
+    invoking_uid=${SUDO_UID:-}
+    case "$invoking_uid" in
+        ''|*[!0-9]*|0) return 1 ;;
+    esac
+    [ -x /usr/bin/getent ] && [ -x /usr/bin/awk ] && [ -x /usr/bin/stat ] \
+        && [ -x /usr/sbin/runuser ] && [ -x /usr/bin/env ] \
+        && [ -x /usr/bin/systemctl ] || return 1
+    passwd_entry=$(/usr/bin/getent passwd "$invoking_uid" 2>/dev/null) || return 1
+    invoking_name=$(printf '%s\n' "$passwd_entry" | /usr/bin/awk -F: \
+        -v expected="$invoking_uid" '$3 == expected { print $1; exit }')
+    invoking_home=$(printf '%s\n' "$passwd_entry" | /usr/bin/awk -F: \
+        -v expected="$invoking_uid" '$3 == expected { print $6; exit }')
+    case "$invoking_name" in
+        ''|-*|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    case "$invoking_home" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    invoking_runtime=/run/user/$invoking_uid
+    runtime_metadata=$(/usr/bin/stat -Lc '%u %a' -- "$invoking_runtime" \
+        2>/dev/null) || return 1
+    set -- $runtime_metadata
+    [ "$1" = "$invoking_uid" ] && [ $((0$2 & 022)) -eq 0 ] \
+        && [ ! -L "$invoking_runtime" ] \
+        && [ -S "$invoking_runtime/bus" ] \
+        && [ ! -L "$invoking_runtime/bus" ] \
+        && [ "$(/usr/bin/stat -Lc '%u' -- "$invoking_runtime/bus" \
+            2>/dev/null)" = "$invoking_uid" ] || return 1
+    /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
+        HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
+        LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
+        /usr/bin/systemctl --user --no-pager stop keysharp-desktop.service \
+        keysharp-desktop.socket >/dev/null 2>&1 || return 1
+    /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
+        HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
+        LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
+        /usr/bin/systemctl --user --no-pager daemon-reload >/dev/null 2>&1
+}
+
+if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
+    if ! stop_invoking_user_manager; then
+        printf '%s\n' \
+            "keysharp-desktop: no active invoking user manager was safely stopped." >&2
+    fi
+    printf '%s\n' \
+        "keysharp-desktop: other logged-in users were not contacted; each should log out or run:" \
+        "  systemctl --user stop keysharp-desktop.service keysharp-desktop.socket" \
+        "  systemctl --user daemon-reload"
+    systemctl disable --now keysharp-desktop-authority.socket \
+        keysharp-desktop-authority.service >/dev/null 2>&1 || true
+    systemctl --global disable keysharp-desktop.socket >/dev/null 2>&1 || true
+fi
+
+exit 0

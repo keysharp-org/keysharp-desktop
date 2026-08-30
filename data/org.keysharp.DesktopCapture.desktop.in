@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Keysharp Desktop Broker
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop serve
+NoDisplay=true
+X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2

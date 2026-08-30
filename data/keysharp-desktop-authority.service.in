@@ -1,0 +1,19 @@
+[Unit]
+Description=Keysharp desktop authorization authority
+Documentation=https://github.com/keysharp-org/keysharp-desktop
+Requires=keysharp-desktop-authority.socket
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop authority
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/keysharp-permissions /run/keysharp-desktop /run/keysharp-permissions
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_ALG
+LockPersonality=true

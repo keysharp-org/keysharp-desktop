@@ -1,0 +1,12 @@
+[Unit]
+Description=Keysharp desktop broker socket
+
+[Socket]
+ListenStream=%t/keysharp-desktop/keysharp-desktop.sock
+Accept=no
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
