@@ -1,88 +1,86 @@
-#include "common.h"
-#include "keysharp_desktop/protocol.h"
+#include "protocol.h"
+#include "protocol_io.h"
 
 #include <assert.h>
-#include <fcntl.h>
-#include <stdio.h>
 #include <string.h>
-#include <unistd.h>
+
+static ksd_frame frame(uint16_t opcode, uint16_t flags, uint64_t request_id)
+{
+    ksd_frame value = {
+        .magic = {
+            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+        },
+        .major = KSD_PROTOCOL_MAJOR,
+        .minor = KSD_PROTOCOL_MINOR,
+        .opcode = opcode,
+        .flags = flags,
+        .request_id = request_id,
+    };
+    return value;
+}
+
+static bool packed_frame_is_valid(ksd_frame *value)
+{
+    static const uint8_t magic[4] = {
+        KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+        KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+    };
+    ksd_buffer packed;
+    ksd_frame decoded;
+    ksd_buffer_init(&packed, 1024u);
+    assert(ksd_frame_pack(value, &packed));
+    bool valid = ksd_frame_unpack(packed.data, packed.length, magic,
+        KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, 1024u, true, &decoded);
+    if (valid)
+        ksd_frame_clear(&decoded);
+    ksd_buffer_clear(&packed);
+    return valid;
+}
 
 int main(void)
 {
-    char capability_names[160];
-    char display_text[32];
-    static const char zero_sha256[] =
-        "0000000000000000000000000000000000000000000000000000000000000000";
-    char app_hash[KSD_HASH_HEX_LENGTH + 1u];
-    ksd_process_identity identity;
-    uint64_t start_time = ksd_process_start_time(getpid());
-    int system_executable = open("/usr/bin/env", O_RDONLY | O_CLOEXEC);
+    assert(KSD_PROTOCOL_MAJOR == 2u);
+    assert(KSD_PROTOCOL_MINOR == 0u);
+    assert(strcmp(KSD_CLIENT_PROTOCOL_NAME, "keysharp-desktop/client") == 0);
+    assert(KSD_FRAME_HEADER_SIZE == 24u);
+    assert(KSD_FRAME_REQUEST_ID_OFFSET == 16u);
+    assert(KSD_OPERATION_CAPTURE_AREA == (UINT64_C(1) << 0u));
+    assert(KSD_OPERATION_CLIPBOARD_WATCH == (UINT64_C(1) << 21u));
+    assert(KSD_OPERATION_MOUSE_MOVE_ABSOLUTE == (UINT64_C(1) << 22u));
+    assert(KSD_OPERATION_MOUSE_SCROLL == (UINT64_C(1) << 25u));
+    assert(KSD_OPERATION_CURSOR_POSITION == (UINT64_C(1) << 26u));
+    assert(KSD_OPERATION_WORK_AREA == (UINT64_C(1) << 27u));
 
-    assert(KSD_PROTOCOL_MAJOR == 1u);
-    assert(KSD_PROTOCOL_MINOR == 2u);
-    assert(strcmp(KSD_PROTOCOL_LABEL, "keysharp-desktop/session-v1") == 0);
-    assert(KSD_CAP_SCREEN_CAPTURE == 1u);
-    assert(KSD_CAP_WINDOW_MONITORING == 2u);
-    assert(KSD_CAP_WINDOW_CONTROL == 4u);
-    assert(KSD_CAP_AUDIO_CAPTURE == 8u);
-    assert(KSD_CAP_CAMERA_CAPTURE == 16u);
-    assert(KSD_CAP_CLIPBOARD_MONITORING == 32u);
-    assert(KSD_CAP_ALL == 63u);
-    assert((KSD_CAP_ALL & 64u) == 0u);
-    assert(KSP_SCOPE_INPUT_MONITORING == 1u);
-    assert(KSP_SCOPE_INPUT_CONTROL == 2u);
-    assert(KSP_SCOPE_WINDOW_MONITORING == 4u);
-    assert(KSP_SCOPE_WINDOW_CONTROL == 8u);
-    assert(KSP_SCOPE_SCREEN_CAPTURE == 16u);
-    assert(KSP_SCOPE_AUDIO_CAPTURE == 32u);
-    assert(KSP_SCOPE_CAMERA_CAPTURE == 64u);
-    assert(KSP_SCOPE_CLIPBOARD_MONITORING == 128u);
-    assert(ksd_format_capability_names(KSD_CAP_ALL, capability_names,
-                                       sizeof(capability_names)) == 0);
-    assert(strcmp(capability_names,
-        "Screen Capture, Window Monitoring, Window Control, Audio Capture, "
-        "Camera Capture, Clipboard Monitoring") == 0);
-    assert(ksd_format_capability_names(KSD_CAP_WINDOW_MONITORING
-                                       | KSD_CAP_CAMERA_CAPTURE,
-                                       capability_names,
-                                       sizeof(capability_names)) == 0);
-    assert(strcmp(capability_names,
-                  "Window Monitoring, Camera Capture") == 0);
-    assert(ksd_format_capability_names(0u, capability_names,
-                                       sizeof(capability_names)) < 0);
-    assert(ksd_format_capability_names(0x80000000u, capability_names,
-                                       sizeof(capability_names)) < 0);
-    assert(ksd_format_capability_names(KSD_CAP_SCREEN_CAPTURE,
-                                       capability_names, 4u) < 0);
-    assert(strcmp(KSD_APP_IDENTITY_DOMAIN, "org.keysharp.app-identity-v1") == 0);
-    assert(sizeof(ksd_authority_request) == 16u);
-    assert(sizeof(ksd_authority_response) == 16u);
-    assert(KSD_AUTH_OP_LIST_UID == 4u);
-    assert(KSD_AUTH_OP_REVOKE == 5u);
-    assert(system_executable >= 0);
-    assert(ksd_executable_path_is_protected(system_executable, "/usr/bin/env"));
-    assert(!ksd_executable_path_is_protected(system_executable, "/tmp/env"));
-    close(system_executable);
+    ksd_frame request = frame(KSD_OP_HELLO, 0u, 1u);
+    assert(packed_frame_is_valid(&request));
+    ksd_frame response = frame(KSD_OP_HELLO, KSD_FLAG_RESPONSE, 1u);
+    assert(packed_frame_is_valid(&response));
+    ksd_frame event = frame(KSD_OP_SESSION_REVOKED, KSD_FLAG_EVENT, 0u);
+    assert(packed_frame_is_valid(&event));
+    ksd_frame ping = frame(KSD_OP_PING, 0u, 0u);
+    assert(packed_frame_is_valid(&ping));
 
-    ksd_sanitize_display_text("/tmp/line\nname\177", display_text,
-                              sizeof(display_text));
-    assert(strcmp(display_text, "/tmp/line?name?") == 0);
-    assert(ksd_hash_app_identity(KSD_APP_IDENTITY_PATH_KIND,
-                                 "/usr/bin/example-app", strlen("/usr/bin/example-app"),
-                                 app_hash) == 0);
-    assert(strcmp(app_hash,
-        "a39558ae92a7f5227560ccf6e10e2941aeeceb8a3b608b4fea274f98dc41f1ae") == 0);
-    assert(ksd_hash_app_identity(KSD_APP_IDENTITY_SHA256_KIND,
-                                 zero_sha256, strlen(zero_sha256), app_hash) == 0);
-    assert(strcmp(app_hash,
-        "73cd7ab5e10d259a782b6e021af8326514447477af0358481ee31fc5fee7d434") == 0);
-    assert(start_time != 0u);
-    assert(ksd_identify_process(getpid(), getuid(), start_time, &identity) == 0);
-    assert(identity.uid == getuid());
-    assert(identity.pid == getpid());
-    assert(identity.start_time == start_time);
-    assert(strlen(identity.hash) == KSD_HASH_HEX_LENGTH);
-    assert(identity.executable[0] == '/');
-    puts("protocol tests passed");
+    request.request_id = 0u;
+    assert(!packed_frame_is_valid(&request));
+    response.request_id = 0u;
+    assert(!packed_frame_is_valid(&response));
+    event.request_id = 1u;
+    assert(!packed_frame_is_valid(&event));
+    event.request_id = 0u;
+    event.flags = KSD_FLAG_EVENT | KSD_FLAG_RESPONSE;
+    assert(!packed_frame_is_valid(&event));
+    event.flags = KSD_FLAG_MORE;
+    assert(!packed_frame_is_valid(&event));
+    event.flags = 0x8000u;
+    assert(!packed_frame_is_valid(&event));
+
+    static const uint8_t valid_utf8[] = { 'a', 0xe2u, 0x82u, 0xacu };
+    static const uint8_t overlong[] = { 0xc0u, 0x80u };
+    static const uint8_t surrogate[] = { 0xedu, 0xa0u, 0x80u };
+    assert(ksd_utf8_valid(valid_utf8, sizeof(valid_utf8), false));
+    assert(!ksd_utf8_valid(overlong, sizeof(overlong), false));
+    assert(!ksd_utf8_valid(surrogate, sizeof(surrogate), false));
+    assert(!ksd_utf8_valid((const uint8_t *)"a\0b", 3u, false));
     return 0;
 }

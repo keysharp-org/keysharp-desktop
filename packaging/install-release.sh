@@ -11,11 +11,6 @@ usage() {
     printf '%s\n' "usage: sudo $0 [--skip-if-compatible]"
 }
 
-protocol_version_compatible() {
-    [ "$1" = keysharp-desktop/session-v1 ] \
-        && [ "$2" = 1 ] && [ "$3" = 2 ]
-}
-
 is_root_protected_chain() {
     current=$1
     while :; do
@@ -48,6 +43,78 @@ is_root_protected_file() {
     [ -f "$resource_resolved" ] && [ -s "$resource_resolved" ] || return 1
     is_root_protected_chain "$1" \
         && is_root_protected_chain "$resource_resolved"
+}
+
+library_payload_under() {
+    library_root=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    soname_link=$library_root/lib/libkeysharp-desktop.so.0
+    [ -L "$soname_link" ] || return 1
+    library_resolved=$(readlink -f -- "$soname_link" 2>/dev/null) || return 1
+    case "$library_resolved" in
+        "$library_root"/lib/libkeysharp-desktop.so.0.*) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$library_resolved" ] && [ ! -L "$library_resolved" ] \
+        && [ -s "$library_resolved" ] || return 1
+    printf '%s\n' "$library_resolved"
+}
+
+portable_library_payload() {
+    portable_library=$(library_payload_under /usr/local) || return 1
+    is_root_protected_file "$portable_library" || return 1
+    printf '%s\n' "$portable_library"
+}
+
+atomic_install_file() {
+    atomic_source=$1
+    atomic_destination=$2
+    atomic_mode=$3
+    atomic_directory=${atomic_destination%/*}
+    [ "$atomic_directory" != "$atomic_destination" ] || return 1
+    atomic_temporary=$(mktemp "$atomic_directory/.keysharp-install.XXXXXX") \
+        || return 1
+    if install -m "$atomic_mode" "$atomic_source" "$atomic_temporary" \
+        && mv -f -- "$atomic_temporary" "$atomic_destination"; then
+        atomic_temporary=
+        return 0
+    fi
+    rm -f -- "$atomic_temporary"
+    atomic_temporary=
+    return 1
+}
+
+atomic_install_symlink() {
+    atomic_link_source=$1
+    atomic_link_destination=$2
+    [ -L "$atomic_link_source" ] || return 1
+    atomic_link_target=$(readlink -- "$atomic_link_source") || return 1
+    case "$atomic_link_target" in
+        ''|/*|*/*) return 1 ;;
+    esac
+    atomic_link_directory=${atomic_link_destination%/*}
+    [ "$atomic_link_directory" != "$atomic_link_destination" ] || return 1
+    atomic_temporary=$(mktemp "$atomic_link_directory/.keysharp-link.XXXXXX") \
+        || return 1
+    rm -f -- "$atomic_temporary"
+    if ln -s -- "$atomic_link_target" "$atomic_temporary" \
+        && mv -f -- "$atomic_temporary" "$atomic_link_destination"; then
+        atomic_temporary=
+        return 0
+    fi
+    rm -f -- "$atomic_temporary"
+    atomic_temporary=
+    return 1
+}
+
+is_root_private_executable() {
+    private_path=$1
+    [ ! -L "$private_path" ] && [ -f "$private_path" ] \
+        && [ -x "$private_path" ] || return 1
+    metadata=$(stat -Lc '%u %a' -- "$private_path" 2>/dev/null) || return 1
+    # shellcheck disable=SC2086 # deliberate split into uid and mode
+    set -- $metadata
+    [ "$1" = 0 ] && [ "$2" = 700 ] \
+        && is_root_protected_chain "$private_path"
 }
 
 policy_configuration_matches() {
@@ -113,9 +180,7 @@ tmpfiles_configuration_matches() {
 
 desktop_entry_configuration_matches() {
     [ -s "$1" ] || return 1
-    alternate_binary=${3:-$2}
-    awk -F= -v expected_exec="$2 serve" \
-        -v alternate_exec="$alternate_binary serve" '
+    awk -F= -v expected_exec="$2" '
         /^[[:space:]]*\[/ {
             section = $0
             sub(/^[[:space:]]*/, "", section)
@@ -136,7 +201,7 @@ desktop_entry_configuration_matches() {
                 if (value != "Application") invalid = 1
             } else if (key == "Exec") {
                 execs++
-                if (value != expected_exec && value != alternate_exec) invalid = 1
+                if (value != expected_exec) invalid = 1
             } else if (key == "NoDisplay") {
                 hidden++
                 if (value != "true") invalid = 1
@@ -197,7 +262,7 @@ is_component_package_installed() {
 }
 
 refresh_invoking_user_manager() {
-    restart_broker=$1
+    restart_daemon=$1
     invoking_uid=${SUDO_UID:-}
     case "$invoking_uid" in
         ''|*[!0-9]*|0) return 1 ;;
@@ -234,7 +299,7 @@ refresh_invoking_user_manager() {
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
         /usr/bin/systemctl --user --no-pager daemon-reload >/dev/null 2>&1 \
         || return 1
-    if [ "$restart_broker" = true ]; then
+    if [ "$restart_daemon" = true ]; then
         /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
             HOME="$invoking_home" USER="$invoking_name" \
             LOGNAME="$invoking_name" LANG=C PATH=/usr/bin:/bin \
@@ -247,22 +312,21 @@ refresh_invoking_user_manager() {
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
-        /usr/bin/systemctl --user --no-pager start keysharp-desktop.socket \
+        /usr/bin/systemctl --user --no-pager start keysharp-desktop.service \
         >/dev/null 2>&1
 }
 
-refresh_or_handoff_user_socket() {
-    restart_broker=$1
-    if refresh_invoking_user_manager "$restart_broker"; then
+refresh_or_handoff_user_service() {
+    restart_daemon=$1
+    if refresh_invoking_user_manager "$restart_daemon"; then
         printf '%s\n' \
             "Refreshed keysharp-desktop for the invoking user's active session."
     else
         printf '%s\n' \
             "No active invoking user manager was safely resolved." \
-            "New logins start the globally enabled socket; already logged-in users should run:" \
+            "New logins start the globally enabled service; already logged-in users should run:" \
             "  systemctl --user daemon-reload" \
-            "  systemctl --user try-restart keysharp-desktop.service" \
-            "  systemctl --user start keysharp-desktop.socket"
+            "  systemctl --user restart keysharp-desktop.service"
     fi
     printf '%s\n' \
         "Other logged-in users are not refreshed automatically; after an upgrade they should run:" \
@@ -273,9 +337,11 @@ refresh_or_handoff_user_socket() {
 
 has_required_resources() {
     resource_root=$1
+    [ -f "$resource_root/libexec/keysharp-desktop-capture-worker" ] \
+        && [ -x "$resource_root/libexec/keysharp-desktop-capture-worker" ] \
+        || return 1
     for relative in \
         lib/systemd/user/keysharp-desktop.service \
-        lib/systemd/user/keysharp-desktop.socket \
         lib/systemd/system/keysharp-desktop-authority.service \
         lib/systemd/system/keysharp-desktop-authority.socket \
         lib/tmpfiles.d/keysharp-desktop-permissions.conf \
@@ -293,23 +359,26 @@ resource_configuration_matches() {
     resource_root=$1
     expected_binary=$2
     policy_path=$3
-    alternate_binary=${4:-$2}
+    worker_prefix=${expected_binary%/bin/keysharp-desktop}
+    [ "$worker_prefix" != "$expected_binary" ] || return 1
+    expected_worker=$worker_prefix/libexec/keysharp-desktop-capture-worker
     has_required_resources "$resource_root" \
         && policy_configuration_matches "$policy_path" \
         && tmpfiles_configuration_matches \
             "$resource_root/lib/tmpfiles.d/keysharp-desktop-permissions.conf" \
         && desktop_entry_configuration_matches \
             "$resource_root/share/applications/org.keysharp.DesktopCapture.desktop" \
-            "$expected_binary" "$alternate_binary"
+            "$expected_worker"
 }
 
 installed_resources_are_protected() {
     resource_root=$1
     policy_path=$2
     is_root_protected_file "$policy_path" || return 1
+    is_root_private_executable \
+        "$resource_root/libexec/keysharp-desktop-capture-worker" || return 1
     for relative in \
         lib/systemd/user/keysharp-desktop.service \
-        lib/systemd/user/keysharp-desktop.socket \
         lib/systemd/system/keysharp-desktop-authority.service \
         lib/systemd/system/keysharp-desktop-authority.socket \
         lib/tmpfiles.d/keysharp-desktop-permissions.conf \
@@ -410,19 +479,6 @@ global_user_service_exec_matches() {
         && [ "$service_exec" = "$service_path $3" ]
 }
 
-global_user_socket_matches() {
-    unit_path=$(global_user_unit_path "$1") || return 1
-    listen_stream=$(unit_property "$unit_path" Socket ListenStream)
-    accept=$(unit_property "$unit_path" Socket Accept)
-    socket_mode=$(unit_property "$unit_path" Socket SocketMode)
-    directory_mode=$(unit_property "$unit_path" Socket DirectoryMode)
-    [ -n "$accept" ] || accept=no
-    [ "$listen_stream" = "$2" ] \
-        && [ "$accept" = no ] \
-        && [ "$socket_mode" = "$3" ] \
-        && [ "$directory_mode" = "$4" ]
-}
-
 systemd_exec_matches() {
     unit=$1
     expected=$2
@@ -450,7 +506,39 @@ systemd_socket_matches() {
         && [ "$(systemctl show --property=SocketMode --value "$1" 2>/dev/null || true)" \
             = "$3" ] \
         && [ "$(systemctl show --property=DirectoryMode --value "$1" 2>/dev/null || true)" \
-            = "$4" ]
+            = "$4" ] \
+        && [ "$(systemctl show --property=FileDescriptorName --value "$1" 2>/dev/null || true)" \
+            = "$5" ]
+}
+
+component_contract_matches() {
+    contract=$("$1" info 2>/dev/null) || return 1
+    abi_major=$(printf '%s\n' "$contract" \
+        | sed -n 's/^client_abi_major=\([0-9][0-9]*\)$/\1/p')
+    abi_minor=$(printf '%s\n' "$contract" \
+        | sed -n 's/^client_abi_minor=\([0-9][0-9]*\)$/\1/p')
+    [ "$abi_major" = 0 ] && [ -n "$abi_minor" ] \
+        && [ "$abi_minor" -ge 1 ]
+}
+
+has_client_artifacts() {
+    client_prefix=$1
+    for required in \
+        lib/libkeysharp-desktop.so \
+        lib/libkeysharp-desktop.so.0 \
+        include/keysharp_desktop/client.h \
+        lib/pkgconfig/keysharp-desktop.pc \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopConfig.cmake \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopConfigVersion.cmake \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopTargets.cmake; do
+        [ -f "$client_prefix/$required" ] \
+            || [ -L "$client_prefix/$required" ] || return 1
+    done
+    for target_configuration in \
+        "$client_prefix/lib/cmake/KeysharpDesktop/KeysharpDesktopTargets-"*.cmake; do
+        [ -f "$target_configuration" ] && return 0
+    done
+    return 1
 }
 
 installation_complete() {
@@ -458,14 +546,31 @@ installation_complete() {
     resolved=$(readlink -f -- "$component_binary" 2>/dev/null) || return 1
     install_prefix=${resolved%/bin/keysharp-desktop}
     [ "$install_prefix" != "$resolved" ] || return 1
+    has_client_artifacts "$install_prefix" || return 1
+    for required in \
+        lib/libkeysharp-desktop.so \
+        lib/libkeysharp-desktop.so.0 \
+        include/keysharp_desktop/client.h \
+        lib/pkgconfig/keysharp-desktop.pc \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopConfig.cmake \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopConfigVersion.cmake \
+        lib/cmake/KeysharpDesktop/KeysharpDesktopTargets.cmake; do
+        is_root_protected_file "$install_prefix/$required" || return 1
+    done
+    targets_configuration=false
+    for target_configuration in \
+        "$install_prefix/lib/cmake/KeysharpDesktop/KeysharpDesktopTargets-"*.cmake; do
+        [ -e "$target_configuration" ] || continue
+        is_root_protected_file "$target_configuration" || return 1
+        targets_configuration=true
+    done
+    [ "$targets_configuration" = true ] || return 1
+    component_contract_matches "$resolved" || return 1
     command -v systemctl >/dev/null 2>&1 || return 1
     global_user_unit_available keysharp-desktop.service || return 1
-    global_user_unit_available keysharp-desktop.socket || return 1
-    global_user_unit_enabled keysharp-desktop.socket || return 1
-    global_user_service_exec_matches keysharp-desktop.service "$resolved" serve \
+    global_user_unit_enabled keysharp-desktop.service || return 1
+    global_user_service_exec_matches keysharp-desktop.service "$resolved" daemon \
         || return 1
-    global_user_socket_matches keysharp-desktop.socket \
-        %t/keysharp-desktop/keysharp-desktop.sock 0600 0700 || return 1
 
     case "$install_prefix" in
         /usr/local) policy=/usr/share/polkit-1/actions/org.keysharp.desktop.policy ;;
@@ -473,13 +578,13 @@ installation_complete() {
         *) policy="$install_prefix/share/polkit-1/actions/org.keysharp.desktop.policy" ;;
     esac
     resource_configuration_matches \
-        "$install_prefix" "$resolved" "$policy" "$component_binary" \
+        "$install_prefix" "$resolved" "$policy" \
         && installed_resources_are_protected "$install_prefix" "$policy" \
         || return 1
 
-    systemd_exec_matches keysharp-desktop-authority.service "$resolved" authority \
+    systemd_exec_matches keysharp-desktop-authority.service "$resolved" authority-daemon \
         && systemd_socket_matches keysharp-desktop-authority.socket \
-            /run/keysharp-desktop/authority.sock 0666 0755
+            /run/keysharp-desktop/keysharp-desktop.sock 0666 0755 public
 }
 
 layered_install_present() {
@@ -519,22 +624,10 @@ if [ "$skip_compatible" = true ]; then
         /run/current-system/sw/bin/keysharp-desktop \
         /usr/local/bin/keysharp-desktop; do
         is_root_protected_executable "$candidate" || continue
-        installed_info=$("$candidate" version 2>/dev/null || true)
-        installed_protocol=$(printf '%s\n' "$installed_info" \
-            | sed -n 's/^protocol_name=//p' | sed -n '1p')
-        installed_major=$(printf '%s\n' "$installed_info" \
-            | sed -n 's/^protocol_major=//p' | sed -n '1p')
-        installed_minor=$(printf '%s\n' "$installed_info" \
-            | sed -n 's/^protocol_minor=//p' | sed -n '1p')
-        case "$installed_minor" in
-            ''|*[!0-9]*) installed_minor=0 ;;
-        esac
-        if protocol_version_compatible "$installed_protocol" \
-            "$installed_major" "$installed_minor" \
-            && installation_complete "$candidate"; then
+        if installation_complete "$candidate"; then
             printf '%s\n' \
                 "A compatible keysharp-desktop is already installed; leaving it unchanged."
-            refresh_or_handoff_user_socket false
+            refresh_or_handoff_user_service false
             exit 0
         fi
     done
@@ -551,7 +644,11 @@ fi
 archive_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 payload="$archive_root/payload/usr/local"
 policy="$archive_root/payload/usr/share/polkit-1/actions/org.keysharp.desktop.policy"
+payload_library=$(library_payload_under "$payload" || true)
 if [ ! -x "$payload/bin/keysharp-desktop" ] \
+    || [ ! -x "$payload/libexec/keysharp-desktop-capture-worker" ] \
+    || [ -z "$payload_library" ] \
+    || ! has_client_artifacts "$payload" \
     || ! resource_configuration_matches \
         "$payload" /usr/local/bin/keysharp-desktop "$policy" \
     || [ ! -x "$archive_root/uninstall.sh" ]; then
@@ -560,13 +657,44 @@ if [ ! -x "$payload/bin/keysharp-desktop" ] \
 fi
 
 install -d -m 0755 /usr/local
-cp -R "$payload/." /usr/local/
+previous_library=$(portable_library_payload || true)
+install_staging=$(mktemp -d /usr/local/.keysharp-desktop-install.XXXXXX)
+atomic_temporary=
+cleanup_install_temporaries() {
+    [ -z "$atomic_temporary" ] || rm -f -- "$atomic_temporary"
+    [ -z "$install_staging" ] || rm -rf -- "$install_staging"
+}
+trap cleanup_install_temporaries EXIT HUP INT TERM
+cp -R "$payload/." "$install_staging/"
+payload_library_name=${payload_library##*/}
+rm -f -- \
+    "$install_staging/bin/keysharp-desktop" \
+    "$install_staging/libexec/keysharp-desktop-capture-worker" \
+    "$install_staging/lib/libkeysharp-desktop.so" \
+    "$install_staging/lib/libkeysharp-desktop.so.0" \
+    "$install_staging/lib/$payload_library_name"
+cp -R "$install_staging/." /usr/local/
+rm -rf -- "$install_staging"
+install_staging=
 install -D -m 0644 "$policy" \
     /usr/share/polkit-1/actions/org.keysharp.desktop.policy
-chown root:root /usr/local/bin/keysharp-desktop
-chmod 0755 /usr/local/bin/keysharp-desktop
+atomic_install_file "$payload_library" \
+    "/usr/local/lib/$payload_library_name" 0755
+atomic_install_symlink "$payload/lib/libkeysharp-desktop.so.0" \
+    /usr/local/lib/libkeysharp-desktop.so.0
+atomic_install_symlink "$payload/lib/libkeysharp-desktop.so" \
+    /usr/local/lib/libkeysharp-desktop.so
+atomic_install_file "$payload/bin/keysharp-desktop" \
+    /usr/local/bin/keysharp-desktop 0755
+atomic_install_file "$payload/libexec/keysharp-desktop-capture-worker" \
+    /usr/local/libexec/keysharp-desktop-capture-worker 0700
+current_library=$(portable_library_payload) || {
+    printf '%s\n' "keysharp-desktop: installed client library is invalid" >&2
+    exit 1
+}
 install -m 0755 "$archive_root/uninstall.sh" \
     /usr/local/share/doc/keysharp-desktop/uninstall.sh
+[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create \
@@ -576,10 +704,14 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now keysharp-desktop-authority.socket
     systemctl try-restart keysharp-desktop-authority.service
-    systemctl --global enable keysharp-desktop.socket
+    systemctl --global enable keysharp-desktop.service
+fi
+
+if [ -n "$previous_library" ] && [ "$previous_library" != "$current_library" ]; then
+    rm -f -- "$previous_library"
 fi
 
 printf '%s\n' \
     "Installed keysharp-desktop." \
     "Uninstall with /usr/local/share/doc/keysharp-desktop/uninstall.sh."
-refresh_or_handoff_user_socket true
+refresh_or_handoff_user_service true

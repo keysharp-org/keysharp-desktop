@@ -1,62 +1,66 @@
-# Packaging and installation policy
+# Packaging
 
-Release archives, distribution packages, the compatible-reuse rules, and removal
-policy. For ordinary build and install steps see the [README](../README.md).
+The source tree uses the pinned `third_party/keysharp-permissions` submodule.
+`KEYSHARP_PERMISSIONS_SOURCE_DIR` is an explicit developer override; builds do
+not search sibling directories.
 
-Release archives contain a prebuilt `/usr/local` payload plus root `install.sh`
-and `uninstall.sh` scripts. An application bundling the archive can invoke
-`sudo ./install.sh --skip-if-compatible`; a root-owned installation implementing
-this exact protocol major and minor is reused unchanged
-only after its unit files, polkit action, shared-state declaration, and authority
-service wiring and global user-socket enablement are verified. Configuration
-resources must resolve through protected root-owned paths; the installer also
-checks the policy defaults, shared tmpfiles contract, KWin entry, and provider
-resources instead of treating an empty or unrelated file as compatible. The installer
-refuses to layer `/usr/local` over a
-distribution- or Nix-managed copy, and the portable uninstaller refuses to
-remove files while a different installation root is present.
-Distribution packages use `/usr`; portable and source installs use `/usr/local`
-so they do not overwrite package-manager files.
-Release binaries are built natively on Ubuntu 22.04 and target its glibc 2.35
-baseline.
-Release assets use `keysharp-desktop-<version>-linux-<x64|arm64>.tar.gz` for
-portable archives and the conventional
-`keysharp-desktop_<version>_<amd64|arm64>.deb` name for Debian packages.
-Nix validation is enabled once `flake.lock` is committed. Generate it on a
-machine with Nix, run `nix flake check --no-write-lock-file`, and review the
-pinned revision and content hash; do not hand-author a `narHash`. Until then,
-CI and release workflows skip Nix validation while continuing to build and
-publish the portable archives and Debian packages. Nix package publication
-should be enabled only after the reviewed lock file is present.
-Release packages and the source installer enable the system authority socket and make
-the user socket available globally. When installation runs through `sudo`, the
-installer resolves the numeric `SUDO_UID`, verifies that user's runtime
-directory and active bus, and uses a clean environment to reload that manager
-and start the socket. A fresh install or upgrade also restarts that broker when
-it is already running, so it cannot keep an old executable or protocol mapped.
-Compatible-reuse mode leaves the broker running and only makes the socket
-available. If no active invoking session can be resolved safely, new logins
-start it automatically and the installer prints the explicit `systemctl --user`
-commands needed by an already logged-in user. Other logged-in users are not
-enumerated or restarted; they must run those commands or log out after an
-upgrade.
+## Required install
 
-The portable uninstaller disables this component's system socket and global
-user-socket enablement, then removes its files below `/usr/local` and its
-component-named polkit action below `/usr/share`. It always preserves shared
-permanent grants. Before removing files, the uninstaller stops the invoking
-user's broker and socket through the same verified `SUDO_UID` path, then reloads
-that user manager after removal. It prints a handoff for other logged-in users, which must
-stop the two units and reload their manager or log out. The Debian pre-install
-script refuses to unpack over an actual root-owned portable `/usr/local`
-installation and points the administrator to its separate uninstaller; this
-prevents `/usr/local` unit files from shadowing package-owned `/usr` units.
-An application's uninstaller must not invoke the component uninstaller: the
-broker can have other clients. Run it only after checking that no other
-application uses the component. There is no portable consumer registry because
-manual installs and distribution packages cannot maintain a reliable common
-reference count.
-Distribution client packages should instead declare `keysharp-desktop` through
-their package manager. That dependency graph, rather than a client's maintainer
-script, decides when the package is no longer required. Package removal and
-purge both keep shared grants, which are deleted only through an authenticated
+Runtime files:
+
+```text
+bin/keysharp-desktop
+libexec/keysharp-desktop-capture-worker        root:root 0700
+lib/libkeysharp-desktop.so{,.0,.0.2.0}
+include/keysharp_desktop/client.h
+lib/pkgconfig/keysharp-desktop.pc
+lib/cmake/KeysharpDesktop/*
+```
+
+Service and provider resources:
+
+```text
+lib/systemd/user/keysharp-desktop.service
+lib/systemd/system/keysharp-desktop-authority.{service,socket}
+lib/tmpfiles.d/keysharp-desktop-permissions.conf
+share/polkit-1/actions/org.keysharp.desktop.policy
+share/applications/org.keysharp.DesktopCapture.desktop
+share/gnome-shell/extensions/keysharp@keysharp.io/*
+share/cinnamon/extensions/keysharp@keysharp.io/*
+```
+
+The installed CMake target is `KeysharpDesktop::client`; the pkg-config name is
+`keysharp-desktop`. Private headers are not installed.
+
+## Activation
+
+The system socket is `/run/keysharp-desktop/keysharp-desktop.sock`, owned by
+root and mode 0666. It activates `keysharp-desktop authority-daemon`.
+
+`keysharp-desktop.service` runs `keysharp-desktop daemon` inside each graphical
+user session. It connects outbound and registers the session backend; it is
+not socket-activated and does not accept application traffic.
+
+Install and removal scripts reload the dynamic-linker cache after adding or
+removing the SONAME library. They reload systemd, enable the system socket,
+and refresh the invoking graphical user's service. Other active users refresh
+at their next login or with `systemctl --user daemon-reload`.
+
+## Ownership and removal
+
+Package managers own their dependency graph. The portable installer refuses a
+partial, package-managed, or differently rooted installation. Compatibility
+reuse requires the ABI library and development metadata plus every service,
+policy, provider, and root-only worker resource.
+
+The standalone uninstaller removes only this project's manifest. It retains
+`/var/lib/keysharp-permissions/v1` because other authorities may use the same
+grants.
+
+The Debian package provides `keysharp-desktop-client-abi-0` and obtains ELF
+dependencies through `dpkg-shlibdeps`. Its preinstall guard rejects unmanaged
+`/usr/local` files that could shadow the packaged runtime or providers.
+
+CI builds and tests x64 and arm64, consumes the staged CMake and pkg-config
+metadata, validates exported symbols and provider sources, assembles Debian
+and portable artifacts, and runs `nix flake check --no-write-lock-file`.

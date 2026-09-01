@@ -9,26 +9,27 @@ file(READ "${SOURCE_DIR}/CMakeLists.txt" cmake_source)
 file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.service.in" authority_unit)
 file(READ "${SOURCE_DIR}/data/keysharp-desktop.service.in" broker_unit)
 file(READ "${SOURCE_DIR}/packaging/debian/postrm" debian_postrm)
+file(READ "${SOURCE_DIR}/nix/module.nix" nix_module)
 
 foreach(required
         "--skip-if-compatible"
-        "protocol_version_compatible"
         "payload/usr/local"
         "payload/usr/share/polkit-1/actions/org.keysharp.desktop.policy"
         "/usr/local/bin/keysharp-desktop"
+        "/usr/local/libexec/keysharp-desktop-capture-worker"
         "has_required_resources"
+        "abi_minor"
         "resource_configuration_matches"
         "installed_resources_are_protected"
+        "is_root_private_executable"
         "policy_configuration_matches"
         "tmpfiles_configuration_matches"
         "desktop_entry_configuration_matches"
         "global_user_unit_available"
         "global_user_unit_enabled"
         "global_user_service_exec_matches"
-        "global_user_socket_matches"
         "systemd_socket_matches"
-        "global_user_service_exec_matches keysharp-desktop.service \"$resolved\" serve"
-        "global_user_socket_matches keysharp-desktop.socket"
+        "global_user_service_exec_matches keysharp-desktop.service \"$resolved\" daemon"
         "systemd_socket_matches keysharp-desktop-authority.socket"
         "/nix/store/*"
         "/run/current-system/sw/share/polkit-1/actions/org.keysharp.desktop.policy"
@@ -42,42 +43,56 @@ foreach(required
         message(FATAL_ERROR "portable release installer is missing ${required}")
     endif()
 endforeach()
+foreach(required
+        "ListenStream = \"/run/keysharp-desktop/keysharp-desktop.sock\""
+        "FileDescriptorName = \"public\"")
+    string(FIND "${nix_module}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "Nix socket is missing ${required}")
+    endif()
+endforeach()
 foreach(installer_source release_installer source_installer debian_postinst)
     foreach(required
             "refresh_invoking_user_manager"
             "SUDO_UID"
             "/usr/sbin/runuser"
             "/usr/bin/systemctl --user --no-pager daemon-reload"
-            "/usr/bin/systemctl --user --no-pager try-restart"
-            "/usr/bin/systemctl --user --no-pager start keysharp-desktop.socket")
+            "keysharp-desktop.service")
         string(FIND "${${installer_source}}" "${required}" found)
         if(found EQUAL -1)
             message(FATAL_ERROR "${installer_source} user-session activation is missing ${required}")
         endif()
     endforeach()
 endforeach()
-string(FIND "${broker_unit}" "/keysharp-desktop serve" broker_mode)
+foreach(lifecycle_source
+        release_installer source_installer debian_postinst
+        portable_uninstaller debian_postrm)
+    string(FIND "${${lifecycle_source}}" "/sbin/ldconfig" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "${lifecycle_source} does not refresh the loader cache")
+    endif()
+endforeach()
+string(FIND "${broker_unit}" "/keysharp-desktop daemon" broker_mode)
 if(broker_mode EQUAL -1)
-    message(FATAL_ERROR "user service does not select the serve mode")
+    message(FATAL_ERROR "user service does not select the daemon mode")
 endif()
 string(FIND "${authority_unit}" "/keysharp-desktop authority" authority_mode)
 if(authority_mode EQUAL -1)
     message(FATAL_ERROR "system service does not select the authority mode")
 endif()
-file(READ "${SOURCE_DIR}/data/keysharp-desktop.socket" broker_socket)
 file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.socket" authority_socket)
 foreach(required
-        "ListenStream=%t/keysharp-desktop/keysharp-desktop.sock"
-        "Accept=no"
-        "SocketMode=0600"
-        "DirectoryMode=0700")
-    string(FIND "${broker_socket}" "${required}" found)
+        "PartOf=graphical-session.target"
+        "WantedBy=graphical-session.target"
+        "Restart=on-failure")
+    string(FIND "${broker_unit}" "${required}" found)
     if(found EQUAL -1)
-        message(FATAL_ERROR "user socket is missing ${required}")
+        message(FATAL_ERROR "user service is missing ${required}")
     endif()
 endforeach()
 foreach(required
-        "ListenStream=/run/keysharp-desktop/authority.sock"
+        "ListenStream=/run/keysharp-desktop/keysharp-desktop.sock"
+        "FileDescriptorName=public"
         "Accept=no"
         "SocketMode=0666"
         "DirectoryMode=0755")
@@ -127,12 +142,32 @@ foreach(required
         "-DCMAKE_INSTALL_PREFIX=/usr"
         "workflow_dispatch"
         "deb_name=\"keysharp-desktop_"
-        "nix_enabled"
-        "if: needs.prepare.outputs.nix_enabled == 'true'"
+        "nix flake check --no-write-lock-file"
         "uninstall.sh")
     string(FIND "${release_workflow}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "release workflow is missing ${required}")
+    endif()
+endforeach()
+foreach(workflow_source ci_workflow release_workflow)
+    foreach(required
+            "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13"
+            "git rev-parse HEAD:third_party/keysharp-permissions"
+            "libkeysharp-desktop.so.0")
+        string(FIND "${${workflow_source}}" "${required}" found)
+        if(found EQUAL -1)
+            message(FATAL_ERROR "${workflow_source} misses ${required}")
+        endif()
+    endforeach()
+endforeach()
+foreach(required
+        "inputs.keysharp-permissions"
+        "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13"
+        "flake = false")
+    file(READ "${SOURCE_DIR}/flake.nix" flake_source)
+    string(FIND "${flake_source}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "Nix flake is missing ${required}")
     endif()
 endforeach()
 string(FIND "${release_workflow}" "Release blocked: generate, review, and commit flake.lock" blocked_without_lock)
@@ -140,8 +175,7 @@ if(NOT blocked_without_lock EQUAL -1)
     message(FATAL_ERROR "portable and Debian releases must not require flake.lock")
 endif()
 foreach(required
-        "Detect locked Nix packaging"
-        "if: steps.nix_lock.outputs.present == 'true'"
+        "cachix/install-nix-action@v31"
         "nix flake check --no-write-lock-file")
     string(FIND "${ci_workflow}" "${required}" found)
     if(found EQUAL -1)
@@ -161,13 +195,49 @@ foreach(required
 endforeach()
 
 foreach(required
-        "systemctl --global disable keysharp-desktop.socket"
+        "systemctl --global disable keysharp-desktop.service"
         "stop keysharp-desktop.service"
         "reload_invoking_user_manager"
-        "Other logged-in users were not contacted")
+        "Other logged-in users were not contacted"
+        "/usr/local/bin/keysharp-desktop"
+        "/usr/local/libexec/keysharp-desktop-capture-worker"
+        "/usr/local/lib/libkeysharp-desktop.so"
+        "/usr/local/lib/libkeysharp-desktop.so.0"
+        "library_payload=$(portable_library_payload || true)"
+        "rm -f -- \"$library_payload\""
+        "/usr/local/include/keysharp_desktop/client.h"
+        "/usr/local/lib/pkgconfig/keysharp-desktop.pc"
+        "/usr/local/lib/cmake/KeysharpDesktop"
+        "/var/lib/keysharp-permissions/v1 were retained")
     string(FIND "${portable_uninstaller}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "portable uninstaller is missing ${required}")
+    endif()
+endforeach()
+foreach(required
+        "previous_library=$(portable_library_payload || true)"
+        "current_library=$(portable_library_payload)"
+        "payload_library=$(library_payload_under \"$payload\" || true)"
+        "atomic_install_file \"$payload_library\""
+        "atomic_install_symlink \"$payload/lib/libkeysharp-desktop.so.0\""
+        "atomic_install_file \"$payload/bin/keysharp-desktop\""
+        "atomic_install_file \"$payload/libexec/keysharp-desktop-capture-worker\""
+        "rm -f -- \"$previous_library\"")
+    string(FIND "${release_installer}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "portable installer does not retire the prior ABI payload: ${required}")
+    endif()
+endforeach()
+string(FIND "${release_installer}" "cp -R \"$payload/.\" /usr/local/" found)
+if(NOT found EQUAL -1)
+    message(FATAL_ERROR "portable installer overwrites live files in place")
+endif()
+foreach(forbidden
+        "keysharp-desktop.socket"
+        "keysharp_desktop/protocol.h")
+    string(FIND "${portable_uninstaller}" "${forbidden}" found)
+    if(NOT found EQUAL -1)
+        message(FATAL_ERROR "portable uninstaller retains obsolete ${forbidden}")
     endif()
 endforeach()
 
@@ -199,9 +269,19 @@ foreach(required
 endforeach()
 foreach(required
         "/usr/local/bin/keysharp-desktop"
+        "/usr/local/lib/libkeysharp-desktop.so*"
+        "/usr/local/libexec/keysharp-desktop-capture-worker"
         "/usr/local/lib/systemd/user/keysharp-desktop.service"
         "/usr/local/share/systemd/user/keysharp-desktop.service"
         "/usr/local/lib/systemd/system/keysharp-desktop-authority.service"
+        "/usr/local/include/keysharp_desktop/client.h"
+        "/usr/local/lib/pkgconfig/keysharp-desktop.pc"
+        "/usr/local/lib/cmake/KeysharpDesktop"
+        "/usr/local/lib/tmpfiles.d/keysharp-desktop-permissions.conf"
+        "/usr/local/share/applications/org.keysharp.DesktopCapture.desktop"
+        "/usr/local/share/gnome-shell/extensions/keysharp@keysharp.io"
+        "/usr/local/share/cinnamon/extensions/keysharp@keysharp.io"
+        "/usr/share/polkit-1/actions/org.keysharp.desktop.policy"
         "[ -L \"\$candidate\" ]"
         "readlink -m"
         "sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh")
@@ -221,7 +301,7 @@ endif()
 foreach(required
         "CPACK_DEBIAN_PACKAGE_BREAKS \"keysharp (<< 0.0.0.17)\""
         "CPACK_DEBIAN_PACKAGE_REPLACES \"keysharp (<< 0.0.0.17)\""
-        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-protocol-1.2\""
+        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-client-abi-0\""
         "CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON"
         "16986957+Descolada@users.noreply.github.com")
     string(FIND "${cmake_source}" "${required}" found)

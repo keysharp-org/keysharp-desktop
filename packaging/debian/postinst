@@ -52,7 +52,7 @@ refresh_invoking_user_manager() {
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
-        /usr/bin/systemctl --user --no-pager start keysharp-desktop.socket \
+        /usr/bin/systemctl --user --no-pager start keysharp-desktop.service \
         >/dev/null 2>&1
 }
 
@@ -60,13 +60,14 @@ if [ -x /usr/bin/keysharp-desktop ]; then
     chown root:root /usr/bin/keysharp-desktop
     chmod 0755 /usr/bin/keysharp-desktop
 fi
+[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/keysharp-desktop-permissions.conf \
     >/dev/null 2>&1 || true
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable --now keysharp-desktop-authority.socket >/dev/null 2>&1 || true
 systemctl try-restart keysharp-desktop-authority.service >/dev/null 2>&1 || true
-systemctl --global enable keysharp-desktop.socket >/dev/null 2>&1 || true
+systemctl --global enable keysharp-desktop.service >/dev/null 2>&1 || true
 
 if refresh_invoking_user_manager; then
     printf '%s\n' \
@@ -74,10 +75,9 @@ if refresh_invoking_user_manager; then
 else
     printf '%s\n' \
         "keysharp-desktop: no active invoking user manager was safely resolved." \
-        "New logins start the globally enabled socket; already logged-in users should run:" \
+        "New logins start the globally enabled service; already logged-in users should run:" \
         "  systemctl --user daemon-reload" \
-        "  systemctl --user try-restart keysharp-desktop.service" \
-        "  systemctl --user start keysharp-desktop.socket"
+        "  systemctl --user restart keysharp-desktop.service"
 fi
 printf '%s\n' \
     "keysharp-desktop: other logged-in users are not refreshed automatically." \

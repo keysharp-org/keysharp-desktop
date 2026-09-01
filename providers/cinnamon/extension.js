@@ -1,6 +1,5 @@
-// Cinnamon extension for Keysharp integration.
-// Exposes window management, window events and mouse simulation via D-Bus
-// so Keysharp can use compositor-owned state on Cinnamon Wayland.
+// Cinnamon provider for desktop automation clients.
+// It exposes compositor-owned state through authenticated D-Bus surfaces.
 //
 // D-Bus service name : io.github.keysharp.CinnamonShell
 // Object path        : /io/github/keysharp/CinnamonShell
@@ -17,10 +16,19 @@ const St = imports.gi.St;
 const CairoGI = imports.gi.cairo;
 const Main = imports.ui.main;
 const ByteArray = imports.byteArray;
-const Cairo = imports.cairo;
 
 const SERVICE_NAME = 'io.github.keysharp.CinnamonShell';
-const DBUS_INTERFACE_NAME = 'io.github.keysharp.CinnamonShell1';
+const PROVIDER_INTERFACE_NAME = 'org.keysharp.Desktop.Provider1';
+const PROVIDER_OBJECT_PATH = '/org/keysharp/DesktopProvider';
+const PROVIDER_SOCKET_NAME = 'provider-cinnamon.sock';
+const MAX_CLIPBOARD_BYTES = 16 * 1024 * 1024;
+const MAX_OVERLAY_PNG_BYTES = 16 * 1024 * 1024;
+const MAX_OVERLAY_DIMENSION = 8192;
+const MAX_OVERLAY_PIXELS = 16 * 1024 * 1024;
+const MAX_OVERLAYS_PER_OWNER = 64;
+const MAX_OVERLAYS_TOTAL = 512;
+const MAX_OVERLAY_BYTES_PER_OWNER = 64 * 1024 * 1024;
+const MAX_OVERLAY_BYTES_TOTAL = 256 * 1024 * 1024;
 
 // How many compositor frames to wait for a reserved window to become placeable.
 // Retries are timer-driven, so this is a real time budget: 40 x 16ms.
@@ -31,16 +39,15 @@ const PLACEMENT_WATCH_MS = 600;
 
 // How long a reservation stays live if the window it was meant for never arrives.
 const PLACEMENT_TTL_MS = 2000;
+const MAX_PLACEMENTS_TOTAL = 256;
+const MAX_PLACEMENTS_PER_PID = 16;
+const MAX_PLACED_TOTAL = 256;
 
 const OBJECT_PATH = '/io/github/keysharp/CinnamonShell';
 
 const DBUS_IFACE_XML =
 `<node>
-  <interface name="io.github.keysharp.CinnamonShell1">
-    <method name="RegisterBroker">
-      <arg type="b" direction="out" name="ok"/>
-    </method>
-
+  <interface name="org.keysharp.Desktop.Provider1">
     <method name="GetWindowList">
       <arg type="b" direction="in" name="includeHidden"/>
       <arg type="s" direction="out" name="json"/>
@@ -60,23 +67,6 @@ const DBUS_IFACE_XML =
       <arg type="i" direction="out" name="y"/>
       <arg type="i" direction="out" name="width"/>
       <arg type="i" direction="out" name="height"/>
-    </method>
-
-    <!-- Capture a screen region and return raw PNG bytes. Permission-gated: only callable by the
-         installed, root-owned keysharp-desktop broker (which enforces the user's capture consent). -->
-    <method name="CaptureArea">
-      <arg type="i" direction="in" name="x"/>
-      <arg type="i" direction="in" name="y"/>
-      <arg type="i" direction="in" name="width"/>
-      <arg type="i" direction="in" name="height"/>
-      <arg type="ay" direction="out" name="pngData"/>
-    </method>
-
-    <!-- Capture one window's own buffer (occlusion-independent, frame-clipped) as PNG bytes.
-         Same keysharp-desktop permission gate as CaptureArea. -->
-    <method name="CaptureWindow">
-      <arg type="t" direction="in" name="handle"/>
-      <arg type="ay" direction="out" name="pngData"/>
     </method>
 
     <method name="FocusWindow">
@@ -161,6 +151,27 @@ const DBUS_IFACE_XML =
       <arg type="b" direction="out" name="ok"/>
     </method>
 
+    <method name="SendMouseMoveAbsolute">
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseMoveRelative">
+      <arg type="i" direction="in" name="dx"/>
+      <arg type="i" direction="in" name="dy"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseButton">
+      <arg type="u" direction="in" name="button"/>
+      <arg type="b" direction="in" name="pressed"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseScroll">
+      <arg type="i" direction="in" name="delta"/>
+      <arg type="b" direction="in" name="vertical"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
     <method name="RegisterHighlightOwner">
       <arg type="s" direction="in" name="ownerKey"/>
       <arg type="s" direction="in" name="busName"/>
@@ -196,25 +207,6 @@ const DBUS_IFACE_XML =
       <arg type="i" direction="in" name="width"/>
       <arg type="i" direction="in" name="height"/>
       <arg type="ay" direction="in" name="pngData"/>
-      <arg type="b" direction="out" name="ok"/>
-    </method>
-
-    <!-- The same frame, handed over as shared memory rather than an encoded PNG. The client writes
-         premultiplied BGRA into a file both processes map, so an animated overlay costs one texture
-         upload per frame instead of a PNG encode, a multi-megabyte D-Bus payload and a PNG decode.
-         pixelWidth/pixelHeight/stride describe the buffer; width/height stay the on-screen size. -->
-    <method name="ShowImageOverlayShm">
-      <arg type="u" direction="in" name="id"/>
-      <arg type="s" direction="in" name="ownerKey"/>
-      <arg type="s" direction="in" name="busName"/>
-      <arg type="i" direction="in" name="x"/>
-      <arg type="i" direction="in" name="y"/>
-      <arg type="i" direction="in" name="width"/>
-      <arg type="i" direction="in" name="height"/>
-      <arg type="s" direction="in" name="shmPath"/>
-      <arg type="i" direction="in" name="pixelWidth"/>
-      <arg type="i" direction="in" name="pixelHeight"/>
-      <arg type="i" direction="in" name="stride"/>
       <arg type="b" direction="out" name="ok"/>
     </method>
 
@@ -263,10 +255,6 @@ const DBUS_IFACE_XML =
       <arg type="b" direction="out" name="ok"/>
     </method>
 
-    <signal name="ActiveWindowChanged">
-      <arg type="s" name="json"/>
-    </signal>
-
     <signal name="WindowEvent">
       <arg type="s" name="type"/>
       <arg type="s" name="json"/>
@@ -278,6 +266,81 @@ const DBUS_IFACE_XML =
       <arg type="s" name="text"/>
       <arg type="as" name="mimetypes"/>
     </signal>
+  </interface>
+</node>`;
+
+const PUBLIC_IFACE_XML =
+`<node>
+  <interface name="io.github.keysharp.CinnamonShell1">
+    <method name="GetCursorPosition">
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+    </method>
+    <method name="GetWorkArea">
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+      <arg type="i" direction="out" name="width"/>
+      <arg type="i" direction="out" name="height"/>
+    </method>
+    <method name="SetClipboardContent">
+      <arg type="s" direction="in" name="mimetype"/>
+      <arg type="ay" direction="in" name="bytes"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SetClipboardText">
+      <arg type="s" direction="in" name="text"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="RegisterHighlightOwner">
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="ShowHighlight">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="s" direction="in" name="color"/>
+      <arg type="i" direction="in" name="thickness"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="HideHighlight">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="ShowImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="ay" direction="in" name="pngData"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="MoveImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="HideImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
   </interface>
 </node>`;
 
@@ -308,6 +371,12 @@ class KeysharpExtension {
     constructor() {
         this._dbusImpl = null;
         this._busNameId = 0;
+        this._providerServer = null;
+        this._providerServerSignalId = 0;
+        this._providerAuthObserver = null;
+        this._providerSocketPath = null;
+        this._providerConnections = new Map();
+        this._vPointer = null;
         this._focusId = null;
         this._winCreatedId = null;
         this._mapId = 0;
@@ -322,11 +391,19 @@ class KeysharpExtension {
         this._overlayReconnectTimers = new Map();
         this._clipboard = null;
         this._clipboardSelectionId = null;
-        this._brokerBusName = null;
     }
 
     enable() {
-        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_IFACE_XML, this);
+        try {
+            const seat = Clutter.get_default_backend().get_default_seat();
+            this._vPointer = seat.create_virtual_device(
+                Clutter.InputDeviceType.POINTER_DEVICE);
+        } catch (e) {
+            global.logError(e, 'Keysharp: could not create Cinnamon virtual pointer device');
+        }
+        this._startProvider();
+
+        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(PUBLIC_IFACE_XML, this);
         this._dbusImpl.export(Gio.DBus.session, OBJECT_PATH);
         this._overlayNameWatchId = Gio.DBus.session.signal_subscribe(
             'org.freedesktop.DBus',
@@ -350,7 +427,6 @@ class KeysharpExtension {
         }
 
         this._focusId = global.display.connect('notify::focus-window', () => {
-            this._emitActiveWindowChanged();
             this._emitWindowEventRaw('active-state', this._getActiveWindow());
             const win = global.display.get_focus_window();
             if (win && this._isTrackedWindow(win))
@@ -401,6 +477,8 @@ class KeysharpExtension {
     }
 
     disable() {
+        this._stopProvider();
+        this._vPointer = null;
         if (this._clipboardSelectionId !== null) {
             try { global.display.get_selection().disconnect(this._clipboardSelectionId); } catch (_e) {}
             this._clipboardSelectionId = null;
@@ -458,7 +536,95 @@ class KeysharpExtension {
             this._dbusImpl = null;
         }
 
-        this._brokerBusName = null;
+    }
+
+    _credentialUid(credentials) {
+        try {
+            const value = credentials.get_unix_user();
+            if (Array.isArray(value))
+                return Number(value.length > 1 ? value[1] : value[0]);
+            return Number(value);
+        } catch (_e) {
+            return -1;
+        }
+    }
+
+    _startProvider() {
+        try {
+            const runtimeDirectory = GLib.build_filenamev([
+                GLib.get_user_runtime_dir(), 'keysharp-desktop']);
+            if (GLib.mkdir_with_parents(runtimeDirectory, 0o700) !== 0)
+                throw new Error('Could not create the provider runtime directory.');
+            GLib.chmod(runtimeDirectory, 0o700);
+            this._providerSocketPath = GLib.build_filenamev([
+                runtimeDirectory, PROVIDER_SOCKET_NAME]);
+            if (GLib.file_test(this._providerSocketPath, GLib.FileTest.EXISTS))
+                GLib.unlink(this._providerSocketPath);
+
+            this._providerAuthObserver = new Gio.DBusAuthObserver();
+            this._providerAuthObserver.connect('allow-mechanism',
+                (_observer, mechanism) => mechanism === 'EXTERNAL');
+            this._providerAuthObserver.connect('authorize-authenticated-peer',
+                (_observer, _stream, credentials) => this._credentialUid(credentials) === 0);
+            this._providerServer = Gio.DBusServer.new_sync(
+                `unix:path=${this._providerSocketPath}`,
+                Gio.DBusServerFlags.NONE,
+                Gio.dbus_generate_guid(),
+                this._providerAuthObserver,
+                null);
+            this._providerServerSignalId = this._providerServer.connect(
+                'new-connection', (_server, connection) => {
+                    if (this._credentialUid(connection.get_peer_credentials()) !== 0)
+                        return false;
+                    try {
+                        const implementation = Gio.DBusExportedObject.wrapJSObject(
+                            DBUS_IFACE_XML, this);
+                        implementation.export(connection, PROVIDER_OBJECT_PATH);
+                        const closedSignalId = connection.connect('closed', () => {
+                            const entry = this._providerConnections.get(connection);
+                            if (entry !== undefined) {
+                                try { entry.implementation.unexport(); } catch (_e) {}
+                                this._providerConnections.delete(connection);
+                            }
+                        });
+                        this._providerConnections.set(connection,
+                            {implementation: implementation, closedSignalId: closedSignalId});
+                        connection.start_message_processing();
+                        return true;
+                    } catch (e) {
+                        global.logError(e, 'Keysharp: could not export private provider connection');
+                        return false;
+                    }
+                });
+            this._providerServer.start();
+        } catch (e) {
+            global.logError(e, 'Keysharp: could not start private desktop provider');
+            this._stopProvider();
+        }
+    }
+
+    _stopProvider() {
+        if (this._providerServer !== null) {
+            if (this._providerServerSignalId !== 0) {
+                try { this._providerServer.disconnect(this._providerServerSignalId); } catch (_e) {}
+                this._providerServerSignalId = 0;
+            }
+            try { this._providerServer.stop(); } catch (_e) {}
+            this._providerServer = null;
+        }
+        for (const entryPair of this._providerConnections.entries()) {
+            const connection = entryPair[0];
+            const entry = entryPair[1];
+            try { entry.implementation.unexport(); } catch (_e) {}
+            try { connection.disconnect(entry.closedSignalId); } catch (_e) {}
+            try { connection.close_sync(null); } catch (_e) {}
+        }
+        this._providerConnections.clear();
+        this._providerAuthObserver = null;
+        if (this._providerSocketPath !== null) {
+            try { GLib.unlink(this._providerSocketPath); } catch (_e) {}
+            this._providerSocketPath = null;
+        }
     }
 
     _getWindowList(includeHidden) {
@@ -495,16 +661,8 @@ class KeysharpExtension {
         }
     }
 
-    RegisterBrokerAsync(_params, invocation) {
-        if (!this._requireBroker(invocation))
-            return;
-
-        this._brokerBusName = invocation.get_sender();
-        invocation.return_value(new GLib.Variant('(b)', [true]));
-    }
-
-    _requireBroker(invocation) {
-        if (this._callerIsHelper(invocation))
+    _requireProviderPeer(invocation) {
+        if (this._callerIsProviderPeer(invocation))
             return true;
 
         invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
@@ -513,7 +671,7 @@ class KeysharpExtension {
     }
 
     _returnSensitiveBoolean(params, invocation, method) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
 
         let ok = false;
@@ -522,19 +680,19 @@ class KeysharpExtension {
     }
 
     GetWindowListAsync(params, invocation) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
         invocation.return_value(new GLib.Variant('(s)', [this._getWindowList(Boolean(params[0]))]));
     }
 
     GetActiveWindowAsync(_params, invocation) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
         invocation.return_value(new GLib.Variant('(s)', [this._getActiveWindow()]));
     }
 
     GetClipboardMimetypesAsync(_params, invocation) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
         invocation.return_value(new GLib.Variant('(as)', [this._getClipboardMimetypes()]));
     }
@@ -542,6 +700,14 @@ class KeysharpExtension {
     FocusWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_focusWindow'); }
     RaiseWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_raiseWindow'); }
     LowerWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_lowerWindow'); }
+    ReserveWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_reserveWindow'); }
+    GetReservedWindowAsync(params, invocation) {
+        if (!this._requireProviderPeer(invocation))
+            return;
+        let id = '';
+        try { id = String(this._getReservedWindow.apply(this, params) || ''); } catch (_e) {}
+        invocation.return_value(new GLib.Variant('(s)', [id]));
+    }
     MoveResizeWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_moveResizeWindow'); }
     MoveResizeWindowByXidAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_moveResizeWindowByXid'); }
     SetWindowStateAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_setWindowState'); }
@@ -550,6 +716,55 @@ class KeysharpExtension {
     SetWindowOpacityAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_setWindowOpacity'); }
     CloseWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_closeWindow'); }
     KillWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_killWindow'); }
+    SendMouseMoveAbsoluteAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseMoveAbsolute'); }
+    SendMouseMoveRelativeAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseMoveRelative'); }
+    SendMouseButtonAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseButton'); }
+    SendMouseScrollAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseScroll'); }
+
+    _overlayCallerMatches(params, invocation, ownerIndex, busIndex) {
+        try {
+            const sender = invocation.get_sender();
+            if (!sender || String(params[busIndex] || '') !== sender)
+                return false;
+            const reply = Gio.DBus.session.call_sync(
+                'org.freedesktop.DBus', '/org/freedesktop/DBus',
+                'org.freedesktop.DBus', 'GetConnectionUnixProcessID',
+                new GLib.Variant('(s)', [sender]), new GLib.VariantType('(u)'),
+                Gio.DBusCallFlags.NONE, 1000, null);
+            const unpacked = reply.deep_unpack();
+            const pid = unpacked[0];
+            const owner = this._parseOverlayOwner(params[ownerIndex]);
+            if (!Number.isInteger(pid) || pid <= 0 || owner.pid !== pid
+                || !owner.startTime || owner.key !== `${pid}:${owner.startTime}`)
+                return false;
+            const read = GLib.file_get_contents(`/proc/${pid}/stat`);
+            if (!read[0])
+                return false;
+            const stat = ByteArray.toString(read[1]);
+            const end = stat.lastIndexOf(')');
+            if (end < 0 || end + 2 >= stat.length)
+                return false;
+            const fields = stat.substring(end + 2).trim().split(/\s+/);
+            return fields.length > 19 && fields[19] === owner.startTime;
+        } catch (_e) {
+            return false;
+        }
+    }
+
+    _returnOwnedOverlayBoolean(params, invocation, method, ownerIndex, busIndex) {
+        let ok = false;
+        if (this._overlayCallerMatches(params, invocation, ownerIndex, busIndex)) {
+            try { ok = Boolean(this[method].apply(this, params)); } catch (_e) {}
+        }
+        invocation.return_value(new GLib.Variant('(b)', [ok]));
+    }
+
+    RegisterHighlightOwnerAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_registerHighlightOwner', 0, 1); }
+    ShowHighlightAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_showHighlight', 1, 2); }
+    HideHighlightAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_hideHighlight', 1, 2); }
+    ShowImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_showImageOverlay', 1, 2); }
+    MoveImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_moveImageOverlay', 1, 2); }
+    HideImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_hideImageOverlay', 1, 2); }
 
     GetCursorPosition() {
         const point = global.get_pointer();
@@ -590,7 +805,11 @@ class KeysharpExtension {
 
     _mimetypes() {
         try {
-            return this._selectionObj().get_mimetypes(Meta.SelectionType.SELECTION_CLIPBOARD) || [];
+            return (this._selectionObj().get_mimetypes(
+                Meta.SelectionType.SELECTION_CLIPBOARD) || [])
+                .filter(value => typeof value === 'string'
+                    && value.length > 0 && value.length <= 1024)
+                .slice(0, 256);
         } catch (_e) {
             return [];
         }
@@ -602,21 +821,30 @@ class KeysharpExtension {
 
     // Async: MetaSelection.transfer_async streams the content of one MIME type into a memory output stream.
     GetClipboardContentAsync(params, invocation) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
 
         const [mimetype] = params;
+        if (typeof mimetype !== 'string' || mimetype.length === 0
+            || mimetype.length > 1024) {
+            invocation.return_value(new GLib.Variant('(ay)', [new Uint8Array(0)]));
+            return;
+        }
         try {
             const stream = Gio.MemoryOutputStream.new_resizable();
-            this._selectionObj().transfer_async(Meta.SelectionType.SELECTION_CLIPBOARD, String(mimetype), -1, stream, null,
+            this._selectionObj().transfer_async(Meta.SelectionType.SELECTION_CLIPBOARD, String(mimetype), MAX_CLIPBOARD_BYTES + 1, stream, null,
                 (sel, res) => {
                     let bytes = new Uint8Array(0);
                     try {
                         sel.transfer_finish(res);
                         stream.close(null);
                         const data = stream.steal_as_bytes().get_data();
-                        if (data)
-                            bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+                        if (data) {
+                            const candidate = data instanceof Uint8Array
+                                ? data : new Uint8Array(data);
+                            if (candidate.length <= MAX_CLIPBOARD_BYTES)
+                                bytes = candidate;
+                        }
                     } catch (_e) {
                     }
                     try { invocation.return_value(new GLib.Variant('(ay)', [bytes])); } catch (_e2) {}
@@ -629,7 +857,11 @@ class KeysharpExtension {
     SetClipboardContent(mimetype, bytes) {
         try {
             const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
-            const source = Meta.SelectionSourceMemory.new(String(mimetype), new GLib.Bytes(data));
+            const type = String(mimetype || '');
+            if (type.length === 0 || type.length > 1024
+                || data.length > MAX_CLIPBOARD_BYTES)
+                return false;
+            const source = Meta.SelectionSourceMemory.new(type, new GLib.Bytes(data));
             this._selectionObj().set_owner(Meta.SelectionType.SELECTION_CLIPBOARD, source);
             return true;
         } catch (e) {
@@ -641,12 +873,14 @@ class KeysharpExtension {
     // Text conveniences (the common A_Clipboard path). Read via St.Clipboard.get_text (async); write goes
     // through SetClipboardContent so the owner is a proper MetaSelection source.
     GetClipboardTextAsync(_params, invocation) {
-        if (!this._requireBroker(invocation))
+        if (!this._requireProviderPeer(invocation))
             return;
 
         try {
             (this._clipboard || St.Clipboard.get_default()).get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => {
-                try { invocation.return_value(new GLib.Variant('(s)', [text || ''])); } catch (_e) {}
+                const value = String(text || '');
+                try { invocation.return_value(new GLib.Variant('(s)',
+                    [value.length <= MAX_CLIPBOARD_BYTES / 4 ? value : ''])); } catch (_e) {}
             });
         } catch (_e) {
             try { invocation.return_value(new GLib.Variant('(s)', [''])); } catch (_e2) {}
@@ -654,189 +888,39 @@ class KeysharpExtension {
     }
 
     SetClipboardText(text) {
-        return this.SetClipboardContent('text/plain;charset=utf-8', ByteArray.fromString(String(text || '')));
+        const value = String(text || '');
+        return value.length <= MAX_CLIPBOARD_BYTES / 4
+            && this.SetClipboardContent('text/plain;charset=utf-8',
+                                        ByteArray.fromString(value));
     }
 
     _emitClipboardChanged() {
-        if (!this._dbusImpl)
+        if (this._providerConnections.size === 0)
             return;
 
         const mimetypes = this._mimetypes();
         try {
             (this._clipboard || St.Clipboard.get_default()).get_text(St.ClipboardType.CLIPBOARD, (_cb, text) => {
-                if (!this._dbusImpl)
+                if (this._providerConnections.size === 0)
                     return;
                 try {
-                    this._emitBrokerSignal('ClipboardChanged',
-                        new GLib.Variant('(sas)', [text || '', mimetypes]));
+                    const value = String(text || '');
+                    this._emitProviderSignal('ClipboardChanged',
+                        new GLib.Variant('(sas)',
+                            [value.length <= MAX_CLIPBOARD_BYTES / 4 ? value : '',
+                             mimetypes]));
                 } catch (_e) {}
             });
         } catch (_e) {
         }
     }
 
-    // The installed, root-owned keysharp-desktop broker is the provider entry point for screen capture,
-    // global window operations, and clipboard observation. It checks the matching grant before calling us.
-    // The async D-Bus form lets the compositor complete the reply when the frame is ready.
-    CaptureAreaAsync(params, invocation) {
-        if (!this._callerIsHelper(invocation)) {
-            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
-                'Screen capture is only permitted through keysharp-desktop.');
-            return;
-        }
-
-        const [x, y, width, height] = params;
-
-        if (width <= 0 || height <= 0) {
-            invocation.return_value(new GLib.Variant('(ay)', [new Uint8Array(0)]));
-            return;
-        }
-
-        let file = null;
+    // Sensitive methods are exported only on authenticated private peer connections.
+    _callerIsProviderPeer(invocation) {
         try {
-            // Cinnamon.Screenshot writes a PNG to a file (no in-memory stream API), so round-trip through a
-            // private temp file we create, read and delete inside the shell. Coordinates arrive logical; the
-            // Screenshot API wants device pixels, so scale by global.ui_scale (matching Cinnamon's own
-            // screenshot service) — the returned PNG is therefore device pixels, as the client expects.
-            const tmp = Gio.File.new_tmp('keysharp-cinnamon-capture-XXXXXX.png');
-            file = tmp[0];
-            tmp[1].close(null);
-            const path = file.get_path();
-            const scale = global.ui_scale || 1;
-
-            const screenshot = new Cinnamon.Screenshot();
-            screenshot.screenshot_area(
-                false,
-                Math.round(x * scale),
-                Math.round(y * scale),
-                Math.round(width * scale),
-                Math.round(height * scale),
-                path,
-                (_obj, success) => {
-                    let bytes = new Uint8Array(0);
-
-                    try {
-                        if (success) {
-                            const [ok, data] = GLib.file_get_contents(path);
-                            if (ok && data && data.length > 0)
-                                bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-                        }
-                    } catch (e) {
-                        global.logError(e, 'Keysharp: CaptureArea read failed');
-                    } finally {
-                        try { file.delete(null); } catch (_e) {}
-                    }
-
-                    invocation.return_value(new GLib.Variant('(ay)', [bytes]));
-                });
-        } catch (e) {
-            global.logError(e, 'Keysharp: CaptureArea failed');
-            try { if (file) file.delete(null); } catch (_e) {}
-            invocation.return_value(new GLib.Variant('(ay)', [new Uint8Array(0)]));
-        }
-    }
-
-    // Captures a single window's contents from its actor's backing buffer (Meta.WindowActor.get_image —
-    // present in Muffin 6.x), so an occluded window still captures correctly; the result is cropped to
-    // the frame rect so the C# side can derive the device-pixel scale as capture-size / frame-size.
-    // A minimized window has no live texture and yields empty (the client falls back to a rect grab).
-    CaptureWindowAsync(params, invocation) {
-        if (!this._callerIsHelper(invocation)) {
-            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
-                'Screen capture is only permitted through keysharp-desktop.');
-            return;
-        }
-
-        const [handle] = params;
-        invocation.return_value(new GLib.Variant('(ay)', [this._captureWindowBytes(handle)]));
-    }
-
-    _captureWindowBytes(handle) {
-        let file = null;
-        try {
-            const win = this._findWindow(handle);
-            if (!win)
-                return new Uint8Array(0);
-
-            const actor = win.get_compositor_private();
-            if (!actor || typeof actor.get_image !== 'function')
-                return new Uint8Array(0);
-
-            let surface = actor.get_image(null);   // the whole actor, device pixels
-            if (!surface)
-                return new Uint8Array(0);
-
-            // Crop to the frame rect (drops the shadow margin when the actor has one). All geometry is
-            // logical; the buffer is logical * ui_scale device pixels (Muffin uses integer UI scaling).
-            const scale = global.ui_scale || 1;
-            const frame = win.get_frame_rect();
-            const [ax, ay] = actor.get_position();
-            const cropX = Math.max(0, Math.round((frame.x - ax) * scale));
-            const cropY = Math.max(0, Math.round((frame.y - ay) * scale));
-            const cropW = Math.round(frame.width * scale);
-            const cropH = Math.round(frame.height * scale);
-
-            if ((cropX !== 0 || cropY !== 0 || cropW !== surface.getWidth() || cropH !== surface.getHeight())
-                && cropW > 0 && cropH > 0) {
-                const cropped = new Cairo.ImageSurface(Cairo.Format.ARGB32, cropW, cropH);
-                const cr = new Cairo.Context(cropped);
-                cr.setSourceSurface(surface, -cropX, -cropY);
-                cr.paint();
-                cr.$dispose();
-                surface = cropped;
-            }
-
-            const tmp = Gio.File.new_tmp('keysharp-cinnamon-winshot-XXXXXX.png');
-            file = tmp[0];
-            tmp[1].close(null);
-            const path = file.get_path();
-
-            surface.flush();
-            surface.writeToPNG(path);
-
-            const [ok, bytes] = GLib.file_get_contents(path);
-            if (!ok || !bytes || bytes.length === 0)
-                return new Uint8Array(0);
-
-            return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-        } catch (e) {
-            global.logError(e, 'Keysharp: CaptureWindow failed');
-            return new Uint8Array(0);
-        } finally {
-            if (file !== null) {
-                try { file.delete(null); } catch (_e) {}
-            }
-        }
-    }
-
-    // Sensitive calls are accepted only from the installed keysharp-desktop binary. The session bus supplies
-    // the caller process, and the executable must be root-owned and immutable to ordinary users.
-    _callerIsHelper(invocation) {
-        try {
-            const sender = invocation.get_sender();
-            if (!sender)
-                return false;
-
-            const reply = Gio.DBus.session.call_sync(
-                'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
-                'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
-                new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, 1000, null);
-            const [pid] = reply.deep_unpack();
-            if (!pid || pid <= 0)
-                return false;
-
-            const exeLink = `/proc/${pid}/exe`;
-            let target;
-            try { target = GLib.file_read_link(exeLink); } catch (_e) { return false; }
-            if (!target || GLib.path_get_basename(target) !== 'keysharp-desktop')
-                return false;
-
-            const info = Gio.File.new_for_path(exeLink).query_info(
-                'unix::uid,unix::mode', Gio.FileQueryInfoFlags.NONE, null);
-            const uid = info.get_attribute_uint32('unix::uid');
-            const mode = info.get_attribute_uint32('unix::mode');
-            // The package manager owns the broker binary; ordinary users cannot replace or edit it.
-            return uid === 0 && (mode & 0o022) === 0;
+            const connection = invocation.get_connection();
+            return this._providerConnections.has(connection)
+                && this._credentialUid(connection.get_peer_credentials()) === 0;
         } catch (_e) {
             return false;
         }
@@ -943,12 +1027,20 @@ class KeysharpExtension {
     // oldest live reservation for a pid belongs to the next window it maps. The pid is the only identity
     // available this early - title, app_id and geometry are all still empty when a window is created, which
     // is exactly why a client cannot recognise its own window without this.
-    ReserveWindow(pid, cookie, x, y, ttlMs) {
+    _reserveWindow(pid, cookie, x, y, ttlMs) {
         if (pid <= 0)
             return false;
 
         try {
             this._sweepPlacements();
+            const existing = this._placements.findIndex(p =>
+                p.pid === pid && p.cookie === cookie);
+            if (existing >= 0)
+                this._placements.splice(existing, 1);
+            else if (this._placements.length >= MAX_PLACEMENTS_TOTAL
+                || this._placements.filter(p => p.pid === pid).length
+                    >= MAX_PLACEMENTS_PER_PID)
+                return false;
             this._placements.push({
                 pid: pid,
                 cookie: cookie,
@@ -964,7 +1056,7 @@ class KeysharpExtension {
 
     // The compositor window a reservation ended up on, or '' if it has not been consumed (or has expired).
     // Keyed by pid too: the cookie is a per-process pointer, so two Keysharp processes can mint the same one.
-    GetReservedWindow(pid, cookie) {
+    _getReservedWindow(pid, cookie) {
         try {
             const now = GLib.get_monotonic_time() / 1000;
             const hit = this._placed[pid + ':' + cookie];
@@ -1017,8 +1109,15 @@ class KeysharpExtension {
 
             p = this._placements.splice(i, 1)[0];
 
-            if (p.cookie)
-                this._placed[p.pid + ':' + p.cookie] = {id: String(win.get_stable_sequence()), expires: p.expires};
+            if (p.cookie) {
+                const key = p.pid + ':' + p.cookie;
+                if (Object.prototype.hasOwnProperty.call(this._placed, key)
+                    || Object.keys(this._placed).length < MAX_PLACED_TOTAL)
+                    this._placed[key] = {
+                        id: String(win.get_stable_sequence()),
+                        expires: p.expires,
+                    };
+            }
         } catch (_e) {
             return;
         }
@@ -1301,7 +1400,47 @@ class KeysharpExtension {
         }
     }
 
-    RegisterHighlightOwner(ownerKey, busName) {
+    _sendMouseMoveAbsolute(x, y) {
+        if (this._vPointer === null)
+            return false;
+        this._vPointer.notify_absolute_motion(GLib.get_monotonic_time(), x, y);
+        return true;
+    }
+
+    _sendMouseMoveRelative(dx, dy) {
+        if (this._vPointer === null)
+            return false;
+        const point = global.get_pointer();
+        this._vPointer.notify_absolute_motion(
+            GLib.get_monotonic_time(), point[0] + dx, point[1] + dy);
+        return true;
+    }
+
+    _sendMouseButton(button, pressed) {
+        if (this._vPointer === null || [1, 2, 3, 8, 9].indexOf(button) < 0)
+            return false;
+        this._vPointer.notify_button(
+            GLib.get_monotonic_time(), button,
+            pressed ? Clutter.ButtonState.PRESSED : Clutter.ButtonState.RELEASED);
+        return true;
+    }
+
+    _sendMouseScroll(delta, vertical) {
+        if (this._vPointer === null || !Number.isInteger(delta)
+            || delta === 0 || Math.abs(delta) > 12000)
+            return false;
+        const direction = vertical
+            ? (delta > 0 ? Clutter.ScrollDirection.UP : Clutter.ScrollDirection.DOWN)
+            : (delta > 0 ? Clutter.ScrollDirection.RIGHT : Clutter.ScrollDirection.LEFT);
+        const time = GLib.get_monotonic_time();
+        const notches = Math.max(1, Math.abs(Math.round(delta / 120)));
+        for (let index = 0; index < notches; index++)
+            this._vPointer.notify_discrete_scroll(
+                time, direction, Clutter.ScrollSource.WHEEL);
+        return true;
+    }
+
+    _registerHighlightOwner(ownerKey, busName) {
         const owner = this._parseOverlayOwner(ownerKey);
         const bus = String(busName || '');
 
@@ -1326,11 +1465,17 @@ class KeysharpExtension {
         return true;
     }
 
-    ShowHighlight(id, ownerKey, busName, x, y, width, height, color, thickness) {
+    _showHighlight(id, ownerKey, busName, x, y, width, height, color, thickness) {
         try {
             const owner = this._parseOverlayOwner(ownerKey);
             const key = this._overlayKey(id, owner.key);
             const bus = String(busName || '');
+
+            if ((width >= 1 || height >= 1)
+                && (!this._validOverlayGeometry(width, height)
+                    || !this._overlayQuotaAvailable(owner.key,
+                                                    this._highlights.has(key))))
+                return false;
 
             this._cancelOverlayReconnectTimer(owner.key);
             this._removeHighlightByKey(key);
@@ -1381,7 +1526,7 @@ class KeysharpExtension {
         }
     }
 
-    HideHighlight(id, ownerKey, _busName) {
+    _hideHighlight(id, ownerKey, _busName) {
         const owner = this._parseOverlayOwner(ownerKey);
         this._removeHighlightByKey(this._overlayKey(id, owner.key));
 
@@ -1394,7 +1539,7 @@ class KeysharpExtension {
         return true;
     }
 
-    ShowImageOverlay(id, ownerKey, busName, x, y, width, height, pngData) {
+    _showImageOverlay(id, ownerKey, busName, x, y, width, height, pngData) {
         try {
             const owner = this._parseOverlayOwner(ownerKey);
             const key = this._overlayKey(id, owner.key);
@@ -1404,30 +1549,16 @@ class KeysharpExtension {
             if (!pngData || pngData.length === 0 || width < 1 || height < 1)
                 return this._clearImageOverlay(key);
 
+            if (!this._validOverlayGeometry(width, height)
+                || pngData.length > MAX_OVERLAY_PNG_BYTES
+                || !this._overlayQuotaAvailable(owner.key,
+                                                this._imageOverlays.has(key)))
+                return false;
+
             return this._presentImageOverlay(key, owner, busName, x, y, width, height,
                 () => this._decodeImageFrame(pngData));
         } catch (e) {
             global.logError(e, 'Keysharp: ShowImageOverlay failed');
-            return false;
-        }
-    }
-
-    // The same overlay, with the frame handed over as shared memory instead of an encoded PNG. Only the
-    // pixels arrive differently; everything downstream is the ShowImageOverlay path.
-    ShowImageOverlayShm(id, ownerKey, busName, x, y, width, height, shmPath, pixelWidth, pixelHeight, stride) {
-        try {
-            const owner = this._parseOverlayOwner(ownerKey);
-            const key = this._overlayKey(id, owner.key);
-
-            this._cancelOverlayReconnectTimer(owner.key);
-
-            if (!shmPath || pixelWidth < 1 || pixelHeight < 1 || width < 1 || height < 1)
-                return this._clearImageOverlay(key);
-
-            return this._presentImageOverlay(key, owner, busName, x, y, width, height,
-                entry => this._mapImageFrame(entry, shmPath, pixelWidth, pixelHeight, stride));
-        } catch (e) {
-            global.logError(e, 'Keysharp: ShowImageOverlayShm failed');
             return false;
         }
     }
@@ -1449,7 +1580,15 @@ class KeysharpExtension {
         const existing = this._imageOverlays.get(key);
         const frame = makeFrame(existing);
 
-        if (!frame)
+        if (!frame || !this._validOverlayGeometry(frame.width, frame.height)
+            || frame.rowStride < frame.width * 3
+            || frame.rowStride * frame.height > MAX_OVERLAY_PIXELS * 4)
+            return false;
+        const decodedBytes = Math.max(frame.rowStride * frame.height,
+                                      frame.width * frame.height * 4);
+        if (!Number.isSafeInteger(decodedBytes)
+            || !this._overlayBytesAvailable(owner.key, decodedBytes,
+                                             existing))
             return false;
 
         if (existing && existing.actor) {
@@ -1458,6 +1597,7 @@ class KeysharpExtension {
                 existing.ownerPid = owner.pid;
                 existing.ownerStartTime = owner.startTime;
                 existing.busName = bus;
+                existing.decodedBytes = decodedBytes;
                 this._ensureOverlayCleanupTimer();
                 return true;
             } catch (_e) {
@@ -1479,19 +1619,20 @@ class KeysharpExtension {
             ownerPid: owner.pid,
             ownerStartTime: owner.startTime,
             busName: bus,
-            shm: frame.shm || null
+            decodedBytes: decodedBytes
         });
         this._ensureOverlayCleanupTimer();
         return true;
     }
 
-    MoveImageOverlay(id, ownerKey, _busName, x, y, width, height) {
+    _moveImageOverlay(id, ownerKey, _busName, x, y, width, height) {
         try {
             const owner = this._parseOverlayOwner(ownerKey);
             const entry = this._imageOverlays.get(this._overlayKey(id, owner.key));
 
             // No live actor for this id: report failure so the caller re-sends the pixels via ShowImageOverlay.
-            if (!entry || !entry.actor)
+            if (!entry || !entry.acto
+                || !this._validOverlayGeometry(width, height))
                 return false;
 
             entry.actor.set_position(x, y);
@@ -1503,7 +1644,7 @@ class KeysharpExtension {
         }
     }
 
-    HideImageOverlay(id, ownerKey, _busName) {
+    _hideImageOverlay(id, ownerKey, _busName) {
         const owner = this._parseOverlayOwner(ownerKey);
         this._removeImageOverlayByKey(this._overlayKey(id, owner.key));
 
@@ -1518,6 +1659,43 @@ class KeysharpExtension {
 
     _overlayKey(id, ownerKey) {
         return `${ownerKey}:${id}`;
+    }
+
+    _validOverlayGeometry(width, height) {
+        return Number.isInteger(width) && Number.isInteger(height)
+            && width > 0 && height > 0
+            && width <= MAX_OVERLAY_DIMENSION
+            && height <= MAX_OVERLAY_DIMENSION
+            && width * height <= MAX_OVERLAY_PIXELS;
+    }
+
+    _overlayQuotaAvailable(ownerKey, existing) {
+        if (existing)
+            return true;
+        if (this._highlights.size + this._imageOverlays.size
+                >= MAX_OVERLAYS_TOTAL)
+            return false;
+        let ownerCount = 0;
+        for (const entries of [this._highlights, this._imageOverlays])
+            for (const entry of entries.values())
+                if (entry.ownerKey === ownerKey)
+                    ownerCount++;
+        return ownerCount < MAX_OVERLAYS_PER_OWNER;
+    }
+
+    _overlayBytesAvailable(ownerKey, decodedBytes, existing) {
+        let total = 0;
+        let ownerTotal = 0;
+        for (const entry of this._imageOverlays.values()) {
+            const bytes = entry.decodedBytes || 0;
+            total += bytes;
+            if (entry.ownerKey === ownerKey)
+                ownerTotal += bytes;
+        }
+        const previous = existing ? existing.decodedBytes || 0 : 0;
+        return total - previous + decodedBytes <= MAX_OVERLAY_BYTES_TOTAL
+            && ownerTotal - previous + decodedBytes
+                <= MAX_OVERLAY_BYTES_PER_OWNER;
     }
 
     _parseOverlayOwner(ownerKey) {
@@ -1622,9 +1800,6 @@ class KeysharpExtension {
             return;
         }
 
-        if (name === this._brokerBusName && oldOwner && !newOwner)
-            this._brokerBusName = null;
-
         if (!name || !oldOwner || newOwner)
             return;
 
@@ -1703,12 +1878,28 @@ class KeysharpExtension {
     }
 
     _decodeImageFrame(pngData) {
+        const data = pngData instanceof Uint8Array
+            ? pngData : new Uint8Array(pngData || []);
+        if (data.length < 33 || data.length > MAX_OVERLAY_PNG_BYTES)
+            throw new Error('Invalid PNG overlay image.');
+        const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        if (!signature.every((value, index) => data[index] === value)
+            || String.fromCharCode.apply(null, data.slice(12, 16)) !== 'IHDR')
+            throw new Error('Invalid PNG overlay image.');
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        const width = view.getUint32(16, false);
+        const height = view.getUint32(20, false);
+        if (view.getUint32(8, false) !== 13
+            || !this._validOverlayGeometry(width, height))
+            throw new Error('Invalid PNG overlay dimensions.');
         const loader = GdkPixbuf.PixbufLoader.new();
-        loader.write(pngData);
+        loader.write(data);
         loader.close();
         const pixbuf = loader.get_pixbuf();
 
-        if (!pixbuf)
+        if (!pixbuf || pixbuf.get_width() !== width
+            || pixbuf.get_height() !== height
+            || pixbuf.get_rowstride() * height > MAX_OVERLAY_PIXELS * 4)
             throw new Error('Could not decode PNG overlay image.');
 
         return {
@@ -1718,50 +1909,6 @@ class KeysharpExtension {
             width: pixbuf.get_width(),
             height: pixbuf.get_height(),
             rowStride: pixbuf.get_rowstride(),
-        };
-    }
-
-    // Maps the client's frame buffer. Both processes map the same file, so the pixels the client wrote are
-    // already here and the only per-frame cost is the texture upload in _updateImageActor. The mapping is
-    // kept on the overlay entry and redone only when the client names a different file, which is how it
-    // reports a size change -- a resized overlay always gets a fresh path.
-    _mapImageFrame(entry, shmPath, width, height, stride) {
-        const path = String(shmPath);
-
-        // Only ever map a buffer one of our own clients wrote.
-        if (!GLib.path_get_basename(path).startsWith('keysharp-overlay-'))
-            return null;
-
-        let shm = entry ? entry.shm : null;
-
-        if (!shm || shm.path !== path || shm.width !== width || shm.height !== height || shm.stride !== stride) {
-            let mapped = null;
-
-            try {
-                mapped = GLib.MappedFile.new(path, false);
-            } catch (_e) {
-                return null;
-            }
-
-            // A short file would have the texture upload read past the mapping.
-            if (mapped.get_length() < stride * height)
-                return null;
-
-            shm = {path: path, mapped: mapped, width: width, height: height, stride: stride};
-
-            if (entry)
-                entry.shm = shm;
-        }
-
-        return {
-            // Shares the mapping rather than copying it, so this stays cheap at video rates.
-            pixels: shm.mapped.get_bytes().toArray(),
-            // Cairo's ARGB32, which is what the client draws into: premultiplied BGRA on little-endian.
-            format: Cogl.PixelFormat.BGRA_8888_PRE,
-            width: width,
-            height: height,
-            rowStride: stride,
-            shm: shm,
         };
     }
 
@@ -1844,17 +1991,6 @@ class KeysharpExtension {
         }
     }
 
-    _emitActiveWindowChanged() {
-        if (!this._dbusImpl)
-            return;
-
-        try {
-            this._emitBrokerSignal('ActiveWindowChanged',
-                new GLib.Variant('(s)', [this._getActiveWindow()]));
-        } catch (_e) {
-        }
-    }
-
     _emitWindowEvent(type, win) {
         if (!win)
             return;
@@ -1871,24 +2007,19 @@ class KeysharpExtension {
     }
 
     _emitWindowEventRaw(type, json) {
-        if (!this._dbusImpl)
+        if (this._providerConnections.size === 0)
             return;
 
         try {
-            this._emitBrokerSignal('WindowEvent',
+            this._emitProviderSignal('WindowEvent',
                 new GLib.Variant('(ss)', [type, json]));
         } catch (_e) {
         }
     }
 
-    _emitBrokerSignal(name, parameters) {
-        if (!this._brokerBusName)
-            return;
-
-        try {
-            Gio.DBus.session.emit_signal(this._brokerBusName, OBJECT_PATH,
-                DBUS_INTERFACE_NAME, name, parameters);
-        } catch (_e) {
+    _emitProviderSignal(name, parameters) {
+        for (const entry of this._providerConnections.values()) {
+            try { entry.implementation.emit_signal(name, parameters); } catch (_e) {}
         }
     }
 

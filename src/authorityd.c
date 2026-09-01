@@ -1,30 +1,44 @@
-#include "common.h"
-#include "authority_admin.h"
-#include "grants.h"
-#include "keysharp_desktop/protocol.h"
-#include "polkit_result.h"
+#include "backend.h"
+#include "backend_protocol.h"
+#include "capture_worker.h"
+#include "protocol.h"
+#include "operation_result.h"
+#include "permission_domain.h"
+#include "protocol_io.h"
+#include "provider.h"
 #include "roles.h"
+#include "transport.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <gio/gio.h>
+#include <keysharp_permissions/permissions.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define KSD_POLKIT_ACTION "org.keysharp.desktop.grant"
-#define KSD_MAX_AUTHORITY_WORKERS 32u
+#define KSD_MAX_AUTHORITY_WORKERS 128u
+#define KSD_MAX_AUTHORITY_WORKERS_PER_UID 32u
+#define KSD_MAX_BACKEND_REGISTRATIONS 128u
+#define KSD_MAX_AUTHORITY_INFLIGHT_BYTES \
+    (KSD_MAX_CAPTURE_BYTES + 16u * 1024u * 1024u)
+#define KSD_GENERATION_POLL_MS 250
 #ifndef KSD_PKCHECK_PATH
 #define KSD_PKCHECK_PATH "/usr/bin/pkcheck"
 #endif
@@ -32,23 +46,111 @@
 typedef struct authority_state {
     pthread_mutex_t mutex;
     size_t workers;
+    size_t inflight_bytes;
+    struct {
+        uid_t uid;
+        size_t count;
+    } worker_usage[KSD_MAX_AUTHORITY_WORKERS];
+    struct {
+        bool active;
+        uid_t uid;
+        int descriptor;
+        uint32_t backend;
+        ksp_identity identity;
+    } backends[KSD_MAX_BACKEND_REGISTRATIONS];
+    ksp_store *store;
 } authority_state;
+
+typedef struct authority_session {
+    authority_state *state;
+    int client_fd;
+    ksp_identity identity;
+    gid_t gid;
+    uint16_t role;
+    uint32_t backend;
+    uint32_t requested_scopes;
+    uint32_t granted_scopes;
+    uint64_t generation;
+    uint64_t identity_checked_at;
+} authority_session;
 
 typedef struct authority_client {
     authority_state *state;
     int descriptor;
+    struct ucred credentials;
 } authority_client;
+static const uint8_t public_magic[4] = {
+    KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+    KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+};
 
-static int inherited_socket(void)
+static bool same_identity(const ksp_identity *left,
+                          const ksp_identity *right)
+{
+    return left->uid == right->uid && left->pid == right->pid
+        && left->start_time == right->start_time
+        && strcmp(left->hash, right->hash) == 0;
+}
+
+static uint64_t monotonic_seconds(void)
+{
+    struct timespec now;
+    return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+        ? (uint64_t)now.tv_sec : 0u;
+}
+
+static bool decimal_equals(const char *text, unsigned long expected)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = text == NULL ? 0u : strtoul(text, &end, 10);
+    return text != NULL && text[0] != '\0' && errno == 0
+        && end != NULL && *end == '\0' && value == expected;
+}
+
+static int inherited_socket(bool *activation_present)
 {
     const char *listen_pid = getenv("LISTEN_PID");
     const char *listen_fds = getenv("LISTEN_FDS");
+    const char *listen_names = getenv("LISTEN_FDNAMES");
+    struct sockaddr_un address;
+    socklen_t address_size = sizeof(address);
+    int type = 0;
+    int accepting = 0;
+    socklen_t option_size = sizeof(int);
+    struct stat status;
 
-    if (listen_pid != NULL && listen_fds != NULL
-        && (pid_t)strtol(listen_pid, NULL, 10) == getpid()
-        && strtol(listen_fds, NULL, 10) >= 1)
-        return 3;
-    return -1;
+    *activation_present = listen_pid != NULL || listen_fds != NULL
+        || listen_names != NULL;
+    if (!*activation_present)
+        return -1;
+    if (!decimal_equals(listen_pid, (unsigned long)getpid())
+        || !decimal_equals(listen_fds, 1u)
+        || listen_names == NULL || strcmp(listen_names, "public") != 0
+        || fstat(3, &status) != 0 || !S_ISSOCK(status.st_mode)
+        || getsockopt(3, SOL_SOCKET, SO_TYPE, &type, &option_size) != 0
+        || option_size != sizeof(type) || type != SOCK_STREAM) {
+        errno = EINVAL;
+        return -1;
+    }
+    option_size = sizeof(accepting);
+    memset(&address, 0, sizeof(address));
+    if (getsockopt(3, SOL_SOCKET, SO_ACCEPTCONN,
+                   &accepting, &option_size) != 0
+        || option_size != sizeof(accepting) || accepting != 1
+        || getsockname(3, (struct sockaddr *)&address, &address_size) != 0
+        || address.sun_family != AF_UNIX
+        || address_size <= offsetof(struct sockaddr_un, sun_path)
+        || strncmp(address.sun_path, KSD_SYSTEM_SOCKET,
+                   sizeof(address.sun_path)) != 0
+        || fcntl(3, F_SETFD, FD_CLOEXEC) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    (void)unsetenv("LISTEN_PID");
+    (void)unsetenv("LISTEN_FDS");
+    (void)unsetenv("LISTEN_FDNAMES");
+    return 3;
 }
 
 static int create_socket(void)
@@ -56,288 +158,1241 @@ static int create_socket(void)
     struct sockaddr_un address;
     int descriptor;
 
-    if (ksd_make_parent_directories(KSD_AUTHORITY_SOCKET, 0755) != 0)
+    if (ksd_make_parent_directories(KSD_SYSTEM_SOCKET, 0755) != 0)
         return -1;
     descriptor = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (descriptor < 0)
         return -1;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    (void)snprintf(address.sun_path, sizeof(address.sun_path), "%s", KSD_AUTHORITY_SOCKET);
-    (void)unlink(KSD_AUTHORITY_SOCKET);
-    if (bind(descriptor, (const struct sockaddr *)&address, sizeof(address)) != 0
-        || chmod(KSD_AUTHORITY_SOCKET, 0666) != 0 || listen(descriptor, 32) != 0) {
+    if (strlen(KSD_SYSTEM_SOCKET) >= sizeof(address.sun_path)) {
+        close(descriptor);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(address.sun_path, KSD_SYSTEM_SOCKET,
+           sizeof(KSD_SYSTEM_SOCKET));
+    (void)unlink(KSD_SYSTEM_SOCKET);
+    if (bind(descriptor, (const struct sockaddr *)&address,
+             sizeof(address)) != 0
+        || chmod(KSD_SYSTEM_SOCKET, 0666) != 0
+        || listen(descriptor, (int)KSD_MAX_AUTHORITY_WORKERS) != 0) {
         close(descriptor);
         return -1;
     }
     return descriptor;
 }
 
-static int run_pkcheck(const ksd_process_identity *identity, uint32_t requested)
+static uint64_t monotonic_milliseconds(void)
 {
-    char process[128];
-    char capabilities[32];
-    char capability_names[160];
-    char prompt[KSD_PATH_MAX + 256u];
-    char executable[KSD_PATH_MAX];
-    pid_t child;
-    int status = 0;
-
-    (void)snprintf(process, sizeof(process), "%ld,%llu,%lu",
-                   (long)identity->pid,
-                   (unsigned long long)identity->start_time,
-                   (unsigned long)identity->uid);
-    (void)snprintf(capabilities, sizeof(capabilities), "0x%08x", requested);
-    if (ksd_format_capability_names(requested, capability_names,
-                                    sizeof(capability_names)) != 0)
-        return -1;
-    ksd_sanitize_display_text(identity->executable, executable,
-                              sizeof(executable));
-    int prompt_length = snprintf(prompt, sizeof(prompt),
-        "Authentication is required to permanently grant %s to %s",
-        capability_names, executable);
-    if (prompt_length <= 0 || (size_t)prompt_length >= sizeof(prompt))
-        return -1;
-    child = fork();
-    if (child < 0)
-        return -1;
-    if (child == 0) {
-        if (clearenv() != 0
-            || setenv("PATH", "/usr/bin:/bin", 1) != 0
-            || setenv("LANG", "C.UTF-8", 1) != 0)
-            _exit(127);
-        char *const arguments[] = {
-            "pkcheck",
-            "--action-id", KSD_POLKIT_ACTION,
-            "--process", process,
-            "--allow-user-interaction",
-            "--detail", "app.path", executable,
-            "--detail", "desktop.capabilities", capabilities,
-            "--detail", "desktop.capability-names", capability_names,
-            "--detail", "polkit.message", prompt,
-            NULL,
-        };
-        execv(KSD_PKCHECK_PATH, arguments);
-        _exit(127);
-    }
-
-    for (unsigned elapsed = 0u; elapsed < KSD_POLKIT_TIMEOUT_SECONDS * 10u; elapsed++) {
-        pid_t waited = waitpid(child, &status, WNOHANG);
-        if (waited == child)
-            return WIFEXITED(status)
-                ? (int)ksd_polkit_result_from_exit(WEXITSTATUS(status))
-                : (int)KSD_POLKIT_UNAVAILABLE;
-        if (waited < 0 && errno != EINTR)
-            return -1;
-        struct timespec delay = { .tv_sec = 0, .tv_nsec = 100000000L };
-        (void)nanosleep(&delay, NULL);
-    }
-
-    (void)kill(child, SIGKILL);
-    (void)waitpid(child, &status, 0);
-    return -1;
+    struct timespec now;
+    return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+        ? (uint64_t)now.tv_sec * 1000u
+            + (uint64_t)now.tv_nsec / 1000000u
+        : 0u;
 }
 
-static uint16_t check_grant(const ksd_authority_request *request, int client_fd,
-                            uint32_t *granted)
+static bool set_socket_timeouts(int descriptor, uint32_t seconds)
 {
-    struct ucred credentials;
-    socklen_t credentials_length = sizeof(credentials);
-    ksd_process_identity identity;
-    ksd_process_identity verified;
-    uint64_t start_time;
-    uint64_t grant_generation = 0u;
-    uint32_t existing = 0u;
-    uint32_t requested = request->capabilities & KSD_CAP_ALL;
-    uint32_t missing;
-    uint16_t status = KSD_AUTH_STATUS_ERROR;
+    struct timeval timeout = {
+        .tv_sec = (time_t)seconds,
+        .tv_usec = 0,
+    };
+    return setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                      &timeout, sizeof(timeout)) == 0
+        && setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                      &timeout, sizeof(timeout)) == 0;
+}
+
+static bool wait_until(int descriptor, short events, uint64_t deadline)
+{
+    for (;;) {
+        uint64_t now = monotonic_milliseconds();
+        if (now == 0u || now >= deadline) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+        uint64_t remaining = deadline - now;
+        struct pollfd item = { .fd = descriptor, .events = events };
+        int ready = poll(&item, 1u, remaining > (uint64_t)INT_MAX
+            ? INT_MAX : (int)remaining);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 || (item.revents & (POLLERR | POLLNVAL)) != 0)
+            return false;
+        return (item.revents & (events | POLLHUP | POLLRDHUP)) != 0;
+    }
+}
+
+static bool fixed_io_until(int descriptor, void *data, size_t length,
+                           bool write_data, uint64_t deadline)
+{
+    uint8_t *bytes = data;
+    size_t offset = 0u;
+    while (offset < length) {
+        if (!wait_until(descriptor, write_data ? POLLOUT : POLLIN, deadline))
+            return false;
+        ssize_t count = write_data
+            ? send(descriptor, bytes + offset, length - offset,
+                   MSG_DONTWAIT | MSG_NOSIGNAL)
+            : recv(descriptor, bytes + offset, length - offset,
+                   MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN
+                          || errno == EWOULDBLOCK))
+            continue;
+        if (count <= 0)
+            return false;
+        offset += (size_t)count;
+    }
+    return true;
+}
+
+static bool peek_connection_magic(int descriptor, uint8_t magic[4])
+{
+    uint64_t now = monotonic_milliseconds();
+    if (now == 0u)
+        return false;
+    uint64_t deadline = now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
+    for (;;) {
+        int available = 0;
+        if (ioctl(descriptor, FIONREAD, &available) != 0)
+            return false;
+        if (available >= 4) {
+            ssize_t count = recv(descriptor, magic, 4u,
+                                 MSG_PEEK | MSG_DONTWAIT);
+            return count == 4;
+        }
+        if (!wait_until(descriptor, POLLIN, deadline))
+            return false;
+        if (available > 0) {
+            struct timespec delay = { .tv_nsec = 1000000L };
+            (void)nanosleep(&delay, NULL);
+        }
+    }
+}
+
+static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
+                                 ksp_identity *identity)
+{
+    char proc_path[64];
+    struct stat authority_status;
+    struct stat peer_status;
+    int length = snprintf(proc_path, sizeof(proc_path), "/proc/%ld/exe",
+                          (long)peer->pid);
+    return peer->uid != 0u && peer->pid > 0
+        && backend >= KSD_BACKEND_KWIN
+        && backend <= KSD_BACKEND_CINNAMON
+        && length > 0 && (size_t)length < sizeof(proc_path)
+        && stat("/proc/self/exe", &authority_status) == 0
+        && stat(proc_path, &peer_status) == 0
+        && S_ISREG(authority_status.st_mode)
+        && authority_status.st_uid == 0u
+        && (authority_status.st_mode & (S_IWGRP | S_IWOTH)) == 0
+        && authority_status.st_dev == peer_status.st_dev
+        && authority_status.st_ino == peer_status.st_ino
+        && ksp_identity_capture(peer->pid, peer->uid, identity) == 0
+        && ksd_backend_resolve_process(peer->pid) == backend;
+}
+
+static bool register_backend(authority_state *state, int descriptor,
+                             const struct ucred *peer, uint32_t backend,
+                             const ksp_identity *identity)
+{
+    size_t free_slot = KSD_MAX_BACKEND_REGISTRATIONS;
+    bool registered = false;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++) {
+        if (state->backends[index].active
+            && state->backends[index].uid == peer->uid)
+            goto done;
+        if (!state->backends[index].active
+            && free_slot == KSD_MAX_BACKEND_REGISTRATIONS)
+            free_slot = index;
+    }
+    if (free_slot < KSD_MAX_BACKEND_REGISTRATIONS) {
+        state->backends[free_slot].active = true;
+        state->backends[free_slot].uid = peer->uid;
+        state->backends[free_slot].descriptor = descriptor;
+        state->backends[free_slot].backend = backend;
+        state->backends[free_slot].identity = *identity;
+        registered = true;
+    }
+done:
+    pthread_mutex_unlock(&state->mutex);
+    return registered;
+}
+
+static void unregister_backend(authority_state *state, uid_t uid,
+                               int descriptor)
+{
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid
+            && state->backends[index].descriptor == descriptor) {
+            memset(&state->backends[index], 0,
+                   sizeof(state->backends[index]));
+            state->backends[index].descriptor = -1;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static uint32_t registered_backend(authority_state *state, uid_t uid)
+{
+    ksp_identity expected = { 0 };
+    int descriptor = -1;
+    uint32_t backend = KSD_BACKEND_NONE;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid) {
+            expected = state->backends[index].identity;
+            descriptor = state->backends[index].descriptor;
+            backend = state->backends[index].backend;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    if (descriptor < 0 || backend == KSD_BACKEND_NONE)
+        return KSD_BACKEND_NONE;
+    ksp_identity verified;
+    if (ksp_identity_revalidate(&expected, &verified) != 0
+        || !same_identity(&expected, &verified)
+        || ksd_backend_resolve_process(expected.pid) != backend)
+        return KSD_BACKEND_NONE;
+    pthread_mutex_lock(&state->mutex);
+    uint32_t result = KSD_BACKEND_NONE;
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid
+            && state->backends[index].descriptor == descriptor
+            && state->backends[index].backend == backend
+            && same_identity(&state->backends[index].identity, &expected)) {
+            result = backend;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return result;
+}
+
+static bool send_backend_ack(int descriptor, uint16_t status,
+                             uint32_t backend, uint64_t deadline)
+{
+    uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
+    memcpy(reply, ksd_backend_ack_magic, sizeof(ksd_backend_ack_magic));
+    ksd_encode_u16(reply + 4u, KSD_BACKEND_REGISTRATION_VERSION);
+    ksd_encode_u16(reply + 6u, status);
+    ksd_encode_u32(reply + 8u, backend);
+    return fixed_io_until(descriptor, reply, sizeof(reply), true, deadline);
+}
+
+static void handle_backend_connection(authority_state *state, int descriptor,
+                                      const struct ucred *peer)
+{
+    uint8_t registration[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
+    ksp_identity identity;
+    uint32_t backend = KSD_BACKEND_NONE;
+    uint64_t now = monotonic_milliseconds();
+    if (now == 0u)
+        return;
+    uint64_t deadline = now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
+    bool valid = fixed_io_until(descriptor, registration,
+                                sizeof(registration), false, deadline)
+        && memcmp(registration, ksd_backend_registration_magic,
+                  sizeof(ksd_backend_registration_magic)) == 0
+        && ksd_decode_u16(registration + 4u)
+            == KSD_BACKEND_REGISTRATION_VERSION
+        && ksd_decode_u16(registration + 6u) == 0u
+        && ksd_decode_u32(registration + 12u) == 0u;
+    if (valid)
+        backend = ksd_decode_u32(registration + 8u);
+    valid = valid && trusted_backend_peer(peer, backend, &identity)
+        && register_backend(state, descriptor, peer, backend, &identity);
+    if (!valid) {
+        (void)send_backend_ack(descriptor, KSD_BACKEND_ACK_REJECTED,
+                               KSD_BACKEND_NONE, deadline);
+        return;
+    }
+    if (!send_backend_ack(descriptor, KSD_BACKEND_ACK_ACCEPTED,
+                          backend, deadline)) {
+        unregister_backend(state, peer->uid, descriptor);
+        return;
+    }
+    for (;;) {
+        struct pollfd item = {
+            .fd = descriptor,
+            .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
+        };
+        int ready = poll(&item, 1u, 1000);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0 || registered_backend(state, peer->uid) != backend
+            || (ready > 0 && (item.revents
+                & (POLLIN | POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0))
+            break;
+    }
+    unregister_backend(state, peer->uid, descriptor);
+}
+
+static bool build_response(const ksd_frame *request, uint32_t status,
+                           uint32_t detail, const char *diagnostic,
+                           const void *tail, uint32_t tail_length,
+                           bool more, ksd_frame *response)
+{
+    ksd_buffer payload;
+    size_t diagnostic_length = diagnostic == NULL ? 0u : strlen(diagnostic);
+    bool ok;
+
+    if (request == NULL || response == NULL || request->request_id == 0u
+        || diagnostic_length > KSD_MAX_TEXT_BYTES
+        || (status == KSD_STATUS_OK && diagnostic_length != 0u)
+        || (tail_length != 0u && tail == NULL))
+        return false;
+    memset(response, 0, sizeof(*response));
+    memcpy(response->magic, public_magic, sizeof(response->magic));
+    response->major = KSD_PROTOCOL_MAJOR;
+    response->minor = KSD_PROTOCOL_MINOR;
+    response->opcode = request->opcode;
+    response->flags =
+        (uint16_t)(KSD_FLAG_RESPONSE | (more ? KSD_FLAG_MORE : 0u));
+    response->request_id = request->request_id;
+    ksd_buffer_init(&payload, KSD_MAX_CAPTURE_BYTES + 64u);
+    ok = ksd_buffer_u32(&payload, status)
+        && ksd_buffer_u32(&payload, detail);
+    if (ok && status != KSD_STATUS_OK && diagnostic != NULL)
+        ok = ksd_buffer_u32(&payload, (uint32_t)diagnostic_length)
+            && ksd_buffer_bytes(&payload, diagnostic, diagnostic_length);
+    if (ok && status == KSD_STATUS_OK)
+        ok = ksd_buffer_bytes(&payload, tail, tail_length);
+    if (!ok || payload.length > UINT32_MAX) {
+        ksd_buffer_clear(&payload);
+        return false;
+    }
+    response->payload = payload.data;
+    response->payload_length = (uint32_t)payload.length;
+    return true;
+}
+
+static bool forward_public(authority_session *session,
+                           const ksd_frame *public_frame)
+{
+    return session != NULL && public_frame != NULL
+        && ksd_frame_write(session->client_fd, public_frame);
+}
+
+static bool forward_response(authority_session *session,
+                             const ksd_frame *request,
+                             uint32_t status, uint32_t detail,
+                             const char *diagnostic,
+                             const void *tail, uint32_t tail_length,
+                             bool more)
+{
+    ksd_frame response;
+    if (!build_response(request, status, detail, diagnostic,
+                        tail, tail_length, more, &response))
+        return false;
+    bool ok = forward_public(session, &response);
+    ksd_frame_clear(&response);
+    return ok;
+}
+
+static bool forward_event(authority_session *session, uint16_t opcode,
+                          const void *payload, uint32_t payload_length)
+{
+    ksd_frame event = {
+        .magic = {
+            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+        },
+        .major = KSD_PROTOCOL_MAJOR,
+        .minor = KSD_PROTOCOL_MINOR,
+        .opcode = opcode,
+        .flags = KSD_FLAG_EVENT,
+        .payload_length = payload_length,
+        .request_id = 0u,
+        .payload = (uint8_t *)payload,
+    };
+    return forward_public(session, &event);
+}
+
+static bool send_revoked(authority_session *session, uint32_t scopes)
+{
+    uint8_t payload[8] = { 0 };
+    ksd_encode_u32(payload, scopes);
+    return scopes == 0u
+        || forward_event(session, KSD_OP_SESSION_REVOKED,
+                         payload, sizeof(payload));
+}
+
+static bool session_identity_refresh(authority_session *session)
+{
+    ksp_identity verified;
+    if (ksp_identity_revalidate(&session->identity, &verified) != 0
+        || !same_identity(&session->identity, &verified))
+        return false;
+    session->identity = verified;
+    session->identity_checked_at = monotonic_seconds();
+    return true;
+}
+
+static bool session_refresh(authority_session *session, bool force_identity,
+                            bool notify, bool *generation_changed)
+{
+    uint64_t generation;
+    uint32_t allowed = 0u;
+    uint32_t revoked;
+    bool changed;
+
+    if (generation_changed != NULL)
+        *generation_changed = false;
+    if (session->requested_scopes == 0u)
+        return !force_identity || session_identity_refresh(session);
+    if (ksp_store_generation(session->state->store, session->identity.uid,
+                             &generation) != 0)
+        goto failed;
+    if (force_identity || generation != session->generation) {
+        if (!session_identity_refresh(session))
+            goto failed;
+    }
+    if (session->requested_scopes != 0u) {
+        if (ksp_store_check_at_generation(session->state->store,
+                session->identity.uid, session->identity.hash,
+                session->requested_scopes, &allowed, &generation) != 0)
+            goto failed;
+    }
+    revoked = session->granted_scopes & ~allowed;
+    changed = generation != session->generation;
+    session->generation = generation;
+    session->granted_scopes = allowed;
+    if (generation_changed != NULL)
+        *generation_changed = changed;
+    return !notify || send_revoked(session, revoked);
+
+failed:
+    revoked = session->granted_scopes;
+    session->granted_scopes = 0u;
+    if (notify)
+        (void)send_revoked(session, revoked);
+    return false;
+}
+
+static bool descriptor_disconnected(int descriptor)
+{
+    if (descriptor < 0)
+        return false;
+    struct pollfd item = {
+        .fd = descriptor,
+        .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
+    };
+    int ready = poll(&item, 1u, 0);
+    if (ready < 0)
+        return errno != EINTR;
+    if (ready == 0)
+        return false;
+    if ((item.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
+        return true;
+    if ((item.revents & POLLIN) == 0)
+        return false;
+    uint8_t byte;
+    ssize_t count = recv(descriptor, &byte, sizeof(byte),
+                         MSG_PEEK | MSG_DONTWAIT);
+    return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK
+                          && errno != EINTR);
+}
+
+static bool authority_disconnected(void *user_data)
+{
+    authority_session *session = user_data;
+    return descriptor_disconnected(session->client_fd);
+}
+
+static bool capture_still_authorized(void *user_data)
+{
+    authority_session *session = user_data;
+    return !descriptor_disconnected(session->client_fd)
+        && session_refresh(session, true, true, NULL)
+        && (session->granted_scopes & KSP_SCOPE_SCREEN_CAPTURE)
+            == KSP_SCOPE_SCREEN_CAPTURE;
+}
+
+static uint32_t authorize_scopes(authority_session *session,
+                                 uint32_t requested, uint16_t auth_mode,
+                                 uint32_t *granted)
+{
+    uint32_t allowed = 0u;
+    uint64_t generation;
     int prompt_lock = -1;
+    ksp_identity verified;
+    uint32_t status = KSD_STATUS_INTERNAL;
 
-    *granted = 0u;
-    if (client_fd < 0 || requested != request->capabilities
-        || getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_length) != 0)
-        return KSD_AUTH_STATUS_ERROR;
+    *granted = session->granted_scopes;
+    if (requested == 0u
+        || (requested & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u
+        || (auth_mode != KSD_AUTH_CHECK && auth_mode != KSD_AUTH_REQUEST))
+        return KSD_STATUS_INVALID_REQUEST;
+    if (ksp_store_check_at_generation(session->state->store,
+            session->identity.uid, session->identity.hash, requested,
+            &allowed, &generation) != 0)
+        return KSD_STATUS_INTERNAL;
+    session->requested_scopes |= requested;
+    session->generation = generation;
+    session->granted_scopes |= allowed;
+    if ((allowed & requested) == requested) {
+        *granted = session->granted_scopes;
+        return KSD_STATUS_OK;
+    }
+    if (auth_mode == KSD_AUTH_CHECK) {
+        *granted = session->granted_scopes;
+        return KSD_STATUS_DENIED;
+    }
 
-    start_time = ksd_process_start_time(credentials.pid);
-    if (start_time == 0u
-        || ksd_identify_process(credentials.pid, credentials.uid, start_time, &identity) != 0
-        || ksd_grants_check(&identity, &existing) != 0)
-        return KSD_AUTH_STATUS_ERROR;
-    *granted = existing & KSD_CAP_ALL;
-    if ((existing & requested) == requested)
-        return KSD_AUTH_STATUS_GRANTED;
-    if ((request->flags & KSD_AUTH_FLAG_INTERACTIVE) == 0u)
-        return KSD_AUTH_STATUS_DENIED;
-
-    prompt_lock = ksd_grants_prompt_lock_acquire(identity.uid, identity.hash);
+    prompt_lock = ksp_prompt_lock_acquire(session->state->store,
+        session->identity.uid, session->identity.hash,
+        authority_disconnected, session);
     if (prompt_lock < 0)
-        return KSD_AUTH_STATUS_ERROR;
-    if (ksd_process_start_time(identity.pid) != identity.start_time
-        || ksd_identify_process(identity.pid, identity.uid, identity.start_time, &verified) != 0
-        || strcmp(verified.hash, identity.hash) != 0) {
-        status = KSD_AUTH_STATUS_DENIED;
+        return authority_disconnected(session)
+            ? KSD_STATUS_CANCELLED : KSD_STATUS_INTERNAL;
+    if (ksp_identity_revalidate(&session->identity, &verified) != 0
+        || !same_identity(&session->identity, &verified)) {
+        status = KSD_STATUS_CANCELLED;
         goto done;
     }
-    identity = verified;
-    if (ksd_grants_check_at_generation(&identity, &existing,
-                                       &grant_generation) != 0)
+    session->identity = verified;
+    if (ksp_store_check_at_generation(session->state->store,
+            session->identity.uid, session->identity.hash, requested,
+            &allowed, &generation) != 0)
         goto done;
-    *granted = existing & KSD_CAP_ALL;
-    if ((existing & requested) == requested) {
-        status = KSD_AUTH_STATUS_GRANTED;
-        goto done;
-    }
-    missing = requested & ~existing;
-
-    int authorization = run_pkcheck(&identity, missing);
-    if (authorization > 0) {
-        status = KSD_AUTH_STATUS_DENIED;
+    session->generation = generation;
+    session->granted_scopes |= allowed;
+    uint32_t missing = requested & ~allowed;
+    if (missing == 0u) {
+        status = KSD_STATUS_OK;
         goto done;
     }
-    if (authorization < 0)
-        goto done;
-
-    if (ksd_process_start_time(identity.pid) != identity.start_time
-        || ksd_identify_process(identity.pid, identity.uid, identity.start_time, &verified) != 0
-        || strcmp(verified.hash, identity.hash) != 0) {
-        status = KSD_AUTH_STATUS_DENIED;
+    const ksp_polkit_config polkit = {
+        .pkcheck_path = KSD_PKCHECK_PATH,
+        .action_id = KSD_POLKIT_ACTION,
+        .scope_detail_key = "desktop.scopes",
+        .scope_names_detail_key = "desktop.scope-names",
+        .allowed_scopes = KSD_DESKTOP_MANAGED_SCOPES,
+        .timeout_seconds = 120u,
+    };
+    ksp_polkit_result decision = ksp_polkit_authorize(&polkit,
+        &session->identity, missing, authority_disconnected, session);
+    if (decision != KSP_POLKIT_GRANTED) {
+        status = decision == KSP_POLKIT_DENIED ? KSD_STATUS_DENIED
+            : decision == KSP_POLKIT_CANCELLED
+                || decision == KSP_POLKIT_IDENTITY_CHANGED
+                ? KSD_STATUS_CANCELLED : KSD_STATUS_UNAVAILABLE;
         goto done;
     }
-    int add_result = ksd_grants_add_if_generation(&verified, missing,
-                                                   grant_generation);
-    if (add_result != 0) {
-        status = add_result > 0 ? KSD_AUTH_STATUS_DENIED : KSD_AUTH_STATUS_ERROR;
+    if (ksp_identity_revalidate(&session->identity, &verified) != 0
+        || !same_identity(&session->identity, &verified)) {
+        status = KSD_STATUS_CANCELLED;
         goto done;
     }
-    *granted = existing | missing;
-    status = KSD_AUTH_STATUS_GRANTED;
+    int added = ksp_store_grant_if_generation(session->state->store,
+        &verified, missing, generation);
+    if (added != 0) {
+        status = added > 0 ? KSD_STATUS_REVOKED : KSD_STATUS_INTERNAL;
+        goto done;
+    }
+    session->identity = verified;
+    if (ksp_store_check_at_generation(session->state->store,
+            session->identity.uid, session->identity.hash, requested,
+            &allowed, &session->generation) != 0)
+        goto done;
+    session->granted_scopes |= allowed;
+    status = (allowed & requested) == requested
+        ? KSD_STATUS_OK : KSD_STATUS_REVOKED;
 
 done:
-    ksd_grants_prompt_lock_release(prompt_lock);
+    ksp_prompt_lock_release(prompt_lock);
+    *granted = session->granted_scopes;
     return status;
 }
 
-static void handle_connection(int descriptor)
+static uint32_t scope_for_operation(uint16_t opcode)
 {
-    ksd_authority_request request;
-    ksd_authority_response response = {
-        .magic = KSD_AUTH_MAGIC,
-        .major = KSD_PROTOCOL_MAJOR,
-        .minor = KSD_PROTOCOL_MINOR,
-        .status = KSD_AUTH_STATUS_ERROR,
-    };
-    ksd_stored_grant *listing = NULL;
-    size_t listing_count = 0u;
-    bool send_listing = false;
-    int passed_fd = -1;
+    if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW)
+        return KSP_SCOPE_SCREEN_CAPTURE;
+    if (opcode == KSD_OP_WINDOW_LIST || opcode == KSD_OP_WINDOW_ACTIVE
+        || opcode == KSD_OP_WINDOW_WATCH)
+        return KSP_SCOPE_WINDOW_MONITORING;
+    if (opcode >= KSD_OP_WINDOW_FOCUS
+        && opcode <= KSD_OP_WINDOW_GET_RESERVED)
+        return KSP_SCOPE_WINDOW_CONTROL;
+    if (opcode >= KSD_OP_CLIPBOARD_MIMETYPES
+        && opcode <= KSD_OP_CLIPBOARD_WATCH)
+        return KSP_SCOPE_CLIPBOARD_MONITORING;
+    if (opcode >= KSD_OP_MOUSE_MOVE_ABSOLUTE
+        && opcode <= KSD_OP_MOUSE_SCROLL)
+        return KSP_SCOPE_INPUT_CONTROL;
+    return 0u;
+}
 
-    if (ksd_receive_optional_fd(descriptor, &request, sizeof(request), &passed_fd) != 0
-        || request.magic != KSD_AUTH_MAGIC || request.major != KSD_PROTOCOL_MAJOR
-        || request.minor != KSD_PROTOCOL_MINOR)
-        goto respond;
-
-    if (request.operation == KSD_AUTH_OP_CHECK) {
-        response.status = check_grant(&request, passed_fd, &response.granted_capabilities);
-    } else if (request.operation == KSD_AUTH_OP_REVOKE_UID) {
-        struct ucred credentials;
-        socklen_t length = sizeof(credentials);
-        if (passed_fd < 0 && request.flags == 0u && request.capabilities == 0u
-            && getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
-                          &credentials, &length) == 0
-            && ksd_grants_revoke_uid(credentials.uid) == 0)
-            response.status = KSD_AUTH_STATUS_GRANTED;
-    } else if (request.operation == KSD_AUTH_OP_LIST_UID) {
-        struct ucred credentials;
-        socklen_t length = sizeof(credentials);
-        if (passed_fd < 0 && request.flags == 0u && request.capabilities == 0u
-            && getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
-                          &credentials, &length) == 0
-            && ksd_grants_list_uid(credentials.uid, &listing, &listing_count) == 0
-            && listing_count <= KSD_AUTHORITY_MAX_LIST_RECORDS) {
-            response.status = KSD_AUTH_STATUS_GRANTED;
-            response.granted_capabilities = (uint32_t)listing_count;
-            send_listing = true;
-        }
-    } else if (request.operation == KSD_AUTH_OP_REVOKE) {
-        char hash[KSD_HASH_HEX_LENGTH + 1u];
-        struct ucred credentials;
-        socklen_t length = sizeof(credentials);
-        if (passed_fd < 0 && request.flags == 0u
-            && request.capabilities != 0u
-            && (request.capabilities & ~KSD_CAP_ALL) == 0u
-            && ksd_read_all(descriptor, hash, sizeof(hash))
-            && hash[KSD_HASH_HEX_LENGTH] == '\0'
-            && getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
-                          &credentials, &length) == 0
-            && ksd_grants_revoke(credentials.uid, hash,
-                                 request.capabilities) == 0)
-            response.status = KSD_AUTH_STATUS_GRANTED;
-    } else if (request.operation == KSD_AUTH_OP_INFO) {
-        response.status = KSD_AUTH_STATUS_GRANTED;
+static uint64_t operation_bit(uint16_t opcode)
+{
+    switch (opcode) {
+        case KSD_OP_CAPTURE_AREA: return KSD_OPERATION_CAPTURE_AREA;
+        case KSD_OP_CAPTURE_WINDOW: return KSD_OPERATION_CAPTURE_WINDOW;
+        case KSD_OP_WINDOW_LIST: return KSD_OPERATION_WINDOW_LIST;
+        case KSD_OP_WINDOW_ACTIVE: return KSD_OPERATION_WINDOW_ACTIVE;
+        case KSD_OP_WINDOW_WATCH: return KSD_OPERATION_WINDOW_WATCH;
+        case KSD_OP_WINDOW_FOCUS: return KSD_OPERATION_WINDOW_FOCUS;
+        case KSD_OP_WINDOW_RAISE: return KSD_OPERATION_WINDOW_RAISE;
+        case KSD_OP_WINDOW_LOWER: return KSD_OPERATION_WINDOW_LOWER;
+        case KSD_OP_WINDOW_CLOSE: return KSD_OPERATION_WINDOW_CLOSE;
+        case KSD_OP_WINDOW_KILL: return KSD_OPERATION_WINDOW_KILL;
+        case KSD_OP_WINDOW_MOVE_RESIZE:
+            return KSD_OPERATION_WINDOW_MOVE_RESIZE;
+        case KSD_OP_WINDOW_MOVE_RESIZE_XID:
+            return KSD_OPERATION_WINDOW_MOVE_RESIZE_XID;
+        case KSD_OP_WINDOW_SET_STATE:
+            return KSD_OPERATION_WINDOW_SET_STATE;
+        case KSD_OP_WINDOW_SET_OPACITY:
+            return KSD_OPERATION_WINDOW_SET_OPACITY;
+        case KSD_OP_WINDOW_SET_ABOVE:
+            return KSD_OPERATION_WINDOW_SET_ABOVE;
+        case KSD_OP_WINDOW_SET_DECORATED:
+            return KSD_OPERATION_WINDOW_SET_DECORATED;
+        case KSD_OP_WINDOW_RESERVE:
+            return KSD_OPERATION_WINDOW_RESERVE;
+        case KSD_OP_WINDOW_GET_RESERVED:
+            return KSD_OPERATION_WINDOW_GET_RESERVED;
+        case KSD_OP_CLIPBOARD_MIMETYPES:
+            return KSD_OPERATION_CLIPBOARD_MIMETYPES;
+        case KSD_OP_CLIPBOARD_CONTENT:
+            return KSD_OPERATION_CLIPBOARD_CONTENT;
+        case KSD_OP_CLIPBOARD_TEXT: return KSD_OPERATION_CLIPBOARD_TEXT;
+        case KSD_OP_CLIPBOARD_WATCH: return KSD_OPERATION_CLIPBOARD_WATCH;
+        case KSD_OP_MOUSE_MOVE_ABSOLUTE:
+            return KSD_OPERATION_MOUSE_MOVE_ABSOLUTE;
+        case KSD_OP_MOUSE_MOVE_RELATIVE:
+            return KSD_OPERATION_MOUSE_MOVE_RELATIVE;
+        case KSD_OP_MOUSE_BUTTON: return KSD_OPERATION_MOUSE_BUTTON;
+        case KSD_OP_MOUSE_SCROLL: return KSD_OPERATION_MOUSE_SCROLL;
+        case KSD_OP_CURSOR_POSITION: return KSD_OPERATION_CURSOR_POSITION;
+        case KSD_OP_WORK_AREA: return KSD_OPERATION_WORK_AREA;
+        default: return 0u;
     }
+}
 
-respond:
-    if (passed_fd >= 0)
-        close(passed_fd);
-    if (!ksd_write_all(descriptor, &response, sizeof(response)))
-        goto done;
-    if (send_listing) {
-        for (size_t index = 0u; index < listing_count; index++) {
-            char executable[KSD_PATH_MAX];
-            ksd_authority_grant_record_header header = { 0 };
+static void hash_to_raw(const char *hash, uint8_t raw[32])
+{
+    for (size_t index = 0u; index < 32u; index++) {
+        char high = hash[index * 2u];
+        char low = hash[index * 2u + 1u];
+        unsigned first = high <= '9' ? (unsigned)(high - '0')
+            : (unsigned)(high - 'a' + 10);
+        unsigned second = low <= '9' ? (unsigned)(low - '0')
+            : (unsigned)(low - 'a' + 10);
+        raw[index] = (uint8_t)((first << 4u) | second);
+    }
+}
 
-            ksd_sanitize_display_text(listing[index].executable,
-                                      executable, sizeof(executable));
-            size_t executable_length = strlen(executable);
-            (void)snprintf(header.hash, sizeof(header.hash),
-                           "%s", listing[index].hash);
-            header.capabilities = listing[index].capabilities;
-            header.executable_length = (uint32_t)executable_length;
-            if (!ksd_write_all(descriptor, &header, sizeof(header))
-                || !ksd_write_all(descriptor, executable, executable_length))
+static void raw_to_hash(const uint8_t raw[32], char hash[65])
+{
+    static const char digits[] = "0123456789abcdef";
+    for (size_t index = 0u; index < 32u; index++) {
+        hash[index * 2u] = digits[raw[index] >> 4u];
+        hash[index * 2u + 1u] = digits[raw[index] & 0x0fu];
+    }
+    hash[64] = '\0';
+}
+
+static size_t safe_path(const char *source, char destination[KSP_PATH_CAPACITY])
+{
+    ksp_sanitize_display_text(source, destination, KSP_PATH_CAPACITY);
+    size_t length = strlen(destination);
+    if (!ksd_utf8_valid((const uint8_t *)destination, length, false)) {
+        for (size_t index = 0u; index < length; index++)
+            if ((uint8_t)destination[index] >= 0x80u)
+                destination[index] = '?';
+    }
+    return length;
+}
+
+static bool permissions_list(authority_session *session,
+                             const ksd_frame *request)
+{
+    ksp_permission_entry *entries = NULL;
+    size_t count = 0u;
+    if (request->payload_length != 0u)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "permissions list payload must be empty",
+                                NULL, 0u, false);
+    if (ksp_store_list(session->state->store, session->identity.uid,
+                       &entries, &count) != 0)
+        return forward_response(session, request, KSD_STATUS_INTERNAL, 0u,
+                                "could not list permissions",
+                                NULL, 0u, false);
+    bool ok = true;
+    for (size_t index = 0u; ok && index < count; index++) {
+        uint32_t scopes = entries[index].scopes
+            & KSD_DESKTOP_MANAGED_SCOPES;
+        if (scopes == 0u)
+            continue;
+        char path[KSP_PATH_CAPACITY];
+        size_t path_length = safe_path(entries[index].executable, path);
+        uint8_t hash[32];
+        ksd_buffer tail;
+        hash_to_raw(entries[index].app_hash, hash);
+        ksd_buffer_init(&tail, KSP_PATH_CAPACITY + 48u);
+        ok = path_length <= UINT32_MAX
+            && ksd_buffer_u32(&tail, scopes)
+            && ksd_buffer_u32(&tail, (uint32_t)path_length)
+            && ksd_buffer_u64(&tail, entries[index].granted_at_utc)
+            && ksd_buffer_bytes(&tail, hash, sizeof(hash))
+            && ksd_buffer_bytes(&tail, path, path_length)
+            && forward_response(session, request, KSD_STATUS_OK, 0u,
+                                NULL, tail.data, (uint32_t)tail.length, true);
+        ksd_buffer_clear(&tail);
+    }
+    ksp_store_list_free(entries);
+    return ok && forward_response(session, request, KSD_STATUS_OK, 0u,
+                                  NULL, NULL, 0u, false);
+}
+
+static bool bytes_are_zero(const uint8_t *bytes, size_t length)
+{
+    for (size_t index = 0u; index < length; index++)
+        if (bytes[index] != 0u)
+            return false;
+    return true;
+}
+
+static bool permissions_revoke(authority_session *session,
+                               const ksd_frame *request)
+{
+    ksd_cursor cursor;
+    uint32_t kind;
+    uint32_t scopes;
+    uint64_t pid;
+    const uint8_t *raw_hash;
+    int result = -1;
+
+    ksd_cursor_init(&cursor, request->payload, request->payload_length);
+    if (request->payload_length != 48u
+        || !ksd_cursor_u32(&cursor, &kind)
+        || !ksd_cursor_u32(&cursor, &scopes)
+        || !ksd_cursor_u64(&cursor, &pid)
+        || !ksd_cursor_bytes(&cursor, 32u, &raw_hash)
+        || !ksd_cursor_finished(&cursor)
+        || scopes == 0u
+        || (scopes & ~(uint32_t)KSD_DESKTOP_MANAGED_SCOPES) != 0u)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "invalid permissions revoke payload",
+                                NULL, 0u, false);
+    if (kind == KSD_PERMISSION_TARGET_HASH) {
+        if (pid != 0u)
+            goto invalid;
+        char hash[65];
+        raw_to_hash(raw_hash, hash);
+        result = ksp_store_revoke(session->state->store,
+            session->identity.uid, hash, scopes);
+    } else if (kind == KSD_PERMISSION_TARGET_PID) {
+        if (!bytes_are_zero(raw_hash, 32u) || pid == 0u || pid > INT_MAX)
+            goto invalid;
+        ksp_identity target;
+        if (ksp_identity_capture((pid_t)pid, session->identity.uid,
+                                 &target) != 0)
+            return forward_response(session, request, KSD_STATUS_NOT_FOUND,
+                                    0u, "target process was not found",
+                                    NULL, 0u, false);
+        result = ksp_store_revoke(session->state->store,
+            session->identity.uid, target.hash, scopes);
+    } else if (kind == KSD_PERMISSION_TARGET_ALL) {
+        if (pid != 0u || !bytes_are_zero(raw_hash, 32u))
+            goto invalid;
+        result = ksp_store_revoke_uid(session->state->store,
+                                     session->identity.uid, scopes);
+    } else {
+        goto invalid;
+    }
+    if (result != 0)
+        return forward_response(session, request, KSD_STATUS_INTERNAL, 0u,
+                                "could not revoke permissions",
+                                NULL, 0u, false);
+    if (!session_refresh(session, true, true, NULL))
+        return false;
+    return forward_response(session, request, KSD_STATUS_OK, 0u,
+                            NULL, NULL, 0u, false);
+
+invalid:
+    return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                            0u, "invalid permissions revoke selector",
+                            NULL, 0u, false);
+}
+
+static bool handle_authorize(authority_session *session,
+                             const ksd_frame *request)
+{
+    ksd_cursor cursor;
+    uint16_t mode;
+    uint16_t reserved0;
+    uint32_t scopes;
+    uint64_t reserved1;
+    uint32_t granted;
+    uint8_t tail[8] = { 0 };
+
+    ksd_cursor_init(&cursor, request->payload, request->payload_length);
+    if (request->payload_length != 16u
+        || !ksd_cursor_u16(&cursor, &mode)
+        || !ksd_cursor_u16(&cursor, &reserved0)
+        || !ksd_cursor_u32(&cursor, &scopes)
+        || !ksd_cursor_u64(&cursor, &reserved1)
+        || !ksd_cursor_finished(&cursor)
+        || reserved0 != 0u || reserved1 != 0u)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "invalid AUTHORIZE payload",
+                                NULL, 0u, false);
+    uint32_t status = authorize_scopes(session, scopes, mode, &granted);
+    if (status != KSD_STATUS_OK)
+        return forward_response(session, request, status, 0u,
+            status == KSD_STATUS_DENIED ? "permission is not granted"
+            : status == KSD_STATUS_CANCELLED ? "authorization was cancelled"
+            : status == KSD_STATUS_REVOKED
+                ? "permission changed during authorization"
+                : status == KSD_STATUS_INVALID_REQUEST
+                    ? "invalid authorization scope or mode"
+                    : "authorization service unavailable",
+            NULL, 0u, false);
+    ksd_encode_u32(tail, granted);
+    return forward_response(session, request, KSD_STATUS_OK, 0u,
+                            NULL, tail, sizeof(tail), false);
+}
+
+typedef struct watch_context {
+    authority_session *session;
+    uint32_t scope;
+    uint32_t backend;
+} watch_context;
+
+static bool watch_emit(uint16_t opcode, const void *payload,
+                       uint32_t payload_length, void *user_data)
+{
+    watch_context *context = user_data;
+    if (registered_backend(context->session->state,
+                           context->session->identity.uid)
+            != context->backend
+        || !session_refresh(context->session, true, true, NULL)
+        || (context->session->granted_scopes & context->scope)
+            != context->scope)
+        return false;
+    return forward_event(context->session, opcode, payload, payload_length);
+}
+
+static bool watch_cancelled(void *user_data)
+{
+    watch_context *context = user_data;
+    authority_session *session = context->session;
+    struct pollfd descriptors[1] = {
+        { .fd = session->client_fd,
+          .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR },
+    };
+    int ready = poll(descriptors, 1u, 0);
+    if (ready < 0 && errno != EINTR)
+        return true;
+    if (ready > 0)
+        for (nfds_t index = 0u; index < 1u; index++)
+            if ((descriptors[index].revents
+                 & (POLLIN | POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
+                return true;
+    bool force_identity = monotonic_seconds() != session->identity_checked_at;
+    if (!session_refresh(session, force_identity, true, NULL))
+        return true;
+    return registered_backend(session->state, session->identity.uid)
+            != context->backend
+        || (session->granted_scopes & context->scope) != context->scope;
+}
+
+static bool start_watch(authority_session *session,
+                        const ksd_frame *request, uint32_t scope)
+{
+    if (session->role != KSD_ROLE_EVENT_STREAM
+        || request->payload_length != 0u)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "invalid event subscription",
+                                NULL, 0u, false);
+    if (!forward_response(session, request, KSD_STATUS_OK, 0u,
+                          NULL, NULL, 0u, false))
+        return false;
+    watch_context context = {
+        .session = session,
+        .scope = scope,
+        .backend = session->backend,
+    };
+    char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
+    (void)ksd_provider_watch(session->identity.uid, session->backend,
+        request->opcode == KSD_OP_CLIPBOARD_WATCH,
+        watch_emit, watch_cancelled, &context,
+        diagnostic, sizeof(diagnostic));
+    return false;
+}
+
+static bool reserve_capture_memory(authority_state *state)
+{
+    bool reserved = false;
+    pthread_mutex_lock(&state->mutex);
+    if (state->inflight_bytes <= KSD_MAX_AUTHORITY_INFLIGHT_BYTES
+            - KSD_MAX_CAPTURE_BYTES) {
+        state->inflight_bytes += KSD_MAX_CAPTURE_BYTES;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return reserved;
+}
+
+static void release_capture_memory(authority_state *state)
+{
+    pthread_mutex_lock(&state->mutex);
+    if (state->inflight_bytes >= KSD_MAX_CAPTURE_BYTES)
+        state->inflight_bytes -= KSD_MAX_CAPTURE_BYTES;
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static bool execute_operation(authority_session *session,
+                              const ksd_frame *request)
+{
+    uint32_t scope = scope_for_operation(request->opcode);
+    uint64_t bit = operation_bit(request->opcode);
+    session->backend = registered_backend(session->state,
+                                          session->identity.uid);
+    uint64_t available = ksd_backend_operations(session->backend);
+    bool generation_changed = false;
+
+    if (bit == 0u)
+        return forward_response(session, request, KSD_STATUS_UNSUPPORTED, 0u,
+                                "unknown desktop operation",
+                                NULL, 0u, false);
+    if (session->role != KSD_ROLE_RPC
+        && session->role != KSD_ROLE_EVENT_STREAM)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "operation is invalid for this role",
+                                NULL, 0u, false);
+    if (scope == 0u ? !session_identity_refresh(session)
+                    : !session_refresh(session, true, true,
+                                       &generation_changed))
+        return false;
+    if (scope != 0u && (session->granted_scopes & scope) != scope)
+        return forward_response(session, request, KSD_STATUS_DENIED, 0u,
+                                "required permission is not granted",
+                                NULL, 0u, false);
+    if ((available & bit) == 0u)
+        return forward_response(session, request, KSD_STATUS_UNAVAILABLE, 0u,
+                                "operation is unavailable on this backend",
+                                NULL, 0u, false);
+    if (request->opcode == KSD_OP_WINDOW_WATCH
+        || request->opcode == KSD_OP_CLIPBOARD_WATCH)
+        return start_watch(session, request, scope);
+    if (session->role != KSD_ROLE_RPC)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "event streams only accept subscriptions",
+                                NULL, 0u, false);
+    bool capture = request->opcode == KSD_OP_CAPTURE_AREA
+        || request->opcode == KSD_OP_CAPTURE_WINDOW;
+    if (capture && !reserve_capture_memory(session->state))
+        return forward_response(session, request,
+                                KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
+                                "capture memory budget is busy",
+                                NULL, 0u, false);
+    uint64_t before = session->generation;
+    uint32_t before_backend = session->backend;
+    ksd_operation_result result;
+    if (session->backend == KSD_BACKEND_KWIN) {
+        ksd_capture_worker_execute(&session->identity, session->gid, request,
+                                   capture_still_authorized, session, &result);
+    } else {
+        ksd_provider_execute(session->identity.uid, session->identity.pid,
+                             session->backend, request, &result);
+    }
+    bool valid = scope == 0u
+        ? session_identity_refresh(session)
+            && registered_backend(session->state, session->identity.uid)
+                == before_backend
+        : session_refresh(session, true, true, &generation_changed)
+            && !generation_changed && session->generation == before
+            && (session->granted_scopes & scope) == scope;
+    bool ok;
+    if (!valid)
+        ok = forward_response(session, request,
+                              scope == 0u ? KSD_STATUS_CANCELLED
+                                          : KSD_STATUS_REVOKED,
+                              0u, scope == 0u
+                                ? "application identity or backend changed"
+                                : "permission changed during the operation",
+                              NULL, 0u, false);
+    else
+        ok = forward_response(session, request, result.status, result.detail,
+            result.status == KSD_STATUS_OK || result.diagnostic[0] == '\0'
+                ? NULL : result.diagnostic,
+            result.tail, result.tail_length, false);
+    ksd_result_clear(&result);
+    if (capture)
+        release_capture_memory(session->state);
+    return ok;
+}
+
+static bool handle_public_request(authority_session *session,
+                                  const ksd_frame *request)
+{
+    if (!ksd_frame_is_request(request))
+        return false;
+    if (request->opcode == KSD_OP_PING) {
+        if (request->payload_length != 0u)
+            return request->request_id != 0u
+                && forward_response(session, request,
+                    KSD_STATUS_INVALID_REQUEST, 0u,
+                    "PING payload must be empty", NULL, 0u, false);
+        if (!session_refresh(session, true, true, NULL))
+            return false;
+        return request->request_id == 0u
+            || forward_response(session, request, KSD_STATUS_OK, 0u,
+                                NULL, NULL, 0u, false);
+    }
+    if (request->request_id == 0u)
+        return false;
+    if (request->opcode == KSD_OP_HELLO)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
+                                0u, "HELLO may only be sent once",
+                                NULL, 0u, false);
+    if (request->opcode == KSD_OP_AUTHORIZE)
+        return handle_authorize(session, request);
+    if (request->opcode == KSD_OP_PERMISSIONS_LIST) {
+        if (session->role != KSD_ROLE_RPC)
+            return forward_response(session, request,
+                                    KSD_STATUS_INVALID_REQUEST, 0u,
+                                    "permissions administration requires RPC",
+                                    NULL, 0u, false);
+        return permissions_list(session, request);
+    }
+    if (request->opcode == KSD_OP_PERMISSIONS_REVOKE) {
+        if (session->role != KSD_ROLE_RPC)
+            return forward_response(session, request,
+                                    KSD_STATUS_INVALID_REQUEST, 0u,
+                                    "permissions administration requires RPC",
+                                    NULL, 0u, false);
+        return permissions_revoke(session, request);
+    }
+    return execute_operation(session, request);
+}
+
+static bool parse_hello(const ksd_frame *request, uint16_t *role,
+                        uint16_t *auth_mode, uint32_t *scopes)
+{
+    ksd_cursor cursor;
+    uint64_t reserved;
+
+    ksd_cursor_init(&cursor, request->payload, request->payload_length);
+    return request->opcode == KSD_OP_HELLO && request->flags == 0u
+        && request->request_id != 0u && request->payload_length == 16u
+        && ksd_cursor_u16(&cursor, role)
+        && ksd_cursor_u16(&cursor, auth_mode)
+        && ksd_cursor_u32(&cursor, scopes)
+        && ksd_cursor_u64(&cursor, &reserved)
+        && ksd_cursor_finished(&cursor) && reserved == 0u
+        && (*role == KSD_ROLE_RPC || *role == KSD_ROLE_EVENT_STREAM
+            || *role == KSD_ROLE_AUTHORIZATION_LEASE)
+        && (*auth_mode == KSD_AUTH_CHECK || *auth_mode == KSD_AUTH_REQUEST)
+        && (*scopes & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) == 0u;
+}
+
+static const char *status_diagnostic(uint32_t status)
+{
+    switch (status) {
+        case KSD_STATUS_DENIED: return "permission is not granted";
+        case KSD_STATUS_INVALID_REQUEST: return "invalid authorization scope";
+        case KSD_STATUS_UNAVAILABLE: return "authorization service unavailable";
+        case KSD_STATUS_CANCELLED: return "authorization was cancelled";
+        case KSD_STATUS_REVOKED: return "permission changed";
+        default: return "internal service error";
+    }
+}
+
+static bool start_public_session(authority_session *session)
+{
+    ksd_frame hello;
+    uint16_t role;
+    uint16_t auth_mode;
+    uint32_t scopes;
+    uint32_t granted = 0u;
+    uint32_t status = KSD_STATUS_INVALID_REQUEST;
+    uint8_t tail[24] = { 0 };
+
+    int received = ksd_frame_read(session->client_fd, public_magic,
+        KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_MAX_REQUEST_PAYLOAD,
+        true, &hello);
+    if (received != 1)
+        return false;
+    if (!parse_hello(&hello, &role, &auth_mode, &scopes)) {
+        bool replied = hello.request_id != 0u
+            && forward_response(session, &hello, KSD_STATUS_INVALID_REQUEST,
+                0u, "HELLO must be first", NULL, 0u, false);
+        ksd_frame_clear(&hello);
+        (void)replied;
+        return false;
+    }
+    session->role = role;
+    status = KSD_STATUS_OK;
+    if (scopes != 0u)
+        status = authorize_scopes(session, scopes, auth_mode, &granted);
+    bool replied;
+    if (status == KSD_STATUS_OK) {
+        ksd_encode_u32(tail, session->granted_scopes);
+        ksd_encode_u64(tail + 8u, ksd_backend_operations(session->backend));
+        ksd_encode_u32(tail + 16u, session->backend);
+        replied = forward_response(session, &hello, KSD_STATUS_OK, 0u,
+                                   NULL, tail, sizeof(tail), false);
+    } else {
+        replied = forward_response(session, &hello, status, 0u,
+                                   status_diagnostic(status),
+                                   NULL, 0u, false);
+    }
+    ksd_frame_clear(&hello);
+    return replied && status == KSD_STATUS_OK;
+}
+
+static void handle_public_connection(authority_state *state, int descriptor,
+                                     const struct ucred *peer)
+{
+    authority_session session = {
+        .state = state,
+        .client_fd = descriptor,
+        .gid = peer->gid,
+    };
+    if (peer->uid == 0u
+        || ksp_identity_capture(peer->pid, peer->uid, &session.identity) != 0)
+        return;
+    session.identity_checked_at = monotonic_seconds();
+    session.backend = registered_backend(state, peer->uid);
+    if (!start_public_session(&session))
+        return;
+    for (;;) {
+        struct pollfd item = {
+            .fd = descriptor,
+            .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
+        };
+        int ready = poll(&item, 1u, KSD_GENERATION_POLL_MS);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0)
+            break;
+        if (ready == 0) {
+            bool force_identity =
+                monotonic_seconds() != session.identity_checked_at;
+            if (!session_refresh(&session, force_identity, true, NULL))
+                break;
+            continue;
+        }
+        if ((item.revents & POLLIN) != 0) {
+            ksd_frame request;
+            int received = ksd_frame_read(descriptor, public_magic,
+                KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
+                KSD_MAX_REQUEST_PAYLOAD, true, &request);
+            if (received != 1)
+                break;
+            bool ok = handle_public_request(&session, &request);
+            ksd_frame_clear(&request);
+            if (!ok)
                 break;
         }
+        if ((item.revents
+             & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
+            break;
     }
-
-done:
-    free(listing);
 }
 
 static void *connection_worker(void *argument)
 {
     authority_client *client = argument;
-
-    handle_connection(client->descriptor);
+    uint8_t magic[4];
+    if (peek_connection_magic(client->descriptor, magic)) {
+        if (memcmp(magic, ksd_backend_registration_magic,
+                   sizeof(magic)) == 0) {
+            handle_backend_connection(client->state, client->descriptor,
+                                      &client->credentials);
+        } else if (memcmp(magic, public_magic, sizeof(magic)) == 0) {
+            if (set_socket_timeouts(client->descriptor, 130u))
+                handle_public_connection(client->state, client->descriptor,
+                                         &client->credentials);
+        }
+    }
     close(client->descriptor);
     pthread_mutex_lock(&client->state->mutex);
     client->state->workers--;
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++)
+        if (client->state->worker_usage[index].count != 0u
+            && client->state->worker_usage[index].uid
+                == client->credentials.uid) {
+            client->state->worker_usage[index].count--;
+            break;
+        }
     pthread_mutex_unlock(&client->state->mutex);
     free(client);
     return NULL;
 }
 
+static bool reserve_worker(authority_state *state, uid_t uid)
+{
+    size_t slot = KSD_MAX_AUTHORITY_WORKERS;
+    bool reserved = false;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->worker_usage[index].count != 0u
+            && state->worker_usage[index].uid == uid) {
+            slot = index;
+            break;
+        }
+        if (slot == KSD_MAX_AUTHORITY_WORKERS
+            && state->worker_usage[index].count == 0u)
+            slot = index;
+    }
+    if (state->workers < KSD_MAX_AUTHORITY_WORKERS
+        && slot < KSD_MAX_AUTHORITY_WORKERS
+        && state->worker_usage[slot].count
+            < KSD_MAX_AUTHORITY_WORKERS_PER_UID) {
+        state->workers++;
+        state->worker_usage[slot].uid = uid;
+        state->worker_usage[slot].count++;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return reserved;
+}
+
 int ksd_authority_main(int argc, char **argv)
 {
     authority_state state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    ksp_store_config store_config;
     int listener;
-
+    bool activation_present = false;
     (void)argv;
 
     if (argc != 1) {
-        fprintf(stderr, "usage: keysharp-desktop authority\n");
+        fputs("usage: keysharp-desktop authority-daemon\n", stderr);
         return 2;
     }
     if (getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
-        fputs("keysharp-desktop authority must run as root\n", stderr);
+        fputs("keysharp-desktop authority-daemon must run as root\n", stderr);
         return 1;
     }
-
+    ksp_store_config_init(&store_config, KSD_DESKTOP_MANAGED_SCOPES);
+    store_config.read_scopes = KSD_DESKTOP_ACCEPTED_SCOPES;
+    if (ksp_store_create(&state.store, &store_config) != 0
+        || ksp_store_prepare(state.store) != 0) {
+        fputs("keysharp-desktop authority-daemon: permission store unavailable\n",
+              stderr);
+        ksp_store_destroy(state.store);
+        return 1;
+    }
     signal(SIGPIPE, SIG_IGN);
-    listener = inherited_socket();
-    if (listener < 0)
+    listener = inherited_socket(&activation_present);
+    if (listener < 0 && !activation_present)
         listener = create_socket();
     if (listener < 0) {
-        perror("keysharp-desktop authority: listen");
+        perror("keysharp-desktop authority-daemon: listen");
+        ksp_store_destroy(state.store);
         return 1;
     }
 
@@ -346,38 +1401,48 @@ int ksd_authority_main(int argc, char **argv)
         if (connection < 0) {
             if (errno == EINTR)
                 continue;
-            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-                struct timespec delay = { .tv_sec = 0, .tv_nsec = 100000000L };
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS
+                || errno == ENOMEM) {
+                struct timespec delay = {
+                    .tv_sec = 0,
+                    .tv_nsec = 100000000L,
+                };
                 (void)nanosleep(&delay, NULL);
                 continue;
             }
-            perror("keysharp-desktop authority: accept");
-            return 1;
+            break;
         }
-        struct timeval receive_timeout = { .tv_sec = 5, .tv_usec = 0 };
-        struct timeval send_timeout = { .tv_sec = 5, .tv_usec = 0 };
-        (void)setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO,
-                         &receive_timeout, sizeof(receive_timeout));
-        (void)setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO,
-                         &send_timeout, sizeof(send_timeout));
-
+        if (!set_socket_timeouts(connection, 5u)) {
+            close(connection);
+            continue;
+        }
+        struct ucred credentials;
+        socklen_t credentials_size = sizeof(credentials);
         authority_client *client = calloc(1u, sizeof(*client));
-        pthread_mutex_lock(&state.mutex);
-        if (client == NULL || state.workers >= KSD_MAX_AUTHORITY_WORKERS) {
-            pthread_mutex_unlock(&state.mutex);
+        if (client == NULL
+            || getsockopt(connection, SOL_SOCKET, SO_PEERCRED,
+                          &credentials, &credentials_size) != 0
+            || credentials_size != sizeof(credentials)
+            || credentials.uid == 0u
+            || !reserve_worker(&state, credentials.uid)) {
             free(client);
             close(connection);
             continue;
         }
-        state.workers++;
-        pthread_mutex_unlock(&state.mutex);
         client->state = &state;
         client->descriptor = connection;
-
+        client->credentials = credentials;
         pthread_t worker;
         if (pthread_create(&worker, NULL, connection_worker, client) != 0) {
             pthread_mutex_lock(&state.mutex);
             state.workers--;
+            for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS;
+                 index++)
+                if (state.worker_usage[index].count != 0u
+                    && state.worker_usage[index].uid == credentials.uid) {
+                    state.worker_usage[index].count--;
+                    break;
+                }
             pthread_mutex_unlock(&state.mutex);
             close(connection);
             free(client);
@@ -385,4 +1450,8 @@ int ksd_authority_main(int argc, char **argv)
         }
         pthread_detach(worker);
     }
+    close(listener);
+    ksp_store_destroy(state.store);
+    pthread_mutex_destroy(&state.mutex);
+    return 1;
 }

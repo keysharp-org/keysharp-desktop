@@ -42,6 +42,39 @@ is_component_package_installed() {
     return 1
 }
 
+is_root_protected_chain() {
+    protected_path=$1
+    while :; do
+        protected_metadata=$(stat -Lc '%u %a' -- "$protected_path" 2>/dev/null) \
+            || return 1
+        # shellcheck disable=SC2086 # deliberate split into uid and mode
+        set -- $protected_metadata
+        [ "$1" = 0 ] && [ $((0$2 & 022)) -eq 0 ] || return 1
+        [ "$protected_path" = / ] && break
+        protected_path=${protected_path%/*}
+        [ -n "$protected_path" ] || protected_path=/
+    done
+}
+
+portable_library_payload() {
+    soname_link=/usr/local/lib/libkeysharp-desktop.so.0
+    [ -L "$soname_link" ] || return 1
+    library_resolved=$(readlink -f -- "$soname_link" 2>/dev/null) || return 1
+    case "$library_resolved" in
+        /usr/local/lib/libkeysharp-desktop.so.0.*) ;;
+        *) return 1 ;;
+    esac
+    [ -f "$library_resolved" ] && [ ! -L "$library_resolved" ] || return 1
+    library_metadata=$(stat -Lc '%u %a' -- "$library_resolved" 2>/dev/null) \
+        || return 1
+    # shellcheck disable=SC2086 # deliberate split into uid and mode
+    set -- $library_metadata
+    [ "$1" = 0 ] && [ $((0$2 & 022)) -eq 0 ] \
+        && is_root_protected_chain "$soname_link" \
+        && is_root_protected_chain "$library_resolved" || return 1
+    printf '%s\n' "$library_resolved"
+}
+
 layered_install_present() {
     portable_resolved=$(readlink -f -- /usr/local/bin/keysharp-desktop 2>/dev/null || true)
     for system_binary in /usr/bin/keysharp-desktop \
@@ -104,7 +137,7 @@ run_invoking_user_systemctl() {
 stop_invoking_user_manager() {
     prepare_invoking_user_manager \
         && run_invoking_user_systemctl stop keysharp-desktop.service \
-            keysharp-desktop.socket >/dev/null 2>&1 \
+            >/dev/null 2>&1 \
         && run_invoking_user_systemctl daemon-reload >/dev/null 2>&1
 }
 
@@ -144,24 +177,32 @@ fi
 if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now keysharp-desktop-authority.socket \
         keysharp-desktop-authority.service >/dev/null 2>&1 || true
-    systemctl --global disable keysharp-desktop.socket >/dev/null 2>&1 || true
+    systemctl --global disable keysharp-desktop.service >/dev/null 2>&1 || true
 fi
+
+library_payload=$(portable_library_payload || true)
 
 rm -f -- \
     /usr/local/bin/keysharp-desktop \
+    /usr/local/libexec/keysharp-desktop-capture-worker \
+    /usr/local/lib/libkeysharp-desktop.so \
+    /usr/local/lib/libkeysharp-desktop.so.0 \
+    /usr/local/lib/pkgconfig/keysharp-desktop.pc \
+    /usr/local/include/keysharp_desktop/client.h \
     /usr/local/lib/systemd/user/keysharp-desktop.service \
-    /usr/local/lib/systemd/user/keysharp-desktop.socket \
     /usr/local/lib/systemd/system/keysharp-desktop-authority.service \
     /usr/local/lib/systemd/system/keysharp-desktop-authority.socket \
     /usr/local/lib/tmpfiles.d/keysharp-desktop-permissions.conf \
     /usr/share/polkit-1/actions/org.keysharp.desktop.policy \
-    /usr/local/share/applications/org.keysharp.DesktopCapture.desktop \
-    /usr/local/include/keysharp_desktop/protocol.h
+    /usr/local/share/applications/org.keysharp.DesktopCapture.desktop
+[ -z "$library_payload" ] || rm -f -- "$library_payload"
 rm -rf -- \
+    /usr/local/lib/cmake/KeysharpDesktop \
     /usr/local/share/gnome-shell/extensions/keysharp@keysharp.io \
     /usr/local/share/cinnamon/extensions/keysharp@keysharp.io \
     /usr/local/share/doc/keysharp-desktop \
     /run/keysharp-desktop
+[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 printf '%s\n' "Removed keysharp-desktop."
 printf '%s\n' \
@@ -179,5 +220,5 @@ else
 fi
 printf '%s\n' \
     "Other logged-in users were not contacted; each should log out or run:" \
-    "  systemctl --user stop keysharp-desktop.service keysharp-desktop.socket" \
+    "  systemctl --user stop keysharp-desktop.service" \
     "  systemctl --user daemon-reload"

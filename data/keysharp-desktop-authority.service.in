@@ -6,7 +6,7 @@ After=systemd-tmpfiles-setup.service
 
 [Service]
 Type=simple
-ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop authority
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop authority-daemon
 User=root
 Group=root
 UMask=0077

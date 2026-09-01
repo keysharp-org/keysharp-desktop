@@ -1,29 +1,27 @@
 #ifndef KEYSHARP_DESKTOP_PROVIDER_H
 #define KEYSHARP_DESKTOP_PROVIDER_H
 
-#include "capture.h"
+#include "backend.h"
+#include "operation_result.h"
+#include "protocol_io.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
-bool ksd_provider_window_list(ksd_backend backend, int output_fd,
-                              bool include_hidden);
-bool ksd_provider_active_window(ksd_backend backend, int output_fd);
-bool ksd_provider_window_handle_command(ksd_backend backend, int output_fd,
-                                        const char *method, uint64_t handle);
-bool ksd_provider_window_move_resize(ksd_backend backend, int output_fd,
-                                     const char *method, uint64_t handle,
-                                     int x, int y, int width, int height);
-bool ksd_provider_window_integer_command(ksd_backend backend, int output_fd,
-                                         const char *method, uint64_t handle,
-                                         int value);
-bool ksd_provider_window_boolean_command(ksd_backend backend, int output_fd,
-                                         const char *method, uint64_t handle,
-                                         bool value);
-bool ksd_provider_clipboard_mimetypes(ksd_backend backend, int output_fd);
-bool ksd_provider_clipboard_content(ksd_backend backend, int output_fd,
-                                    const char *mimetype);
-bool ksd_provider_clipboard_text(ksd_backend backend, int output_fd);
-bool ksd_provider_watch(ksd_backend backend, int output_fd, bool clipboard);
+typedef bool (*ksd_provider_event_fn)(uint16_t opcode,
+                                      const void *payload,
+                                      uint32_t payload_length,
+                                      void *user_data);
+typedef bool (*ksd_provider_cancel_fn)(void *user_data);
+
+void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
+                          const ksd_frame *request,
+                          ksd_operation_result *result);
+int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
+                       ksd_provider_event_fn emit,
+                       ksd_provider_cancel_fn cancelled,
+                       void *user_data, char *diagnostic,
+                       size_t diagnostic_capacity);
 
 #endif

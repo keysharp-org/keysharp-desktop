@@ -1,12 +1,12 @@
 [Unit]
 Description=Keysharp desktop broker
 Documentation=https://github.com/keysharp-org/keysharp-desktop
-Requires=keysharp-desktop.socket
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop serve
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop daemon
 StandardInput=null
 StandardOutput=journal
 StandardError=journal
@@ -16,3 +16,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 RestrictAddressFamilies=AF_UNIX
 LockPersonality=true
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

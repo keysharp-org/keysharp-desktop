@@ -24,13 +24,13 @@ jobs:
       source_sha: ${{ steps.release.outputs.source_sha }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
-      nix_enabled: ${{ steps.release.outputs.nix_enabled }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Resolve immutable release source
         id: release
@@ -52,27 +52,30 @@ jobs:
             echo "Checked-out source does not match refs/tags/$RELEASE_TAG." >&2
             exit 1
           fi
+          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13" \
+             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13" ]]; then
+            echo "keysharp-permissions submodule is not at the reviewed pin." >&2
+            exit 1
+          fi
           version=$(sed -n '/^project(keysharp-desktop/,/LANGUAGES C)/s/^[[:space:]]*VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
           if [[ -z "$version" || "$RELEASE_TAG" != "v$version" ]]; then
             echo "Release tag $RELEASE_TAG does not exactly match CMake project version ${version:-<missing>}." >&2
             exit 1
           fi
           header_version=$(sed -n 's/^#define KSD_PRODUCT_VERSION "\([0-9.]*\)"$/\1/p' \
-            include/keysharp_desktop/protocol.h)
+            src/protocol.h)
           nix_version=$(sed -n 's/^[[:space:]]*version = "\([0-9.]*\)";$/\1/p' nix/package.nix)
           if [[ "$header_version" != "$version" || "$nix_version" != "$version" ]]; then
-            echo "Release version is inconsistent across CMake, the protocol header, and Nix packaging." >&2
+            echo "Release version is inconsistent across CMake, the private protocol, and Nix packaging." >&2
             exit 1
           fi
 
           echo "source_sha=$tag_sha" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "nix_enabled=$([[ -f flake.lock ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   nix:
     needs: prepare
-    if: needs.prepare.outputs.nix_enabled == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -80,7 +83,7 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
       - uses: cachix/install-nix-action@v31
-      - name: Validate locked Nix package
+      - name: Validate Nix package
         run: nix flake check --no-write-lock-file
 
   build:
@@ -109,6 +112,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
+          submodules: recursive
 
       - name: Verify immutable source
         env:
@@ -145,6 +149,12 @@ jobs:
           chmod +x uninstall.sh packaging/install-release.sh \
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
           DESTDIR="$STAGE" cmake --install build-portable --strip
+          test -x "$STAGE/usr/local/bin/keysharp-desktop"
+          test -x "$STAGE/usr/local/libexec/keysharp-desktop-capture-worker"
+          test "$(stat -c %a "$STAGE/usr/local/libexec/keysharp-desktop-capture-worker")" = 700
+          test -e "$STAGE/usr/local/lib/libkeysharp-desktop.so.0"
+          readelf -d "$STAGE/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.0\]'
+          readelf -d "$STAGE/usr/local/lib/libkeysharp-desktop.so.0.2.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.0\]'
 
           mkdir -p dist
           archive_name="keysharp-desktop-${VERSION}-linux-${ASSET_ARCH}"
@@ -183,6 +193,7 @@ jobs:
   publish:
     needs:
       - prepare
+      - nix
       - build
     runs-on: ubuntu-24.04
     permissions:

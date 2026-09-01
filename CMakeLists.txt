@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(keysharp-desktop
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Per-application desktop capability broker for Linux"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
 
 include(GNUInstallDirs)
 include(CTest)
+include(CMakePackageConfigHelpers)
+
+set(KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH
+    "${CMAKE_INSTALL_FULL_LIBEXECDIR}/keysharp-desktop-capture-worker"
+    CACHE FILEPATH "root-only capture worker execution path")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -17,29 +22,94 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
 
-add_library(keysharp-desktop-common STATIC src/common.c)
+set(KEYSHARP_PERMISSIONS_SOURCE_DIR "" CACHE PATH
+    "keysharp-permissions source directory")
+if(KEYSHARP_PERMISSIONS_SOURCE_DIR STREQUAL "")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/keysharp-permissions/CMakeLists.txt")
+        set(KEYSHARP_PERMISSIONS_SOURCE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/keysharp-permissions")
+    else()
+        message(FATAL_ERROR
+            "Set KEYSHARP_PERMISSIONS_SOURCE_DIR to a pinned keysharp-permissions checkout")
+    endif()
+endif()
+add_subdirectory("${KEYSHARP_PERMISSIONS_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/keysharp-permissions" EXCLUDE_FROM_ALL)
+
+add_library(keysharp-desktop-wire STATIC
+    src/protocol_io.c
+    src/transport.c)
+set_target_properties(keysharp-desktop-wire PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden)
+target_include_directories(keysharp-desktop-wire PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(keysharp-desktop-wire PUBLIC
+    _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+
+add_library(keysharp-desktop-client SHARED
+    src/client.c)
+add_library(KeysharpDesktop::client ALIAS keysharp-desktop-client)
+set_target_properties(keysharp-desktop-client PROPERTIES
+    OUTPUT_NAME keysharp-desktop
+    EXPORT_NAME client
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 0
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+target_include_directories(keysharp-desktop-client
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(keysharp-desktop-client PRIVATE
+    KEYSHARP_DESKTOP_CLIENT_BUILD _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+target_link_libraries(keysharp-desktop-client PRIVATE
+    keysharp-desktop-wire KeysharpPermissions::permissions Threads::Threads)
+
+add_library(keysharp-desktop-common STATIC
+    src/backend.c
+    src/operation_result.c)
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(keysharp-desktop-common PUBLIC _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+target_link_libraries(keysharp-desktop-common PUBLIC
+    keysharp-desktop-wire KeysharpPermissions::permissions PkgConfig::GIO)
 
 add_executable(keysharp-desktop
     src/main.c
-    src/desktopd.c
-    src/capture.c
+    src/session_backend.c
     src/provider.c
-    src/authority_client.c
     src/authorityd.c
-    src/shared_grants.c
-    src/polkit_result.c
-    src/desktopctl.c)
+    src/cli.c)
+
+add_library(keysharp-desktop-capture STATIC
+    src/capture_worker.c
+    src/local_capture.c)
+target_include_directories(keysharp-desktop-capture PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(keysharp-desktop-capture PUBLIC
+    _GNU_SOURCE _POSIX_C_SOURCE=200809L
+    KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
+target_link_libraries(keysharp-desktop-capture PUBLIC
+    keysharp-desktop-common PkgConfig::GIO)
+
+add_executable(keysharp-desktop-capture-worker
+    src/capture_worker_entry.c)
+target_link_libraries(keysharp-desktop-capture-worker PRIVATE
+    keysharp-desktop-capture)
 target_link_libraries(keysharp-desktop PRIVATE
-    keysharp-desktop-common PkgConfig::GIO Threads::Threads)
+    keysharp-desktop-common keysharp-desktop-client keysharp-desktop-capture
+    PkgConfig::GIO Threads::Threads)
 set(KSD_PKCHECK_PATH "/usr/bin/pkcheck" CACHE FILEPATH "absolute path to pkcheck")
 target_compile_definitions(keysharp-desktop PRIVATE
     KSD_PKCHECK_PATH="${KSD_PKCHECK_PATH}")
 
-foreach(target keysharp-desktop-common keysharp-desktop)
+foreach(target keysharp-desktop-wire keysharp-desktop-client
+               keysharp-desktop-common keysharp-desktop-capture
+               keysharp-desktop keysharp-desktop-capture-worker)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2)
@@ -63,17 +133,43 @@ set(KEYSHARP_DESKTOP_POLKIT_ACTION_DIR
 configure_file(data/keysharp-desktop.service.in keysharp-desktop.service @ONLY)
 configure_file(data/keysharp-desktop-authority.service.in keysharp-desktop-authority.service @ONLY)
 configure_file(data/org.keysharp.DesktopCapture.desktop.in org.keysharp.DesktopCapture.desktop @ONLY)
+configure_file(data/keysharp-desktop.pc.in keysharp-desktop.pc @ONLY)
+configure_package_config_file(
+    cmake/KeysharpDesktopConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/KeysharpDesktopConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KeysharpDesktop)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/KeysharpDesktopConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
 
-install(TARGETS keysharp-desktop RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop.service data/keysharp-desktop.socket
+install(TARGETS keysharp-desktop keysharp-desktop-client
+    EXPORT KeysharpDesktopTargets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS keysharp-desktop-capture-worker
+    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}
+    PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop.service
     DESTINATION ${KEYSHARP_DESKTOP_SYSTEMD_USER_DIR})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop-authority.service
               data/keysharp-desktop-authority.socket
     DESTINATION ${KEYSHARP_DESKTOP_SYSTEMD_SYSTEM_DIR})
 install(FILES data/keysharp-desktop-permissions.conf DESTINATION lib/tmpfiles.d)
 install(FILES data/org.keysharp.desktop.policy DESTINATION ${KEYSHARP_DESKTOP_POLKIT_ACTION_DIR})
-install(FILES include/keysharp_desktop/protocol.h
+install(FILES include/keysharp_desktop/client.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/keysharp_desktop)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/KeysharpDesktopConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/KeysharpDesktopConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KeysharpDesktop)
+install(EXPORT KeysharpDesktopTargets
+    FILE KeysharpDesktopTargets.cmake
+    NAMESPACE KeysharpDesktop::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KeysharpDesktop)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.keysharp.DesktopCapture.desktop
     DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
 install(DIRECTORY providers/gnome/
@@ -91,85 +187,87 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(protocol-tests tests/protocol_tests.c)
-    target_link_libraries(protocol-tests PRIVATE keysharp-desktop-common)
+    target_link_libraries(protocol-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME protocol-tests COMMAND protocol-tests)
 
     add_executable(authority-fd-tests tests/authority_fd_tests.c)
-    target_link_libraries(authority-fd-tests PRIVATE keysharp-desktop-common)
+    target_link_libraries(authority-fd-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME authority-fd-tests COMMAND authority-fd-tests)
 
-    add_executable(session-protocol-tests tests/session_protocol_tests.c)
-    target_link_libraries(session-protocol-tests PRIVATE keysharp-desktop-common)
-    add_test(NAME session-protocol-tests
-        COMMAND session-protocol-tests $<TARGET_FILE:keysharp-desktop>)
+    add_executable(client-abi-tests tests/client_abi_tests.c)
+    target_include_directories(client-abi-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(client-abi-tests PRIVATE keysharp-desktop-client)
+    add_test(NAME client-abi-tests COMMAND client-abi-tests)
+
+    add_executable(client-stream-tests
+        tests/client_stream_tests.c
+        src/client.c)
+    target_include_directories(client-stream-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(client-stream-tests PRIVATE
+        KSD_CLIENT_TESTING _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(client-stream-tests PRIVATE
+        keysharp-desktop-wire KeysharpPermissions::permissions Threads::Threads)
+    add_test(NAME client-stream-tests COMMAND client-stream-tests)
+
+    add_test(NAME client-exported-symbols-test
+        COMMAND ${CMAKE_COMMAND}
+            -DLIBRARY=$<TARGET_FILE:keysharp-desktop-client>
+            -DCLIENT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_desktop/client.h
+            -DNM=${CMAKE_NM}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/exported_symbols_test.cmake)
+
+    add_test(NAME install-tree-consumer-test
+        COMMAND sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/install_tree_consumer_test.sh
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_INSTALL_PREFIX}
+            ${CMAKE_INSTALL_LIBDIR})
+
+    add_executable(capture-pipe-security-tests
+        tests/capture_pipe_security_tests.c)
+    target_link_libraries(capture-pipe-security-tests PRIVATE
+        keysharp-desktop-capture)
+    add_test(NAME capture-pipe-security-tests
+        COMMAND capture-pipe-security-tests)
+    set_tests_properties(capture-pipe-security-tests PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    add_executable(permissions-core-tests
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/identity_tests.c
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/polkit_tests.c
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/scopes_tests.c
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/store_tests.c
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/test_main.c)
+    target_include_directories(permissions-core-tests PRIVATE
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests)
+    target_compile_definitions(permissions-core-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(permissions-core-tests PRIVATE
+        KeysharpPermissions::permissions)
+    add_test(NAME permissions-core-tests COMMAND permissions-core-tests)
+
+    add_executable(permission-domain-tests tests/permission_domain_tests.c)
+    target_link_libraries(permission-domain-tests PRIVATE
+        KeysharpPermissions::permissions)
+    target_include_directories(permission-domain-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(permission-domain-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    add_test(NAME permission-domain-tests COMMAND permission-domain-tests)
+
     add_test(NAME version-command COMMAND keysharp-desktop version)
     set_tests_properties(version-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "capability_clipboard_monitoring=0x00000020"
-        FAIL_REGULAR_EXPRESSION "accessibility|cursor")
-    add_test(NAME info-alias COMMAND keysharp-desktop --info)
-    set_tests_properties(info-alias PROPERTIES
-        PASS_REGULAR_EXPRESSION "protocol_minor=2")
-    add_test(NAME explicit-mode-required COMMAND keysharp-desktop)
-    set_tests_properties(explicit-mode-required PROPERTIES WILL_FAIL TRUE)
-
-    add_executable(keysharp-desktop-serve-revocation-test
-        tests/serve_entry.c src/desktopd.c src/capture.c src/provider.c
-        src/authority_client.c src/common.c)
-    target_include_directories(keysharp-desktop-serve-revocation-test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(keysharp-desktop-serve-revocation-test PRIVATE
-        _GNU_SOURCE _POSIX_C_SOURCE=200809L
-        KSD_AUTHORITY_SOCKET="/tmp/keysharp-desktop-session-revoke-authority.sock"
-        KSD_RUNTIME_DIRECTORY="/tmp/keysharp-desktop-session-revoke-runtime"
-        KSD_HANDSHAKE_TIMEOUT_SECONDS=1u
-        KSD_REVOKE_GENERATION_OWNER_UID=getuid\(\))
-    target_link_libraries(keysharp-desktop-serve-revocation-test PRIVATE PkgConfig::GIO Threads::Threads)
-
-    add_executable(session-revocation-tests tests/session_revocation_tests.c src/common.c)
-    target_include_directories(session-revocation-tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(session-revocation-tests PRIVATE
-        _GNU_SOURCE _POSIX_C_SOURCE=200809L
-        KSD_RUNTIME_DIRECTORY="/tmp/keysharp-desktop-session-revoke-runtime"
-        KSD_REVOKE_GENERATION_OWNER_UID=getuid\(\))
-    add_test(NAME session-revocation-tests
-        COMMAND session-revocation-tests $<TARGET_FILE:keysharp-desktop-serve-revocation-test>)
-
-    add_executable(polkit-result-tests tests/polkit_result_tests.c src/polkit_result.c)
-    target_include_directories(polkit-result-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    add_test(NAME polkit-result-tests COMMAND polkit-result-tests)
-
-    add_executable(revocation-tests tests/revocation_tests.c src/common.c src/shared_grants.c)
-    target_include_directories(revocation-tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(revocation-tests PRIVATE
-        _GNU_SOURCE _POSIX_C_SOURCE=200809L
-        KSD_GRANT_DIRECTORY="/tmp/keysharp-desktop-revocation-test-state"
-        KSD_RUNTIME_DIRECTORY="/tmp/keysharp-desktop-revocation-test-runtime"
-        KSD_REVOKE_GENERATION_OWNER_UID=getuid\(\))
-    add_test(NAME revocation-tests COMMAND revocation-tests)
-
-    add_executable(prompt-lock-tests
-        tests/prompt_lock_tests.c src/common.c src/shared_grants.c)
-    target_include_directories(prompt-lock-tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(prompt-lock-tests PRIVATE
-        _GNU_SOURCE _POSIX_C_SOURCE=200809L
-        KSD_GRANT_DIRECTORY="/tmp/keysharp-desktop-prompt-lock-test-state"
-        KSD_RUNTIME_DIRECTORY="/tmp/keysharp-desktop-prompt-lock-test-runtime"
-        KSD_REVOKE_GENERATION_OWNER_UID=getuid\(\))
-    add_test(NAME prompt-lock-tests COMMAND prompt-lock-tests)
-
-    add_executable(grant-admin-tests
-        tests/grant_admin_tests.c src/common.c src/shared_grants.c)
-    target_include_directories(grant-admin-tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(grant-admin-tests PRIVATE
-        _GNU_SOURCE _POSIX_C_SOURCE=200809L
-        KSD_GRANT_DIRECTORY="/tmp/keysharp-desktop-grant-admin-test-state"
-        KSD_RUNTIME_DIRECTORY="/tmp/keysharp-desktop-grant-admin-test-runtime"
-        KSD_REVOKE_GENERATION_OWNER_UID=getuid\(\))
-    add_test(NAME grant-admin-tests COMMAND grant-admin-tests)
+        PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
+    add_test(NAME info-command COMMAND keysharp-desktop info)
+    set_tests_properties(info-command PROPERTIES
+        PASS_REGULAR_EXPRESSION "client_abi_minor=1")
+    add_test(NAME unknown-command-rejected
+        COMMAND keysharp-desktop unknown-command)
+    set_tests_properties(unknown-command-rejected PROPERTIES WILL_FAIL TRUE)
 
     add_test(NAME bare-revoke-rejected COMMAND keysharp-desktop revoke)
     set_tests_properties(bare-revoke-rejected PROPERTIES WILL_FAIL TRUE)
@@ -192,13 +290,10 @@ if(BUILD_TESTING)
         foreach(test_target
                 protocol-tests
                 authority-fd-tests
-                session-protocol-tests
-                keysharp-desktop-serve-revocation-test
-                session-revocation-tests
-                polkit-result-tests
-                revocation-tests
-                prompt-lock-tests
-                grant-admin-tests)
+                client-abi-tests
+                client-stream-tests
+                capture-pipe-security-tests
+                permission-domain-tests)
             target_compile_options(${test_target} PRIVATE -UNDEBUG)
         endforeach()
     endif()
@@ -212,7 +307,7 @@ set(CPACK_PACKAGE_FILE_NAME "keysharp-desktop-${PROJECT_VERSION}-${CMAKE_SYSTEM_
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libglib2.0-0 (>= 2.56) | libglib2.0-0t64, polkitd | policykit-1, systemd")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-protocol-1.2")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-0")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_BREAKS "keysharp (<< 0.0.0.17)")
 set(CPACK_DEBIAN_PACKAGE_REPLACES "keysharp (<< 0.0.0.17)")

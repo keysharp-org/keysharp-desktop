@@ -6,11 +6,12 @@
   pkg-config,
   glib,
   polkit,
+  keysharpPermissions,
 }:
 
 stdenv.mkDerivation {
   pname = "keysharp-desktop";
-  version = "0.1.0";
+  version = "0.2.0";
 
   src = lib.cleanSource ../.;
 
@@ -24,8 +25,10 @@ stdenv.mkDerivation {
   cmakeFlags = [
     "-DBUILD_TESTING=ON"
     "-DKSD_PKCHECK_PATH=${polkit}/bin/pkcheck"
+    "-DKEYSHARP_PERMISSIONS_SOURCE_DIR=${keysharpPermissions}"
     "-DKEYSHARP_DESKTOP_SYSTEMD_SYSTEM_DIR=lib/systemd/system"
     "-DKEYSHARP_DESKTOP_SYSTEMD_USER_DIR=lib/systemd/user"
+    "-DKEYSHARP_DESKTOP_CAPTURE_WORKER_PATH=/run/keysharp-desktop/keysharp-desktop-capture-worker"
   ];
 
   doCheck = true;

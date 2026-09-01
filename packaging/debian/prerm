@@ -41,7 +41,7 @@ stop_invoking_user_manager() {
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
         /usr/bin/systemctl --user --no-pager stop keysharp-desktop.service \
-        keysharp-desktop.socket >/dev/null 2>&1 || return 1
+        >/dev/null 2>&1 || return 1
     /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
@@ -56,11 +56,11 @@ if [ "${1:-}" = remove ] && command -v systemctl >/dev/null 2>&1; then
     fi
     printf '%s\n' \
         "keysharp-desktop: other logged-in users were not contacted; each should log out or run:" \
-        "  systemctl --user stop keysharp-desktop.service keysharp-desktop.socket" \
+        "  systemctl --user stop keysharp-desktop.service" \
         "  systemctl --user daemon-reload"
     systemctl disable --now keysharp-desktop-authority.socket \
         keysharp-desktop-authority.service >/dev/null 2>&1 || true
-    systemctl --global disable keysharp-desktop.socket >/dev/null 2>&1 || true
+    systemctl --global disable keysharp-desktop.service >/dev/null 2>&1 || true
 fi
 
 exit 0

@@ -14,14 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - name: Detect locked Nix packaging
-        id: nix_lock
-        shell: bash
-        run: echo "present=$([[ -f flake.lock ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - uses: cachix/install-nix-action@v31
-        if: steps.nix_lock.outputs.present == 'true'
       - name: Validate Nix flake
-        if: steps.nix_lock.outputs.present == 'true'
         run: nix flake check --no-write-lock-file
 
   build:
@@ -38,6 +32,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Verify permission dependency pin
+        run: |
+          test "$(git rev-parse HEAD:third_party/keysharp-permissions)" = ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13
+          test "$(git -C third_party/keysharp-permissions rev-parse HEAD)" = ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13
 
       - name: Install build dependencies
         run: |
@@ -49,13 +50,16 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX=/usr/local
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
           -DBUILD_TESTING=ON
 
       - name: Build
         run: cmake --build build --parallel
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          ctest --test-dir build --output-on-failure
+          sudo ./build/capture-pipe-security-tests
 
       - name: Validate provider JavaScript
         run: |
@@ -76,9 +80,15 @@ jobs:
             packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
           cmake --install build
           test -x "$DESTDIR/usr/local/bin/keysharp-desktop"
+          test -x "$DESTDIR/usr/local/libexec/keysharp-desktop-capture-worker"
+          test "$(stat -c %a "$DESTDIR/usr/local/libexec/keysharp-desktop-capture-worker")" = 700
+          test -e "$DESTDIR/usr/local/lib/libkeysharp-desktop.so.0"
+          readelf -d "$DESTDIR/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.0\]'
+          readelf -d "$DESTDIR/usr/local/lib/libkeysharp-desktop.so.0.2.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.0\]'
+          test -f "$DESTDIR/usr/local/include/keysharp_desktop/client.h"
+          test -f "$DESTDIR/usr/local/lib/pkgconfig/keysharp-desktop.pc"
           for resource in \
             lib/systemd/user/keysharp-desktop.service \
-            lib/systemd/user/keysharp-desktop.socket \
             lib/systemd/system/keysharp-desktop-authority.service \
             lib/systemd/system/keysharp-desktop-authority.socket \
             lib/tmpfiles.d/keysharp-desktop-permissions.conf; do
@@ -91,8 +101,14 @@ jobs:
           cmake --build build-deb --parallel
           cpack -G DEB --config build-deb/CPackConfig.cmake -B build-deb/packages
           dpkg-deb --info build-deb/packages/*.deb
-          dpkg-deb --contents build-deb/packages/*.deb | grep -q './usr/bin/keysharp-desktop'
-          if dpkg-deb --contents build-deb/packages/*.deb | grep -q './usr/local/'; then
+          dpkg-deb --contents build-deb/packages/*.deb > build-deb/package-contents.txt
+          grep -q './usr/bin/keysharp-desktop' build-deb/package-contents.txt
+          grep -q './usr/libexec/keysharp-desktop-capture-worker' build-deb/package-contents.txt
+          grep -q 'libkeysharp-desktop.so.0' build-deb/package-contents.txt
+          grep -q 'include/keysharp_desktop/client.h' build-deb/package-contents.txt
+          grep -q 'pkgconfig/keysharp-desktop.pc' build-deb/package-contents.txt
+          grep -q 'cmake/KeysharpDesktop/KeysharpDesktopConfig.cmake' build-deb/package-contents.txt
+          if grep -q './usr/local/' build-deb/package-contents.txt; then
             echo 'Debian package unexpectedly contains /usr/local paths.' >&2
             exit 1
           fi

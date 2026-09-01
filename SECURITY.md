@@ -1,87 +1,77 @@
 # Security model
 
-## Privilege separation
+The root authority listens on
+`/run/keysharp-desktop/keysharp-desktop.sock`, owned by root and mode 0666.
+Every connection is identified with `SO_PEERCRED`. Application frames cannot
+supply an identity, backend, provider credential, or grant result.
 
-`keysharp-desktop serve` runs as the logged-in user and refuses UID 0 or any
-real/effective credential mismatch. It never receives root privilege. Its
-user socket has mode `0600` beneath a `0700` runtime directory.
-
-Only `keysharp-desktop authority` runs as root and it requires real and
-effective UID and GID 0. Sharing one executable does not merge the two process
-privilege domains, and the executable must never be installed setuid. Its system socket is writable
-by users because authorization requests must cross the privilege boundary, but
-callers cannot state an identity. For an authorization check, the broker passes
-the original connected client file descriptor with `SCM_RIGHTS`; the authority
-derives PID, UID, and process start time from that socket's `SO_PEERCRED` data.
-List and revoke operations use the control socket's own peer UID and can
-therefore inspect or remove only the caller's grants. Scoped revoke accepts a
-validated 64-hex application identity and desktop capability mask; UID-wide
-revocation requires the explicit `--all` CLI form.
-
-The authority asks polkit to authorize the original client process, not the
-broker. It rechecks the process start time after polkit returns and writes a
-root-owned `0600` store through a locked, fsynced, atomic rename. Stored grants
-are permanent until revoked; no session or deny records are stored. A revoke
-also advances a root-owned runtime generation. The session broker observes it
-within 250 milliseconds and shuts down every capability-bearing connection.
-Work already executing may complete, but the connection accepts no subsequent
-command. Capability-only clients receive the same closure signal. Generation
-updates bracket the locked grant-store mutation, so a service crash cannot
-remove a grant without first invalidating sessions that held it.
-
-Before opening an interactive polkit request, either compatible helper takes
-the same root-owned `0600`, `O_NOFOLLOW` prompt lock for the client's UID and
-application identity. It revalidates the client and shared grants after waiting,
-then holds that lock until any new marker is durable. The grant-store lock is
-not held across UI, and revoke deliberately ignores the prompt lock; the revoke
-generation fence prevents a late approval from restoring a revoked grant.
+The authority accepts only small bounded request frames, maps every sensitive
+operation to one permission scope, and checks the executable identity and
+grant before and after work. Client, per-UID, capture-memory, string, geometry,
+event, overlay, reservation, and I/O limits fail closed.
 
 ## Application identity
 
-The grant key is the tuple `(UID, SHA-256 executable identity)`. For a
-root-owned executable whose entire resolved path is root-owned and not group-
-or other-writable, the identity covers its canonical kernel path so package
-updates keep their grants. The final path is checked against the opened inode.
-Otherwise the identity covers executable content, so replacing a development
-binary changes it. This matches keysharp-input's permanent executable-level grants and
-macOS TCC-style application consent. Command-line arguments are deliberately
-excluded because they are forgeable, unstable, and not an operating-system
-security boundary.
+A grant is keyed by UID and the hash of the kernel-resolved executable. The
+authority also records the process start time and revalidates it while a
+connection is active.
 
-The kernel-derived UID, executable, and PID start time protect against other
-UIDs, a different executable, and PID reuse. Linux does not provide a strong
-security boundary between hostile processes running under the same UID. A
-same-UID process can debug another dumpable process, and every script hosted by
-the same interpreter necessarily shares that interpreter's executable grant.
+This is a consent identity, not isolation from hostile code already running as
+the same user. It assumes the granted program's launch and runtime integrity.
+For example, it cannot stop the same user from launching a granted dynamically
+linked executable with `LD_PRELOAD` or `LD_AUDIT`, or from injecting where OS
+policy permits it. Scripts using the same interpreter executable share one
+principal. Separate grants require separate protected executables or a
+stronger external sandbox.
 
-## Compositor providers
+## Session registration and providers
 
-GNOME and Cinnamon accept capture, broker registration, global window
-monitoring and control, and clipboard reads and change delivery only from a
-session-bus caller whose
-`/proc/PID/exe` basename is `keysharp-desktop` and whose executable is
-root-owned and not group- or other-writable. This prevents accidental bypass by
-ordinary provider clients, but the same-UID limitation above still applies.
-Provider installation must preserve root ownership and mode `0755` or stricter.
+The supervised per-user daemon connects outbound to the public authority
+socket and sends one fixed registration record. The authority verifies peer
+credentials, executable inode, process identity, and detected desktop. Only
+one live backend is accepted per UID. The daemon never accepts application
+connections and never forwards application frames.
 
-Global cursor-position queries and clipboard writes are intentionally
-permission-free provider operations. Process-owned overlays and placement
-reservations also remain direct because they are scoped to the registering
-client rather than arbitrary desktop state.
+GNOME Shell and Cinnamon expose sensitive methods only on private peer sockets
+under the user's runtime directory. Those sockets accept UID 0. Before use,
+the authority validates the provider peer, unique session-bus owner, and
+root-owned provider executable under an absolute deadline. No connection-cache
+lock is held while connecting or performing D-Bus I/O.
 
-The provider boundary makes the broker the effective gate for calls made
-through these extension interfaces. It is not a system-wide mandatory-access
-control boundary: X11 and public desktop-session APIs, including Cinnamon's
-`org.Cinnamon.Eval` when enabled and KWin's ordinary window-management
-interfaces, remain callable by same-user processes. Authorization there records
-application consent but cannot make the underlying APIs exclusive to this
-broker. Audio and camera capture performed through other platform APIs likewise
-remains the client's responsibility to precede with the matching authorization
-request.
+Provider executable validation has the same-UID runtime-integrity limit
+as application grants. Executable paths alone do not defeat same-UID injection.
 
-## Reporting issues
+## Capture
 
-Do not include grant-store contents, full command lines, screenshots, or other
-private desktop data in a public report. Open a minimal report with the affected
-version and contact the project maintainers privately when disclosure would
-expose user data or an authorization bypass.
+KWin capture runs in a separate root-only executable. The authority supplies a
+root-owned mode-000 directional pipe before the worker drops to the session
+UID. The non-dumpable worker retains the read end and a root-owned anonymous
+spool. Its short-lived D-Bus child closes every capture descriptor except the
+write end before becoming dumpable, and returns only fixed-size metadata.
+The worker drains concurrently, seals the exact validated bytes, and converts
+them only after the child exits. KWin capture requires Linux Yama
+`ptrace_scope=1`; other values fail closed.
+
+GNOME area capture stays in an in-memory stream. GNOME window capture and all
+Cinnamon capture are disabled because the available shell APIs require named
+temporary files that other same-UID processes could open. Provider operation
+bits report this accurately.
+
+## Grants and revocation
+
+Shared grants live in `/var/lib/keysharp-permissions/v1`. Files are root-owned,
+mode 0600, and updated with locking and atomic rename. A per-identity prompt
+lock prevents duplicate polkit prompts, and generation fencing prevents a late
+approval from recreating a revoked grant.
+
+Revocation advances a per-UID generation. Active sessions clear revoked scopes
+before receiving the revoke result. Work whose generation changes before
+release returns `REVOKED` and discards sensitive output.
+
+The authority manages the six desktop scopes plus shared InputControl. It
+rejects InputMonitoring. Another authority may grant or revoke InputControl;
+the common prompt lock and generation fence keep the shared marker coherent.
+
+Do not put grants, hashes, screenshots, clipboard data, or full command lines
+in public diagnostics. Report vulnerabilities privately through the
+repository's GitHub security advisory page.

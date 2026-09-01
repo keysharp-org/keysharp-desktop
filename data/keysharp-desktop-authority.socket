@@ -2,7 +2,8 @@
 Description=Keysharp desktop authorization socket
 
 [Socket]
-ListenStream=/run/keysharp-desktop/authority.sock
+ListenStream=/run/keysharp-desktop/keysharp-desktop.sock
+FileDescriptorName=public
 Accept=no
 SocketMode=0666
 DirectoryMode=0755

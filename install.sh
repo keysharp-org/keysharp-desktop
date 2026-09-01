@@ -49,19 +49,14 @@ refresh_invoking_user_manager() {
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
-        /usr/bin/systemctl --user --no-pager try-restart \
+        /usr/bin/systemctl --user --no-pager restart \
         keysharp-desktop.service >/dev/null 2>&1 || return 1
-    /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
-        HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
-        LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
-        /usr/bin/systemctl --user --no-pager start keysharp-desktop.socket \
-        >/dev/null 2>&1
 }
 
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --build "$build_dir" --parallel
 cmake --install "$build_dir"
+[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create "$prefix/lib/tmpfiles.d/keysharp-desktop-permissions.conf" || true
@@ -70,16 +65,15 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
     systemctl enable --now keysharp-desktop-authority.socket || true
     systemctl try-restart keysharp-desktop-authority.service || true
-    systemctl --global enable keysharp-desktop.socket || true
+    systemctl --global enable keysharp-desktop.service || true
 fi
 
 if refresh_invoking_user_manager; then
     user_handoff="Refreshed keysharp-desktop for the invoking user's active session."
 else
-    user_handoff="No active invoking user manager was safely resolved. New logins start the globally enabled socket; already logged-in users should run:
+    user_handoff="No active invoking user manager was safely resolved. New logins start the globally enabled service; already logged-in users should run:
   systemctl --user daemon-reload
-  systemctl --user try-restart keysharp-desktop.service
-  systemctl --user start keysharp-desktop.socket"
+  systemctl --user restart keysharp-desktop.service"
 fi
 printf '%s\n' \
     "Installed keysharp-desktop ${prefix}." \

@@ -18,16 +18,36 @@ portable_path_conflicts() {
     return 0
 }
 
+package_owns_path() {
+    command -v dpkg-query >/dev/null 2>&1 \
+        && dpkg-query -S "$1" 2>/dev/null \
+            | grep -q '^keysharp-desktop:'
+}
+
 case "${1:-}" in
     install|upgrade)
+        for portable in /usr/local/lib/libkeysharp-desktop.so*; do
+            [ -e "$portable" ] || [ -L "$portable" ] || continue
+            printf '%s\n' \
+                "keysharp-desktop: a conflicting portable library is present ($portable)." \
+                "Remove the portable installation before installing the Debian package:" \
+                "  sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh" >&2
+            exit 1
+        done
         for mapping in \
             "/usr/local/bin/keysharp-desktop /usr/bin/keysharp-desktop" \
+            "/usr/local/libexec/keysharp-desktop-capture-worker /usr/libexec/keysharp-desktop-capture-worker" \
             "/usr/local/lib/systemd/user/keysharp-desktop.service /usr/lib/systemd/user/keysharp-desktop.service" \
-            "/usr/local/lib/systemd/user/keysharp-desktop.socket /usr/lib/systemd/user/keysharp-desktop.socket" \
             "/usr/local/share/systemd/user/keysharp-desktop.service /usr/lib/systemd/user/keysharp-desktop.service" \
-            "/usr/local/share/systemd/user/keysharp-desktop.socket /usr/lib/systemd/user/keysharp-desktop.socket" \
             "/usr/local/lib/systemd/system/keysharp-desktop-authority.service /usr/lib/systemd/system/keysharp-desktop-authority.service" \
-            "/usr/local/lib/systemd/system/keysharp-desktop-authority.socket /usr/lib/systemd/system/keysharp-desktop-authority.socket"; do
+            "/usr/local/lib/systemd/system/keysharp-desktop-authority.socket /usr/lib/systemd/system/keysharp-desktop-authority.socket" \
+            "/usr/local/lib/tmpfiles.d/keysharp-desktop-permissions.conf /usr/lib/tmpfiles.d/keysharp-desktop-permissions.conf" \
+            "/usr/local/include/keysharp_desktop/client.h /usr/include/keysharp_desktop/client.h" \
+            "/usr/local/lib/pkgconfig/keysharp-desktop.pc /usr/lib/pkgconfig/keysharp-desktop.pc" \
+            "/usr/local/lib/cmake/KeysharpDesktop /usr/lib/cmake/KeysharpDesktop" \
+            "/usr/local/share/applications/org.keysharp.DesktopCapture.desktop /usr/share/applications/org.keysharp.DesktopCapture.desktop" \
+            "/usr/local/share/gnome-shell/extensions/keysharp@keysharp.io /usr/share/gnome-shell/extensions/keysharp@keysharp.io" \
+            "/usr/local/share/cinnamon/extensions/keysharp@keysharp.io /usr/share/cinnamon/extensions/keysharp@keysharp.io"; do
             # shellcheck disable=SC2086 # deliberate split into portable and packaged paths
             set -- $mapping
             portable=$1
@@ -38,6 +58,15 @@ case "${1:-}" in
                 "  sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh" >&2
             exit 1
         done
+        policy=/usr/share/polkit-1/actions/org.keysharp.desktop.policy
+        if { [ -e "$policy" ] || [ -L "$policy" ]; } \
+            && ! package_owns_path "$policy"; then
+            printf '%s\n' \
+                "keysharp-desktop: an unmanaged policy is present ($policy)." \
+                "Remove the portable installation before installing the Debian package:" \
+                "  sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh" >&2
+            exit 1
+        fi
         ;;
 esac
 

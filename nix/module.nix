@@ -36,7 +36,8 @@ in
       description = "Keysharp desktop authorization socket";
       wantedBy = [ "sockets.target" ];
       socketConfig = {
-        ListenStream = "/run/keysharp-desktop/authority.sock";
+        ListenStream = "/run/keysharp-desktop/keysharp-desktop.sock";
+        FileDescriptorName = "public";
         SocketMode = "0666";
         DirectoryMode = "0755";
         RemoveOnStop = true;
@@ -46,9 +47,14 @@ in
     systemd.services.keysharp-desktop-authority = {
       description = "Keysharp desktop authorization authority";
       requires = [ "keysharp-desktop-authority.socket" ];
+      preStart = ''
+        ${pkgs.coreutils}/bin/install -m 0700 \
+          ${cfg.package}/libexec/keysharp-desktop-capture-worker \
+          /run/keysharp-desktop/keysharp-desktop-capture-worker
+      '';
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/keysharp-desktop authority";
+        ExecStart = "${cfg.package}/bin/keysharp-desktop authority-daemon";
         User = "root";
         Group = "root";
         UMask = "0077";
@@ -70,24 +76,14 @@ in
       };
     };
 
-    systemd.user.sockets.keysharp-desktop = {
-      description = "Keysharp desktop broker socket";
-      wantedBy = [ "sockets.target" ];
-      socketConfig = {
-        ListenStream = "%t/keysharp-desktop/keysharp-desktop.sock";
-        SocketMode = "0600";
-        DirectoryMode = "0700";
-        RemoveOnStop = true;
-      };
-    };
-
     systemd.user.services.keysharp-desktop = {
       description = "Keysharp desktop broker";
-      requires = [ "keysharp-desktop.socket" ];
       after = [ "graphical-session.target" ];
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${cfg.package}/bin/keysharp-desktop serve";
+        ExecStart = "${cfg.package}/bin/keysharp-desktop daemon";
         StandardInput = "null";
         StandardOutput = "journal";
         StandardError = "journal";
@@ -97,6 +93,8 @@ in
         ProtectHome = "read-only";
         RestrictAddressFamilies = [ "AF_UNIX" ];
         LockPersonality = true;
+        Restart = "on-failure";
+        RestartSec = "2s";
       };
     };
   };
