@@ -259,6 +259,13 @@ if(BUILD_TESTING)
         _GNU_SOURCE _POSIX_C_SOURCE=200809L)
     add_test(NAME permission-domain-tests COMMAND permission-domain-tests)
 
+    # Both build their scratch store under $HOME, because a store refuses any parent a
+    # third party can write to and /tmp is exactly that. A build sandbox points HOME at
+    # a directory that does not exist, so give them one in the build tree instead.
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-home)
+    set_tests_properties(permissions-core-tests permission-domain-tests PROPERTIES
+        ENVIRONMENT HOME=${CMAKE_CURRENT_BINARY_DIR}/test-home)
+
     add_test(NAME version-command COMMAND keysharp-desktop version)
     set_tests_properties(version-command PROPERTIES
         PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")

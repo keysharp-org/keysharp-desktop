@@ -37,7 +37,15 @@ cp "$source_dir/data/keysharp-desktop-authority.socket" \
     "$resource_root/lib/systemd/system/keysharp-desktop-authority.socket"
 cp "$source_dir/data/keysharp-desktop-permissions.conf" \
     "$resource_root/lib/tmpfiles.d/keysharp-desktop-permissions.conf"
-cp /bin/true \
+# A sandbox carries only /bin/sh, so provide the executable stand-ins here rather than
+# reaching for host paths. The live-upgrade case needs a real binary that stays alive
+# across its own replacement; everything else only needs something that exits 0.
+sleep_binary=$(command -v sleep)
+[ -x "$sleep_binary" ]
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$temporary/replacement"
+chmod 0755 "$temporary/replacement"
+
+cp "$temporary/replacement" \
     "$resource_root/libexec/keysharp-desktop-capture-worker"
 chmod 0700 "$resource_root/libexec/keysharp-desktop-capture-worker"
 sed 's|@KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH@|/usr/local/libexec/keysharp-desktop-capture-worker|' \
@@ -92,18 +100,25 @@ cp "$source_dir/data/keysharp-desktop.service.in" \
 rm -f "$resource_root/libexec/keysharp-desktop-capture-worker"
 ! has_required_resources "$resource_root"
 
+# A build sandbox maps every uid but the builder's to nobody, so nothing there can be
+# root-protected and only the rejection case stays meaningful. Probe ownership directly
+# rather than through the predicate under test.
 protected_file=$(command -v sh)
-is_root_protected_file "$protected_file"
+if [ "$(stat -Lc '%u' /etc 2>/dev/null || echo 1)" = 0 ]; then
+    is_root_protected_file "$protected_file"
+else
+    echo "skipping the acceptance case: no root-owned system files here" >&2
+fi
 ln -s "$protected_file" "$temporary/unprotected-link"
 ! is_root_protected_file "$temporary/unprotected-link"
 
 live_executable=$temporary/live-executable
-cp /bin/sleep "$live_executable"
+cp "$sleep_binary" "$live_executable"
 chmod 0755 "$live_executable"
 old_inode=$(stat -c '%i' "$live_executable")
 "$live_executable" 30 &
 upgrade_pid=$!
-atomic_install_file /bin/true "$live_executable" 0755
+atomic_install_file "$temporary/replacement" "$live_executable" 0755
 new_inode=$(stat -c '%i' "$live_executable")
 [ "$old_inode" != "$new_inode" ]
 kill -0 "$upgrade_pid"

@@ -29,6 +29,14 @@ stdenv.mkDerivation {
     "-DKEYSHARP_DESKTOP_SYSTEMD_SYSTEM_DIR=lib/systemd/system"
     "-DKEYSHARP_DESKTOP_SYSTEMD_USER_DIR=lib/systemd/user"
     "-DKEYSHARP_DESKTOP_CAPTURE_WORKER_PATH=/run/keysharp-desktop/keysharp-desktop-capture-worker"
+    # The cmake hook points each install directory at an absolute $out path, which makes
+    # CMake bake that prefix into the exported targets instead of deriving it from where
+    # the package config is found. The layout is unchanged, but the export stays
+    # relocatable, which is what a consumer reading a staged install tree needs.
+    "-DCMAKE_INSTALL_BINDIR=bin"
+    "-DCMAKE_INSTALL_LIBDIR=lib"
+    "-DCMAKE_INSTALL_INCLUDEDIR=include"
+    "-DCMAKE_INSTALL_LIBEXECDIR=libexec"
   ];
 
   doCheck = true;
