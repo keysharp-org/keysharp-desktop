@@ -1,119 +1,289 @@
 # keysharp-desktop
 
-keysharp-desktop is a standalone Linux desktop-automation service and C
-library. It provides screen capture, window inspection and control, clipboard
-observation, and compositor pointer control without giving applications direct
-access to privileged compositor interfaces.
+A Linux desktop-automation service and C library. It provides screen capture,
+window inspection and control, clipboard observation, and compositor pointer
+control, without giving applications direct access to privileged compositor
+interfaces.
 
-The public C ABI is 0.1 and uses SONAME `libkeysharp-desktop.so.0`. The wire
-protocol is private.
+Applications link a small C library (`keysharp_desktop/client.h`) and connect to
+a root-owned Unix socket at `/run/keysharp-desktop/keysharp-desktop.sock`. The
+socket is mode 0666: authorization comes from kernel peer credentials and
+per-application grants, not from filesystem permissions. The public C ABI is 0.1
+with SONAME `libkeysharp-desktop.so.0`; the wire protocol is private.
 
-## Components
+## Install
 
-- `libkeysharp-desktop.so.0` provides `keysharp_desktop/client.h` and the CMake
-  target `KeysharpDesktop::client`.
-- `keysharp-desktop authority-daemon` is the socket-activated root authority.
-- `keysharp-desktop daemon` registers the current graphical session with the
-  authority. It is a supervised per-user service and never proxies application
-  messages.
-- `keysharp-desktop-capture-worker` is a root-only KWin capture worker.
-- GNOME Shell and Cinnamon extensions provide compositor operations over a
-  private root-authenticated peer connection.
+Three routes, in order of preference. Each one leaves the authority socket
+enabled and the per-session service running.
 
-Applications connect directly to the root-owned Unix socket at
-`/run/keysharp-desktop/keysharp-desktop.sock`. The socket is mode 0666;
-authorization comes from kernel peer credentials and application grants, not
-filesystem access to the socket.
+### Debian package
 
-## Build and install
+Download the `.deb` for your architecture from the [releases page][releases]:
 
-The pinned `keysharp-permissions` dependency is a git submodule.
+```bash
+sudo apt install ./keysharp-desktop_<version>_<arch>.deb
+```
 
-```sh
+The package is self-contained apart from ordinary distribution dependencies,
+and its post-install step enables the services for you. It provides the virtual
+package `keysharp-desktop-client-abi-0`, which is the name applications depend
+on.
+
+### Portable archive
+
+For distributions without a package. The archive carries a prebuilt payload and
+its own installer, so nothing is compiled:
+
+```bash
+tar xf keysharp-desktop-<version>-linux-<arch>.tar.gz
+cd keysharp-desktop-<version>-linux-<arch>
+sudo ./install.sh
+```
+
+An application installer that should leave an existing, compatible system
+installation alone can pass `--skip-if-compatible`.
+
+### From source
+
+You need CMake 3.20+, a C11 compiler, and GLib; polkit is needed at run time for
+authorization prompts. The `keysharp-permissions` dependency is a submodule, so
+clone recursively:
+
+```bash
 git clone --recurse-submodules https://github.com/keysharp-org/keysharp-desktop
 cd keysharp-desktop
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+sudo apt install cmake make gcc pkg-config libglib2.0-dev polkitd
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 sudo cmake --install build
 ```
 
-An alternate dependency checkout is a developer-only override:
+The install step finishes the system side: it refreshes the linker cache, creates
+the permission store, enables and starts
+`keysharp-desktop-authority.socket`, and enables the per-user
+`keysharp-desktop.service` for every account.
 
-```sh
-cmake -S . -B build \
-  -DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path/to/keysharp-permissions
-```
+An account that is already logged in picks the user service up at its next
+login, or immediately with:
 
-After a source install:
-
-```sh
-sudo systemd-tmpfiles --create
-sudo systemctl enable --now keysharp-desktop-authority.socket
-sudo systemctl --global enable keysharp-desktop.service
+```bash
 systemctl --user daemon-reload
-systemctl --user start keysharp-desktop.service
+systemctl --user restart keysharp-desktop.service
 ```
 
-The Debian package is self-contained apart from normal distribution
-dependencies; installing it does not require another project artifact. It
-provides `keysharp-desktop-client-abi-0`.
+`sudo ./install.sh` does all of the above, additionally installs the distribution
+packages listed here, and refreshes the invoking user's session for you;
+`PREFIX` and `BUILD_DIR` move the destination and the build tree. To build and
+test without installing anything, stop after `ctest`:
 
-Portable installations include
-`/usr/local/share/doc/keysharp-desktop/uninstall.sh`. It removes only this
-project's installed files and retains shared grants in
-`/var/lib/keysharp-permissions/v1`.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Configure with `-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF` to install the files
+without touching systemd, which is what packaging does. To develop against a
+sibling `keysharp-permissions` checkout instead of the submodule, use
+`-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path/to/keysharp-permissions`.
+
+### Enable the compositor extension
+
+On GNOME Shell and Cinnamon, the compositor operations come from a bundled shell
+extension, which every install places on the system but does not turn on. Enable
+it once per user account:
+
+```bash
+gnome-extensions enable keysharp@keysharp.io
+```
+
+On Cinnamon, enable *Keysharp Desktop Integration* in System Settings ->
+Extensions. Either way, log out and back in afterwards, then confirm the
+operations are advertised with `keysharp-desktop info`. KWin needs no extension.
+
+### Check the install
+
+```bash
+keysharp-desktop probe
+keysharp-desktop info
+```
+
+### Uninstall
+
+Remove a packaged install with your package manager. A source or portable
+install under `/usr/local` carries its own uninstaller:
+
+```bash
+sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh
+```
+
+It removes only this project's files and keeps the shared grants in
+`/var/lib/keysharp-permissions/v1`, because other authorities use the same
+store.
+
+## How it fits together
+
+- `libkeysharp-desktop.so.0` is what applications link. It provides
+  `keysharp_desktop/client.h` and the CMake target `KeysharpDesktop::client`.
+- `keysharp-desktop authority-daemon` is the socket-activated root authority
+  that applications talk to.
+- `keysharp-desktop daemon` is a supervised per-user service. It registers the
+  current graphical session with the authority and never proxies application
+  messages.
+- `keysharp-desktop-capture-worker` is a root-only KWin capture worker.
+- The GNOME Shell and Cinnamon extensions perform compositor operations over a
+  private, root-authenticated peer connection.
 
 ## Client API
 
-Include `keysharp_desktop/client.h` and link with either:
+Build against the client library:
 
-```sh
-pkg-config --cflags --libs keysharp-desktop
+```bash
+cc my-app.c $(pkg-config --cflags --libs keysharp-desktop)
 ```
 
-or:
+or, from CMake:
 
 ```cmake
 find_package(KeysharpDesktop 0.2 CONFIG REQUIRED)
 target_link_libraries(my-app PRIVATE KeysharpDesktop::client)
 ```
 
-Initialize every options/result object with its matching `ksd_*_init`
-function. Release owned output with the matching `ksd_*_clear` function. A
-connection is used by one thread at a time.
+Three rules cover the whole API: initialize every options and result object with
+its matching `ksd_*_init` function, release owned output with the matching
+`ksd_*_clear` function, and use a connection from one thread at a time. Every
+call takes an initialized `ksd_error` and returns a `ksd_status`, so the two
+examples below are complete programs.
+
+`ksd_connect` names the scopes an application wants, and `ksd_authorize` with
+`KSD_AUTH_REQUEST` is what opens the polkit dialog the first time it runs. Once
+the user approves, the grant is remembered and later runs go straight through.
+Connect requesting no scopes to read `info.available_operations` without opening
+a dialog at all.
+
+### List the open windows
 
 ```c
-ksd_connect_options options;
-ksd_service_info info;
-ksd_error error;
-ksd_connection *connection = NULL;
+#include <keysharp_desktop/client.h>
+#include <stdio.h>
 
-ksd_connect_options_init(&options);
-ksd_service_info_init(&info);
-ksd_error_init(&error);
-options.requested_scopes = KSD_SCOPE_WINDOW_MONITORING;
-
-if (ksd_connect(&options, &connection, &info, &error) == KSD_STATUS_OK) {
+int main(void)
+{
+    ksd_connect_options options;
+    ksd_service_info info;
+    ksd_error error;
+    ksd_connection *connection = NULL;
     ksd_string windows;
+    uint32_t granted = 0u;
+
+    ksd_connect_options_init(&options);
+    ksd_service_info_init(&info);
+    ksd_error_init(&error);
     ksd_string_init(&windows);
-    if (ksd_window_list_json(connection, 0, &windows, &error)
-            == KSD_STATUS_OK)
+    options.requested_scopes = KSD_SCOPE_WINDOW_MONITORING;
+
+    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "connect: %s\n", error.message);
+        return 1;
+    }
+    if (ksd_authorize(connection, KSD_AUTH_REQUEST, KSD_SCOPE_WINDOW_MONITORING,
+                      &granted, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "authorize: %s\n", error.message);
+        ksd_disconnect(connection);
+        return 1;
+    }
+    if (ksd_window_list_json(connection, 0, &windows, &error) == KSD_STATUS_OK) {
+        printf("%s\n", windows.data);
         ksd_string_clear(&windows);
+    } else {
+        fprintf(stderr, "window list: %s\n", error.message);
+    }
     ksd_disconnect(connection);
+    return 0;
 }
 ```
 
-Use `info.available_operations` before calling an operation:
+Each window in that JSON carries the handle `ksd_window_focus`,
+`ksd_window_raise`, `ksd_window_close` and `ksd_window_move_resize` take.
+Changing a window needs `KSD_SCOPE_WINDOW_CONTROL` as well.
 
-- KWin: area and window capture.
-- GNOME Shell: in-memory area capture, window operations/events, clipboard
-  reads/events, pointer control, cursor position, and work area.
-- Cinnamon: window operations/events, clipboard reads/events, pointer control,
-  cursor position, and work area.
+### Capture part of the screen
 
-GNOME window capture and Cinnamon capture are not advertised because their
-available shell APIs require named temporary image files.
+`ksd_capture_area` fills a `ksd_capture` whose `data` the caller releases with
+`ksd_capture_clear`. On the backends that advertise capture the format is
+`KSD_CAPTURE_FORMAT_PNG`, so the bytes can go straight to a file.
+
+```c
+#include <keysharp_desktop/client.h>
+#include <stdio.h>
+
+int main(void)
+{
+    ksd_connect_options options;
+    ksd_service_info info;
+    ksd_error error;
+    ksd_connection *connection = NULL;
+    ksd_capture capture;
+    uint32_t granted = 0u;
+    FILE *file;
+
+    ksd_connect_options_init(&options);
+    ksd_service_info_init(&info);
+    ksd_error_init(&error);
+    ksd_capture_init(&capture);
+    options.requested_scopes = KSD_SCOPE_SCREEN_CAPTURE;
+
+    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "connect: %s\n", error.message);
+        return 1;
+    }
+    if (ksd_authorize(connection, KSD_AUTH_REQUEST, KSD_SCOPE_SCREEN_CAPTURE,
+                      &granted, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "authorize: %s\n", error.message);
+        ksd_disconnect(connection);
+        return 1;
+    }
+    if (ksd_capture_area(connection, 0, 0, 400, 300, &capture, &error)
+            != KSD_STATUS_OK) {
+        fprintf(stderr, "capture: %s\n", error.message);
+        ksd_disconnect(connection);
+        return 1;
+    }
+    if (capture.format == KSD_CAPTURE_FORMAT_PNG
+        && (file = fopen("shot.png", "wb")) != NULL) {
+        fwrite(capture.data.data, 1, capture.data.length, file);
+        fclose(file);
+        printf("wrote shot.png (%ux%u)\n", capture.width, capture.height);
+    }
+    ksd_capture_clear(&capture);
+    ksd_disconnect(connection);
+    return 0;
+}
+```
+
+### Beyond the examples
+
+`ksd_cursor_position` and `ksd_work_area` answer screen queries.
+`ksd_window_event_init` with an event-stream connection watches windows, and the
+clipboard equivalents watch copies. `ksd_permissions_list` and
+`ksd_permissions_revoke` back a settings UI.
+[docs/integrating.md](docs/integrating.md) covers the whole API.
+
+## Available operations
+
+What a session supports depends on its compositor, so check
+`info.available_operations` before calling an operation.
+
+| Operation | KWin | GNOME Shell | Cinnamon |
+| --- | --- | --- | --- |
+| Area capture | yes | in-memory | - |
+| Window capture | yes | - | - |
+| Window operations and events | - | yes | yes |
+| Clipboard reads and events | - | yes | yes |
+| Pointer control, cursor position, work area | - | yes | yes |
+
+GNOME window capture and Cinnamon capture are not advertised because the shell
+APIs available for them require named temporary image files.
 
 ## Permissions
 
@@ -131,10 +301,12 @@ The shared durable scopes are:
 | `KSD_SCOPE_CLIPBOARD_MONITORING` | read or watch the clipboard |
 
 This service manages its six desktop scopes plus the shared InputControl scope
-used by pointer calls. InputMonitoring is a canonical shared value but is not
-accepted for grant or revocation here. Polkit authenticates a new grant
-request; the result remains until explicitly revoked. Shared scope values and
-marker handling come from the pinned `keysharp-permissions` library.
+that pointer calls use. InputMonitoring is a canonical shared value, but this
+service does not accept it for a grant or a revocation.
+
+Polkit authenticates a new grant request, and the result remains until it is
+explicitly revoked. Shared scope values and marker handling come from the pinned
+`keysharp-permissions` library.
 
 ## Command line
 
@@ -147,8 +319,8 @@ keysharp-desktop permissions revoke (--hash HASH|--pid PID|--all) [SCOPE ...] [-
 keysharp-desktop daemon
 ```
 
-Exit status is 0 for success, 1 for an operational or authorization failure,
-and 2 for invalid syntax.
+Exit status is 0 for success, 1 for an operational or authorization failure, and
+2 for invalid syntax.
 
 ## Troubleshooting
 
@@ -159,8 +331,14 @@ sudo systemctl status keysharp-desktop-authority.socket \
   keysharp-desktop-authority.service
 ```
 
-See [SECURITY.md](SECURITY.md), [docs/integrating.md](docs/integrating.md), and
-[docs/packaging.md](docs/packaging.md) for the security, API, and packaging
-contracts.
+## More documentation
 
-Licensed under the MIT License. Descolada is the sole contributor.
+- [docs/integrating.md](docs/integrating.md) - the client API in depth
+- [SECURITY.md](SECURITY.md) - trust boundaries and reporting
+- [docs/packaging.md](docs/packaging.md) - install layout and release artifacts
+
+## License
+
+MIT.
+
+[releases]: https://github.com/keysharp-org/keysharp-desktop/releases

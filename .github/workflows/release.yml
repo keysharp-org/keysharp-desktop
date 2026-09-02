@@ -122,20 +122,21 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build gcc pkg-config libglib2.0-dev polkitd
+          sudo apt-get install --yes cmake gcc pkg-config libglib2.0-dev polkitd
 
       - name: Configure and build
         run: |
-          cmake -S . -B build-portable -G Ninja \
+          cmake -S . -B build-portable \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
             -DBUILD_TESTING=ON
           cmake --build build-portable --parallel
           ctest --test-dir build-portable --output-on-failure
-          cmake -S . -B build-deb -G Ninja \
+          cmake -S . -B build-deb \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF
           cmake --build build-deb --parallel
 
       - name: Assemble release files

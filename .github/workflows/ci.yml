@@ -43,11 +43,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake ninja-build gcc pkg-config libglib2.0-dev polkitd shellcheck
+          sudo apt-get install --yes cmake gcc pkg-config libglib2.0-dev polkitd shellcheck
 
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_INSTALL_PREFIX=/usr/local
           -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
@@ -94,10 +94,11 @@ jobs:
             lib/tmpfiles.d/keysharp-desktop-permissions.conf; do
             test -f "$DESTDIR/usr/local/$resource"
           done
-          cmake -S . -B build-deb -G Ninja \
+          cmake -S . -B build-deb \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF
           cmake --build build-deb --parallel
           cpack -G DEB --config build-deb/CPackConfig.cmake -B build-deb/packages
           dpkg-deb --info build-deb/packages/*.deb

@@ -2,7 +2,6 @@
   lib,
   stdenv,
   cmake,
-  ninja,
   pkg-config,
   glib,
   polkit,
@@ -17,7 +16,6 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = [
     cmake
-    ninja
     pkg-config
   ];
   buildInputs = [ glib ];
@@ -29,6 +27,7 @@ stdenv.mkDerivation {
     "-DKEYSHARP_DESKTOP_SYSTEMD_SYSTEM_DIR=lib/systemd/system"
     "-DKEYSHARP_DESKTOP_SYSTEMD_USER_DIR=lib/systemd/user"
     "-DKEYSHARP_DESKTOP_CAPTURE_WORKER_PATH=/run/keysharp-desktop/keysharp-desktop-capture-worker"
+    "-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF"
     # The cmake hook points each install directory at an absolute $out path, which makes
     # CMake bake that prefix into the exported targets instead of deriving it from where
     # the package config is found. The layout is unchanged, but the export stays

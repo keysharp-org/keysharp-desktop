@@ -185,6 +185,50 @@ if(CMAKE_INSTALL_PREFIX STREQUAL "/usr/local")
         DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-desktop)
 endif()
 
+# A direct root install finishes the job, so `sudo cmake --install` needs no
+# follow-up commands. Packaging installs stage into DESTDIR, or turn this off,
+# and run the equivalent step from their own maintainer scripts. Only the system
+# side is done here: refreshing an already-running user session needs the
+# invoking user's bus, which install.sh resolves.
+option(KEYSHARP_DESKTOP_SETUP_ON_INSTALL
+    "refresh the linker cache and enable the services after a direct root install" ON)
+if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
+    install(CODE "
+        if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+            find_program(_ldconfig ldconfig PATHS /sbin /usr/sbin NO_CACHE)
+            if(_ldconfig)
+                execute_process(COMMAND \"\${_ldconfig}\")
+            endif()
+            find_program(_tmpfiles systemd-tmpfiles NO_CACHE)
+            if(_tmpfiles)
+                execute_process(COMMAND \"\${_tmpfiles}\" --create
+                    \"\${CMAKE_INSTALL_PREFIX}/lib/tmpfiles.d/keysharp-desktop-permissions.conf\"
+                    RESULT_VARIABLE _tmpfiles_result)
+                if(NOT _tmpfiles_result EQUAL 0)
+                    message(WARNING \"systemd-tmpfiles did not create the keysharp-desktop permission store\")
+                endif()
+            endif()
+            find_program(_systemctl systemctl NO_CACHE)
+            if(_systemctl)
+                execute_process(COMMAND \"\${_systemctl}\" daemon-reload)
+                execute_process(COMMAND \"\${_systemctl}\" enable --now
+                    keysharp-desktop-authority.socket
+                    RESULT_VARIABLE _socket_result)
+                execute_process(COMMAND \"\${_systemctl}\" try-restart
+                    keysharp-desktop-authority.service)
+                execute_process(COMMAND \"\${_systemctl}\" --global enable
+                    keysharp-desktop.service
+                    RESULT_VARIABLE _user_result)
+                if(NOT _socket_result EQUAL 0 OR NOT _user_result EQUAL 0)
+                    message(WARNING \"keysharp-desktop service setup was not completed; check 'systemctl status keysharp-desktop-authority.socket'\")
+                endif()
+            else()
+                message(WARNING \"systemctl was not found; the keysharp-desktop services were not enabled\")
+            endif()
+        endif()
+    ")
+endif()
+
 if(BUILD_TESTING)
     add_executable(protocol-tests tests/protocol_tests.c)
     target_link_libraries(protocol-tests PRIVATE keysharp-desktop-wire)
@@ -260,11 +304,18 @@ if(BUILD_TESTING)
     add_test(NAME permission-domain-tests COMMAND permission-domain-tests)
 
     # Both build their scratch store under $HOME, because a store refuses any parent a
-    # third party can write to and /tmp is exactly that. A build sandbox points HOME at
-    # a directory that does not exist, so give them one in the build tree instead.
-    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test-home)
+    # third party can write to, and /tmp is exactly that. A build sandbox points HOME at
+    # a directory that does not exist, so fall back to the build tree there. The build
+    # tree is not the first choice: a checkout can sit under a world-writable mount,
+    # which the store refuses for the same reason it refuses /tmp.
+    if(EXISTS "$ENV{HOME}")
+        set(KEYSHARP_DESKTOP_TEST_HOME "$ENV{HOME}")
+    else()
+        set(KEYSHARP_DESKTOP_TEST_HOME "${CMAKE_CURRENT_BINARY_DIR}/test-home")
+        file(MAKE_DIRECTORY "${KEYSHARP_DESKTOP_TEST_HOME}")
+    endif()
     set_tests_properties(permissions-core-tests permission-domain-tests PROPERTIES
-        ENVIRONMENT HOME=${CMAKE_CURRENT_BINARY_DIR}/test-home)
+        ENVIRONMENT HOME=${KEYSHARP_DESKTOP_TEST_HOME})
 
     add_test(NAME version-command COMMAND keysharp-desktop version)
     set_tests_properties(version-command PROPERTIES
