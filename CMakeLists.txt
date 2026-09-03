@@ -235,6 +235,12 @@ if(BUILD_TESTING)
     target_link_libraries(protocol-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME protocol-tests COMMAND protocol-tests)
 
+    add_executable(provider-xml-tests tests/provider_xml_tests.c)
+    target_link_libraries(provider-xml-tests PRIVATE
+        keysharp-desktop-common)
+    add_test(NAME provider-xml-tests
+        COMMAND provider-xml-tests ${CMAKE_CURRENT_SOURCE_DIR})
+
     add_executable(request-chunk-tests tests/request_chunk_tests.c)
     target_link_libraries(request-chunk-tests PRIVATE
         keysharp-desktop-common)
@@ -380,6 +386,7 @@ if(BUILD_TESTING)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         foreach(test_target
                 protocol-tests
+                provider-xml-tests
                 request-chunk-tests
                 authority-fd-tests
                 client-abi-tests

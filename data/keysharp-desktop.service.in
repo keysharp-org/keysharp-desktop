@@ -3,6 +3,8 @@ Description=Keysharp desktop broker
 Documentation=https://github.com/keysharp-org/keysharp-desktop
 After=graphical-session.target
 PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

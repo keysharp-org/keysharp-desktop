@@ -250,7 +250,7 @@ const DBUS_IFACE_XML = `
          CaptureArea: no flash, no file, no compositor round trip outside this
          process. handle is the stable_sequence uint32 of Meta.Window (the "id"
          field of the window JSON). includeDecoration keeps the buffer-rect
-         margin Mutter draws outside the visible frame rect -- on Mutter that
+         margin Mutter draws outside the visible frame rect; on Mutter that
          margin is the shadow and invisible border, since server-side
          decoration already lives inside the frame rect. The bytes carry the
          window's own alpha. Returns an empty array on failure. -->

@@ -204,7 +204,10 @@ int ksd_daemon_main(int argc, char **argv)
     if (descriptor < 0 || !register_backend(descriptor, backend, deadline)) {
         if (descriptor >= 0)
             close(descriptor);
-        fputs("keysharp-desktop daemon: authority unavailable\n", stderr);
+        fputs("keysharp-desktop daemon: authority unavailable. The root"
+              " authority socket is not running: enable it with"
+              " systemctl enable --now keysharp-desktop-authority.socket\n",
+              stderr);
         return 1;
     }
     signal(SIGPIPE, SIG_IGN);
