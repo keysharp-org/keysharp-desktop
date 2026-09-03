@@ -679,6 +679,15 @@ static void invalid_request(ksd_operation_result *result)
                      "invalid desktop operation payload");
 }
 
+bool ksd_provider_capture_supported(ksd_backend backend, uint16_t opcode)
+{
+    bool window = opcode == KSD_OP_CAPTURE_WINDOW;
+    bool area = opcode == KSD_OP_CAPTURE_AREA;
+    if (backend == KSD_BACKEND_GNOME)
+        return area || window;
+    return backend == KSD_BACKEND_CINNAMON && window;
+}
+
 static void execute_capture(uid_t uid, ksd_backend backend,
                             const ksd_frame *request,
                             ksd_operation_result *result)
@@ -687,12 +696,7 @@ static void execute_capture(uid_t uid, ksd_backend backend,
     GVariant *reply;
     ksd_cursor cursor;
     ksd_cursor_init(&cursor, request->payload, request->payload_length);
-    bool window = request->opcode == KSD_OP_CAPTURE_WINDOW;
-    bool area = request->opcode == KSD_OP_CAPTURE_AREA;
-    bool served = backend == KSD_BACKEND_GNOME
-        ? (area || window)
-        : (backend == KSD_BACKEND_CINNAMON && window);
-    if (!served) {
+    if (!ksd_provider_capture_supported(backend, request->opcode)) {
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
                          "capture is unavailable on this provider");
         return;

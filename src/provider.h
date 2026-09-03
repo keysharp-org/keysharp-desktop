@@ -15,6 +15,11 @@ typedef bool (*ksd_provider_event_fn)(uint16_t opcode,
                                       void *user_data);
 typedef bool (*ksd_provider_cancel_fn)(void *user_data);
 
+/* Whether this provider can actually serve a capture opcode. It must agree
+ * with the corresponding bit in ksd_backend_operations for every backend: the
+ * two drifted apart once, and Cinnamon window capture was advertised,
+ * implemented and refused for as long as they disagreed. */
+bool ksd_provider_capture_supported(ksd_backend backend, uint16_t opcode);
 void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
                           const ksd_frame *request,
                           ksd_operation_result *result);

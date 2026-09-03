@@ -81,9 +81,12 @@ paints the window actor to a content texture and composites the cropped
 sub-texture straight into that stream, so no capture path on any backend writes
 a named file another same-UID process could open. The provider rejects the
 window's scaled pixel count before it asks the compositor to paint, so an
-oversized window costs no offscreen paint and no GPU readback. All Cinnamon
-capture stays disabled because the available Cinnamon shell APIs require named
-temporary files. Provider operation bits report this accurately.
+oversized window costs no offscreen paint and no GPU readback. Cinnamon window
+capture reads the actor image into a pixbuf and encodes it into a sealed memfd,
+so it writes no named file either; Cinnamon area capture stays disabled,
+because the only Cinnamon shell API for it does require one. Provider operation
+bits report this accurately, and a test pins the advertised bits against what
+the provider will actually serve, because the two drifted apart once.
 
 ## Grants and revocation
 

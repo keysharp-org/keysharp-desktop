@@ -252,17 +252,6 @@ foreach(required
             "provider watch loop is not bounded-blocking: ${required}")
     endif()
 endforeach()
-# ksd_backend_operations advertises CAPTURE_WINDOW for Cinnamon as well as GNOME, and the
-# Cinnamon extension implements it, but execute_capture refused every backend except GNOME,
-# so the operation was advertised and always failed. The dispatch must keep admitting it.
-foreach(required
-        "backend == KSD_BACKEND_CINNAMON && window")
-    string(FIND "${provider_source}" "${required}" position)
-    if(position EQUAL -1)
-        message(FATAL_ERROR
-            "capture dispatch no longer matches the advertised mask: ${required}")
-    endif()
-endforeach()
 foreach(forbidden
         "g_usleep"
         "g_main_context_iteration(context, FALSE)")

@@ -1,5 +1,7 @@
 #include "permission_domain.h"
+#include "backend.h"
 #include "protocol.h"
+#include "provider.h"
 #include "protocol_io.h"
 
 #include <assert.h>
@@ -30,6 +32,49 @@ bool ksd_capture_tail_valid(const void *tail, uint32_t tail_length);
  * kind of change. Unsealed, a peer could rewrite the pixels after their
  * length had been agreed, and the client maps it read-only expecting not to
  * have to re-check. */
+/* The advertised mask and the provider dispatch drifted apart once, and
+ * Cinnamon window capture was advertised, implemented and refused for as
+ * long as they disagreed. Neither side may move without the other.
+ * Exhaustive over every backend and both capture opcodes rather than a
+ * literal check, so it survives edits to either side. */
+static void check_capture_mask_matches_dispatch(void)
+{
+    static const uint16_t opcodes[] = {
+        KSD_OP_CAPTURE_AREA, KSD_OP_CAPTURE_WINDOW,
+    };
+    static const uint64_t bits[] = {
+        KSD_OPERATION_CAPTURE_AREA, KSD_OPERATION_CAPTURE_WINDOW,
+    };
+
+    for (uint32_t backend = 0u; backend <= KSD_BACKEND_GENERIC; backend++) {
+        uint64_t mask = ksd_backend_operations((ksd_backend)backend);
+
+        for (size_t index = 0u; index < 2u; index++) {
+            bool advertised = (mask & bits[index]) != 0u;
+            /* Two routes serve a capture. GNOME and Cinnamon go through the
+             * provider; KWin never does, and is dispatched to the root capture
+             * worker instead. Either route counts as served, but something
+             * must. */
+            bool served = backend == KSD_BACKEND_KWIN
+                || ksd_provider_capture_supported((ksd_backend)backend,
+                                                  opcodes[index]);
+
+            if (advertised == served)
+                continue;
+            fprintf(stderr,
+                    "backend %u opcode 0x%04x: advertised=%d served=%d. "
+                    "Every advertised capture bit must have a route that "
+                    "serves it, and no route may serve one that is not "
+                    "advertised. Otherwise the operation is either advertised "
+                    "and always refused, or reachable without being "
+                    "announced.%s",
+                    (unsigned)backend, (unsigned)opcodes[index],
+                    (int)advertised, (int)served, "\n");
+            abort();
+        }
+    }
+}
+
 static void check_capture_memfd_is_sealed(void)
 {
     static const uint8_t png[] = { 0x89u, 0x50u, 0x4eu, 0x47u, 0u, 1u, 2u, 3u };
@@ -306,6 +351,7 @@ int main(void)
                        0u, NULL) == KSD_STATUS_UNAVAILABLE);
 
     check_assembly_budget();
+    check_capture_mask_matches_dispatch();
     check_capture_memfd_is_sealed();
     check_capture_budget();
 
