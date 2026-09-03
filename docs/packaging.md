@@ -39,7 +39,9 @@ root and mode 0666. It activates `keysharp-desktop authority-daemon`.
 
 `keysharp-desktop.service` runs `keysharp-desktop daemon` inside each graphical
 user session. It connects outbound and registers the session backend; it is
-not socket-activated and does not accept application traffic.
+not socket-activated and does not accept application traffic. It registers
+exactly once and then reaches a steady state: a session with no supported
+compositor registers the generic backend rather than retrying forever.
 
 Install and removal scripts reload the dynamic-linker cache after adding or
 removing the SONAME library. They reload systemd, enable the system socket,

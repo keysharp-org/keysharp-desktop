@@ -29,6 +29,9 @@ const MAX_OVERLAYS_PER_OWNER = 64;
 const MAX_OVERLAYS_TOTAL = 512;
 const MAX_OVERLAY_BYTES_PER_OWNER = 64 * 1024 * 1024;
 const MAX_OVERLAY_BYTES_TOTAL = 256 * 1024 * 1024;
+const MAX_CAPTURE_BYTES = 256 * 1024 * 1024;
+const MAX_CAPTURE_DIMENSION = 32768;
+const MAX_CAPTURE_PIXELS = 64 * 1024 * 1024;
 
 // How many compositor frames to wait for a reserved window to become placeable.
 // Retries are timer-driven, so this is a real time budget: 40 x 16ms.
@@ -170,6 +173,16 @@ const DBUS_IFACE_XML =
       <arg type="i" direction="in" name="delta"/>
       <arg type="b" direction="in" name="vertical"/>
       <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Capture one window and return raw PNG bytes. No flash, no file is written: the compositor paints
+         the window actor into an in-process cairo surface. includeDecoration false clips to the frame
+         rect, which drops the invisible shadow border; Muffin exposes no client-area rect, so a
+         server-side decorated window keeps its titlebar either way. Returns an empty array on failure. -->
+    <method name="CaptureWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="in" name="includeDecoration"/>
+      <arg type="ay" direction="out" name="pngData"/>
     </method>
 
     <method name="RegisterHighlightOwner">
@@ -391,6 +404,8 @@ class KeysharpExtension {
         this._overlayReconnectTimers = new Map();
         this._clipboard = null;
         this._clipboardSelectionId = null;
+        this._gdk = null;
+        this._gdkChecked = false;
     }
 
     enable() {
@@ -720,6 +735,135 @@ class KeysharpExtension {
     SendMouseMoveRelativeAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseMoveRelative'); }
     SendMouseButtonAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseButton'); }
     SendMouseScrollAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_sendMouseScroll'); }
+
+    // The installed, root-owned keysharp-desktop broker is the provider entry point for window capture; it
+    // checks the SCREEN_CAPTURE grant before calling us. get_image paints the actor synchronously, so the
+    // async D-Bus form is only here to gate on the invocation and to answer an empty array on failure.
+    CaptureWindowAsync(params, invocation) {
+        if (!this._requireProviderPeer(invocation))
+            return;
+
+        let bytes = new Uint8Array(0);
+
+        try {
+            bytes = this._captureWindow(params[0], Boolean(params[1]));
+        } catch (e) {
+            global.logError(e, 'Keysharp: CaptureWindow failed');
+            bytes = new Uint8Array(0);
+        }
+
+        invocation.return_value(new GLib.Variant('(ay)', [bytes]));
+    }
+
+    // Gdk 3 is what turns a cairo surface into a pixbuf. It is resolved on the first capture, never at
+    // enable time, so a session without it keeps every other operation instead of failing to load. The
+    // version is pinned because Gdk 4 has no pixbuf_get_from_surface and must never be loaded beside the
+    // GTK 3 this process already links.
+    _gdkPixbufBridge() {
+        if (this._gdkChecked)
+            return this._gdk;
+
+        this._gdkChecked = true;
+
+        try {
+            const wanted = imports.gi.versions.Gdk;
+
+            // Deferring to a foreign pin would load that Gdk into a GTK-3 process. Refuse instead,
+            // and do not overwrite it -- the extension that set it is entitled to its own version.
+            if (wanted !== undefined && wanted !== '3.0')
+                return this._gdk;
+
+            imports.gi.versions.Gdk = '3.0';
+
+            const gdk = imports.gi.Gdk;
+
+            if (typeof gdk.pixbuf_get_from_surface === 'function')
+                this._gdk = gdk;
+        } catch (e) {
+            global.logError(e, 'Keysharp: window capture needs Gdk 3');
+        }
+
+        return this._gdk;
+    }
+
+    _captureWindow(handle, includeDecoration) {
+        const empty = new Uint8Array(0);
+        const gdk = this._gdkPixbufBridge();
+        const win = this._findWindow(handle);
+        const actor = win ? win.get_compositor_private() : null;
+
+        if (gdk === null || !actor || typeof actor.get_image !== 'function')
+            return empty;
+
+        // get_image allocates ceil(clip * resource_scale) ARGB32 inside the compositor, so the logical
+        // clip alone is not the bound that matters: on a 2x session a 64 Mi-pixel clip is a 1 GiB
+        // allocation. Bound the scaled figure.
+        // clutter_actor_get_resource_scale returns gboolean with the scale as an (out) gfloat, so cjs
+        // hands back [ok, scale]; treating that as a number yields NaN and rejects every window.
+        let captureScale = 1;
+
+        if (typeof actor.get_resource_scale === 'function') {
+            const raw = actor.get_resource_scale();
+            const [ok, scale] = Array.isArray(raw) ? raw : [true, raw];
+
+            if (ok && Number.isFinite(scale) && scale >= 1)
+                captureScale = Math.ceil(scale);
+        }
+
+        // The clip is in actor coordinates, whose origin is the buffer rect, and is always explicit so the
+        // two decoration modes share one path and nothing depends on a nullable clip argument.
+        const buffer = win.get_buffer_rect();
+        const wanted = includeDecoration ? buffer : win.get_frame_rect();
+        const clip = new CairoGI.RectangleInt();
+        clip.x = Math.round(wanted.x - buffer.x);
+        clip.y = Math.round(wanted.y - buffer.y);
+        clip.width = Math.round(wanted.width);
+        clip.height = Math.round(wanted.height);
+
+        if (clip.x < 0 || clip.y < 0
+            || !this._validCaptureGeometry(clip.width * captureScale,
+                                           clip.height * captureScale)
+            || clip.x + clip.width > Math.round(buffer.width)
+            || clip.y + clip.height > Math.round(buffer.height))
+            return empty;
+
+        const surface = actor.get_image(clip);
+
+        // The surface is in device pixels and the clip in logical ones, so only the surface can say how many
+        // pixels came back. A surface that cannot say is not converted at all rather than cropped.
+        if (!surface || typeof surface.getWidth !== 'function'
+            || typeof surface.getHeight !== 'function')
+            return empty;
+
+        const width = surface.getWidth();
+        const height = surface.getHeight();
+
+        if (!this._validCaptureGeometry(width, height))
+            return empty;
+
+        const pixbuf = gdk.pixbuf_get_from_surface(surface, 0, 0, width, height);
+
+        if (!pixbuf || pixbuf.get_width() !== width
+            || pixbuf.get_height() !== height)
+            return empty;
+
+        const saved = pixbuf.save_to_bufferv('png', [], []);
+        const data = Array.isArray(saved) ? saved[saved.length - 1] : saved;
+        const png = data instanceof Uint8Array
+            ? data
+            : (data && typeof data.length === 'number' ? new Uint8Array(data) : null);
+
+        return (png !== null && png.length > 0 && png.length <= MAX_CAPTURE_BYTES)
+            ? png : empty;
+    }
+
+    _validCaptureGeometry(width, height) {
+        return Number.isInteger(width) && Number.isInteger(height)
+            && width > 0 && height > 0
+            && width <= MAX_CAPTURE_DIMENSION
+            && height <= MAX_CAPTURE_DIMENSION
+            && width * height <= MAX_CAPTURE_PIXELS;
+    }
 
     _overlayCallerMatches(params, invocation, ownerIndex, busIndex) {
         try {

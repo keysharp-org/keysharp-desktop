@@ -12,6 +12,11 @@
 #include <sys/time.h>
 #include <time.h>
 
+_Static_assert(KSD_MAX_REQUEST_TOTAL_PAYLOAD > KSD_MAX_REQUEST_PAYLOAD,
+               "a chunked request total must exceed one chunk");
+_Static_assert(KSD_MAX_REQUEST_TOTAL_PAYLOAD % KSD_MAX_REQUEST_PAYLOAD == 0u,
+               "a chunked request total must be whole chunks");
+
 uint16_t ksd_decode_u16(const uint8_t *data)
 {
     return (uint16_t)((uint16_t)data[0]
@@ -59,7 +64,7 @@ static bool valid_public_header(const ksd_frame *frame)
     bool more = (frame->flags & KSD_FLAG_MORE) != 0u;
 
     if ((frame->flags & ~KSD_FLAG_ALL) != 0u
-        || (response && event) || (more && !response))
+        || (response && event) || (more && event))
         return false;
     if (event)
         return frame->request_id == 0u;
@@ -421,6 +426,86 @@ bool ksd_buffer_u64(ksd_buffer *buffer, uint64_t value)
     uint8_t encoded[8];
     ksd_encode_u64(encoded, value);
     return ksd_buffer_bytes(buffer, encoded, sizeof(encoded));
+}
+
+void ksd_request_assembly_init(ksd_request_assembly *assembly)
+{
+    if (assembly == NULL)
+        return;
+    memset(assembly, 0, sizeof(*assembly));
+    ksd_buffer_init(&assembly->payload, KSD_MAX_REQUEST_TOTAL_PAYLOAD);
+}
+
+void ksd_request_assembly_clear(ksd_request_assembly *assembly)
+{
+    if (assembly == NULL)
+        return;
+    ksd_buffer_clear(&assembly->payload);
+    memset(assembly, 0, sizeof(*assembly));
+    ksd_buffer_init(&assembly->payload, KSD_MAX_REQUEST_TOTAL_PAYLOAD);
+}
+
+bool ksd_request_assembly_active(const ksd_request_assembly *assembly)
+{
+    return assembly != NULL && assembly->active;
+}
+
+ksd_assembly_result ksd_request_assembly_accept(
+    ksd_request_assembly *assembly, const ksd_frame *frame)
+{
+    bool more;
+
+    if (assembly == NULL || frame == NULL || !ksd_frame_is_request(frame)
+        || frame->request_id == 0u || frame->payload == NULL
+        || frame->payload_length == 0u
+        || frame->payload_length > KSD_MAX_REQUEST_PAYLOAD)
+        return KSD_ASSEMBLY_INVALID;
+    more = (frame->flags & KSD_FLAG_MORE) != 0u;
+    if (frame->flags != (uint16_t)(more ? KSD_FLAG_MORE : 0u)
+        || (more && frame->payload_length != KSD_MAX_REQUEST_PAYLOAD))
+        return KSD_ASSEMBLY_INVALID;
+    if (!assembly->active) {
+        if (!more
+            || !ksd_buffer_bytes(&assembly->payload, frame->payload,
+                                 frame->payload_length))
+            return KSD_ASSEMBLY_INVALID;
+        assembly->opcode = frame->opcode;
+        assembly->request_id = frame->request_id;
+        assembly->active = true;
+        assembly->complete = false;
+        return KSD_ASSEMBLY_PENDING;
+    }
+    if (frame->opcode != assembly->opcode
+        || frame->request_id != assembly->request_id
+        || !ksd_buffer_bytes(&assembly->payload, frame->payload,
+                             frame->payload_length))
+        return KSD_ASSEMBLY_INVALID;
+    assembly->complete = !more;
+    return more ? KSD_ASSEMBLY_PENDING : KSD_ASSEMBLY_COMPLETE;
+}
+
+bool ksd_request_assembly_take(ksd_request_assembly *assembly,
+                               ksd_frame *frame)
+{
+    if (assembly == NULL || frame == NULL || !assembly->active
+        || !assembly->complete || assembly->payload.data == NULL
+        || assembly->payload.length == 0u
+        || assembly->payload.length > KSD_MAX_REQUEST_TOTAL_PAYLOAD)
+        return false;
+    memset(frame, 0, sizeof(*frame));
+    frame->magic[0] = KSD_FRAME_MAGIC_0;
+    frame->magic[1] = KSD_FRAME_MAGIC_1;
+    frame->magic[2] = KSD_FRAME_MAGIC_2;
+    frame->magic[3] = KSD_FRAME_MAGIC_3;
+    frame->major = KSD_PROTOCOL_MAJOR;
+    frame->minor = KSD_PROTOCOL_MINOR;
+    frame->opcode = assembly->opcode;
+    frame->payload_length = (uint32_t)assembly->payload.length;
+    frame->request_id = assembly->request_id;
+    frame->payload = assembly->payload.data;
+    assembly->payload.data = NULL;
+    ksd_request_assembly_clear(assembly);
+    return true;
 }
 
 bool ksd_utf8_valid(const uint8_t *data, size_t length, bool allow_nul)

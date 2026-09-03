@@ -3,6 +3,7 @@
 #include "capture_worker.h"
 #include "protocol.h"
 #include "operation_result.h"
+#include "operation_scope.h"
 #include "permission_domain.h"
 #include "protocol_io.h"
 #include "provider.h"
@@ -36,17 +37,26 @@
 #define KSD_MAX_AUTHORITY_WORKERS 128u
 #define KSD_MAX_AUTHORITY_WORKERS_PER_UID 32u
 #define KSD_MAX_BACKEND_REGISTRATIONS 128u
+#define KSD_BACKEND_REGISTRATION_POLL_MS 1000
+#define KSD_GENERIC_REGISTRATION_POLL_MS 30000
 #define KSD_MAX_AUTHORITY_INFLIGHT_BYTES \
     (KSD_MAX_CAPTURE_BYTES + 16u * 1024u * 1024u)
+#define KSD_MAX_AUTHORITY_ASSEMBLY_BYTES (64u * 1024u * 1024u)
+#define KSD_MAX_REQUEST_ASSEMBLY_SECONDS 10u
 #define KSD_GENERATION_POLL_MS 250
 #ifndef KSD_PKCHECK_PATH
 #define KSD_PKCHECK_PATH "/usr/bin/pkcheck"
 #endif
 
+_Static_assert(KSD_MAX_AUTHORITY_ASSEMBLY_BYTES
+                   >= KSD_MAX_REQUEST_TOTAL_PAYLOAD,
+               "the assembly budget must admit one chunked request");
+
 typedef struct authority_state {
     pthread_mutex_t mutex;
     size_t workers;
     size_t inflight_bytes;
+    size_t assembly_bytes;
     struct {
         uid_t uid;
         size_t count;
@@ -72,6 +82,9 @@ typedef struct authority_session {
     uint32_t granted_scopes;
     uint64_t generation;
     uint64_t identity_checked_at;
+    uint64_t assembly_deadline;
+    int descriptor;
+    ksd_request_assembly assembly;
 } authority_session;
 
 typedef struct authority_client {
@@ -281,7 +294,7 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
                           (long)peer->pid);
     return peer->uid != 0u && peer->pid > 0
         && backend >= KSD_BACKEND_KWIN
-        && backend <= KSD_BACKEND_CINNAMON
+        && backend <= KSD_BACKEND_GENERIC
         && length > 0 && (size_t)length < sizeof(proc_path)
         && stat("/proc/self/exe", &authority_status) == 0
         && stat(proc_path, &peer_status) == 0
@@ -291,7 +304,8 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
         && authority_status.st_dev == peer_status.st_dev
         && authority_status.st_ino == peer_status.st_ino
         && ksp_identity_capture(peer->pid, peer->uid, identity) == 0
-        && ksd_backend_resolve_process(peer->pid) == backend;
+        && (backend == KSD_BACKEND_GENERIC
+            || ksd_backend_resolve_process(peer->pid) == backend);
 }
 
 static bool register_backend(authority_state *state, int descriptor,
@@ -358,7 +372,8 @@ static uint32_t registered_backend(authority_state *state, uid_t uid)
     ksp_identity verified;
     if (ksp_identity_revalidate(&expected, &verified) != 0
         || !same_identity(&expected, &verified)
-        || ksd_backend_resolve_process(expected.pid) != backend)
+        || (backend != KSD_BACKEND_GENERIC
+            && ksd_backend_resolve_process(expected.pid) != backend))
         return KSD_BACKEND_NONE;
     pthread_mutex_lock(&state->mutex);
     uint32_t result = KSD_BACKEND_NONE;
@@ -423,7 +438,9 @@ static void handle_backend_connection(authority_state *state, int descriptor,
             .fd = descriptor,
             .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
         };
-        int ready = poll(&item, 1u, 1000);
+        int ready = poll(&item, 1u, backend == KSD_BACKEND_GENERIC
+            ? KSD_GENERIC_REGISTRATION_POLL_MS
+            : KSD_BACKEND_REGISTRATION_POLL_MS);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0 || registered_backend(state, peer->uid) != backend
@@ -712,72 +729,6 @@ done:
     return status;
 }
 
-static uint32_t scope_for_operation(uint16_t opcode)
-{
-    if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW)
-        return KSP_SCOPE_SCREEN_CAPTURE;
-    if (opcode == KSD_OP_WINDOW_LIST || opcode == KSD_OP_WINDOW_ACTIVE
-        || opcode == KSD_OP_WINDOW_WATCH)
-        return KSP_SCOPE_WINDOW_MONITORING;
-    if (opcode >= KSD_OP_WINDOW_FOCUS
-        && opcode <= KSD_OP_WINDOW_GET_RESERVED)
-        return KSP_SCOPE_WINDOW_CONTROL;
-    if (opcode >= KSD_OP_CLIPBOARD_MIMETYPES
-        && opcode <= KSD_OP_CLIPBOARD_WATCH)
-        return KSP_SCOPE_CLIPBOARD_MONITORING;
-    if (opcode >= KSD_OP_MOUSE_MOVE_ABSOLUTE
-        && opcode <= KSD_OP_MOUSE_SCROLL)
-        return KSP_SCOPE_INPUT_CONTROL;
-    return 0u;
-}
-
-static uint64_t operation_bit(uint16_t opcode)
-{
-    switch (opcode) {
-        case KSD_OP_CAPTURE_AREA: return KSD_OPERATION_CAPTURE_AREA;
-        case KSD_OP_CAPTURE_WINDOW: return KSD_OPERATION_CAPTURE_WINDOW;
-        case KSD_OP_WINDOW_LIST: return KSD_OPERATION_WINDOW_LIST;
-        case KSD_OP_WINDOW_ACTIVE: return KSD_OPERATION_WINDOW_ACTIVE;
-        case KSD_OP_WINDOW_WATCH: return KSD_OPERATION_WINDOW_WATCH;
-        case KSD_OP_WINDOW_FOCUS: return KSD_OPERATION_WINDOW_FOCUS;
-        case KSD_OP_WINDOW_RAISE: return KSD_OPERATION_WINDOW_RAISE;
-        case KSD_OP_WINDOW_LOWER: return KSD_OPERATION_WINDOW_LOWER;
-        case KSD_OP_WINDOW_CLOSE: return KSD_OPERATION_WINDOW_CLOSE;
-        case KSD_OP_WINDOW_KILL: return KSD_OPERATION_WINDOW_KILL;
-        case KSD_OP_WINDOW_MOVE_RESIZE:
-            return KSD_OPERATION_WINDOW_MOVE_RESIZE;
-        case KSD_OP_WINDOW_MOVE_RESIZE_XID:
-            return KSD_OPERATION_WINDOW_MOVE_RESIZE_XID;
-        case KSD_OP_WINDOW_SET_STATE:
-            return KSD_OPERATION_WINDOW_SET_STATE;
-        case KSD_OP_WINDOW_SET_OPACITY:
-            return KSD_OPERATION_WINDOW_SET_OPACITY;
-        case KSD_OP_WINDOW_SET_ABOVE:
-            return KSD_OPERATION_WINDOW_SET_ABOVE;
-        case KSD_OP_WINDOW_SET_DECORATED:
-            return KSD_OPERATION_WINDOW_SET_DECORATED;
-        case KSD_OP_WINDOW_RESERVE:
-            return KSD_OPERATION_WINDOW_RESERVE;
-        case KSD_OP_WINDOW_GET_RESERVED:
-            return KSD_OPERATION_WINDOW_GET_RESERVED;
-        case KSD_OP_CLIPBOARD_MIMETYPES:
-            return KSD_OPERATION_CLIPBOARD_MIMETYPES;
-        case KSD_OP_CLIPBOARD_CONTENT:
-            return KSD_OPERATION_CLIPBOARD_CONTENT;
-        case KSD_OP_CLIPBOARD_TEXT: return KSD_OPERATION_CLIPBOARD_TEXT;
-        case KSD_OP_CLIPBOARD_WATCH: return KSD_OPERATION_CLIPBOARD_WATCH;
-        case KSD_OP_MOUSE_MOVE_ABSOLUTE:
-            return KSD_OPERATION_MOUSE_MOVE_ABSOLUTE;
-        case KSD_OP_MOUSE_MOVE_RELATIVE:
-            return KSD_OPERATION_MOUSE_MOVE_RELATIVE;
-        case KSD_OP_MOUSE_BUTTON: return KSD_OPERATION_MOUSE_BUTTON;
-        case KSD_OP_MOUSE_SCROLL: return KSD_OPERATION_MOUSE_SCROLL;
-        case KSD_OP_CURSOR_POSITION: return KSD_OPERATION_CURSOR_POSITION;
-        case KSD_OP_WORK_AREA: return KSD_OPERATION_WORK_AREA;
-        default: return 0u;
-    }
-}
-
 static void hash_to_raw(const char *hash, uint8_t raw[32])
 {
     for (size_t index = 0u; index < 32u; index++) {
@@ -1052,11 +1003,32 @@ static void release_capture_memory(authority_state *state)
     pthread_mutex_unlock(&state->mutex);
 }
 
+static bool reserve_assembly_memory(authority_state *state)
+{
+    bool reserved = false;
+    pthread_mutex_lock(&state->mutex);
+    if (state->assembly_bytes <= KSD_MAX_AUTHORITY_ASSEMBLY_BYTES
+            - KSD_MAX_REQUEST_TOTAL_PAYLOAD) {
+        state->assembly_bytes += KSD_MAX_REQUEST_TOTAL_PAYLOAD;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return reserved;
+}
+
+static void release_assembly_memory(authority_state *state)
+{
+    pthread_mutex_lock(&state->mutex);
+    if (state->assembly_bytes >= KSD_MAX_REQUEST_TOTAL_PAYLOAD)
+        state->assembly_bytes -= KSD_MAX_REQUEST_TOTAL_PAYLOAD;
+    pthread_mutex_unlock(&state->mutex);
+}
+
 static bool execute_operation(authority_session *session,
                               const ksd_frame *request)
 {
-    uint32_t scope = scope_for_operation(request->opcode);
-    uint64_t bit = operation_bit(request->opcode);
+    uint32_t scope = ksd_operation_scope(request->opcode);
+    uint64_t bit = ksd_operation_bit(request->opcode);
     session->backend = registered_backend(session->state,
                                           session->identity.uid);
     uint64_t available = ksd_backend_operations(session->backend);
@@ -1070,6 +1042,10 @@ static bool execute_operation(authority_session *session,
         && session->role != KSD_ROLE_EVENT_STREAM)
         return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
                                 0u, "operation is invalid for this role",
+                                NULL, 0u, false);
+    if (scope == 0u && !ksd_operation_scope_free(request->opcode))
+        return forward_response(session, request, KSD_STATUS_INTERNAL, 0u,
+                                "operation carries no permission scope",
                                 NULL, 0u, false);
     if (scope == 0u ? !session_identity_refresh(session)
                     : !session_refresh(session, true, true,
@@ -1178,6 +1154,65 @@ static bool handle_public_request(authority_session *session,
     return execute_operation(session, request);
 }
 
+static bool assembly_within_deadline(const authority_session *session)
+{
+    uint64_t now = monotonic_seconds();
+    return now != 0u && now <= session->assembly_deadline;
+}
+
+static void end_assembly(authority_session *session)
+{
+    ksd_request_assembly_clear(&session->assembly);
+    (void)set_socket_timeouts(session->descriptor, 130u);
+}
+
+static bool may_begin_assembly(authority_session *session,
+                               const ksd_frame *frame)
+{
+    uint64_t now = monotonic_seconds();
+    if (session->role != KSD_ROLE_RPC || now == 0u
+        || !ksd_request_chunk_admissible(frame->opcode, frame->flags,
+                                         frame->request_id))
+        return false;
+    if (!set_socket_timeouts(session->descriptor,
+                             (uint32_t)KSD_MAX_REQUEST_ASSEMBLY_SECONDS))
+        return false;
+    session->assembly_deadline = now + KSD_MAX_REQUEST_ASSEMBLY_SECONDS;
+    return true;
+}
+
+static bool handle_public_frame(authority_session *session,
+                                const ksd_frame *frame)
+{
+    bool starting = !ksd_request_assembly_active(&session->assembly);
+
+    if (starting && (frame->flags & KSD_FLAG_MORE) == 0u)
+        return handle_public_request(session, frame);
+    if (starting && !may_begin_assembly(session, frame))
+        return false;
+    if (!assembly_within_deadline(session))
+        return false;
+    ksd_assembly_result accepted =
+        ksd_request_assembly_accept(&session->assembly, frame);
+    if (accepted == KSD_ASSEMBLY_INVALID)
+        return false;
+    if (starting && !reserve_assembly_memory(session->state)) {
+        end_assembly(session);
+        return false;
+    }
+    if (accepted == KSD_ASSEMBLY_PENDING)
+        return true;
+    ksd_frame assembled;
+    bool taken = ksd_request_assembly_take(&session->assembly, &assembled);
+    end_assembly(session);
+    release_assembly_memory(session->state);
+    if (!taken)
+        return false;
+    bool ok = handle_public_request(session, &assembled);
+    ksd_frame_clear(&assembled);
+    return ok;
+}
+
 static bool parse_hello(const ksd_frame *request, uint16_t *role,
                         uint16_t *auth_mode, uint32_t *scopes)
 {
@@ -1268,6 +1303,8 @@ static void handle_public_connection(authority_state *state, int descriptor,
     session.backend = registered_backend(state, peer->uid);
     if (!start_public_session(&session))
         return;
+    session.descriptor = descriptor;
+    ksd_request_assembly_init(&session.assembly);
     for (;;) {
         struct pollfd item = {
             .fd = descriptor,
@@ -1279,6 +1316,9 @@ static void handle_public_connection(authority_state *state, int descriptor,
         if (ready < 0)
             break;
         if (ready == 0) {
+            if (ksd_request_assembly_active(&session.assembly)
+                && !assembly_within_deadline(&session))
+                break;
             bool force_identity =
                 monotonic_seconds() != session.identity_checked_at;
             if (!session_refresh(&session, force_identity, true, NULL))
@@ -1292,7 +1332,7 @@ static void handle_public_connection(authority_state *state, int descriptor,
                 KSD_MAX_REQUEST_PAYLOAD, true, &request);
             if (received != 1)
                 break;
-            bool ok = handle_public_request(&session, &request);
+            bool ok = handle_public_frame(&session, &request);
             ksd_frame_clear(&request);
             if (!ok)
                 break;
@@ -1300,6 +1340,10 @@ static void handle_public_connection(authority_state *state, int descriptor,
         if ((item.revents
              & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
             break;
+    }
+    if (ksd_request_assembly_active(&session.assembly)) {
+        end_assembly(&session);
+        release_assembly_memory(state);
     }
 }
 
@@ -1455,3 +1499,39 @@ int ksd_authority_main(int argc, char **argv)
     pthread_mutex_destroy(&state.mutex);
     return 1;
 }
+
+#ifdef KSD_AUTHORITY_TESTING
+int ksd_authority_test_generic_session(int descriptor,
+                                       const struct ucred *peer,
+                                       const char *persistent_directory,
+                                       const char *runtime_directory)
+{
+    authority_state state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    ksp_store_config store_config;
+    ksp_identity identity;
+
+    if (peer == NULL || peer->uid == 0u
+        || ksp_identity_capture(peer->pid, peer->uid, &identity) != 0)
+        return -1;
+    ksp_store_config_init(&store_config, KSD_DESKTOP_MANAGED_SCOPES);
+    store_config.read_scopes = KSD_DESKTOP_ACCEPTED_SCOPES;
+    store_config.persistent_directory = persistent_directory;
+    store_config.runtime_directory = runtime_directory;
+    store_config.owner_uid = peer->uid;
+    if (ksp_store_create(&state.store, &store_config) != 0
+        || ksp_store_prepare(state.store) != 0) {
+        ksp_store_destroy(state.store);
+        pthread_mutex_destroy(&state.mutex);
+        return -1;
+    }
+    state.backends[0].active = true;
+    state.backends[0].uid = peer->uid;
+    state.backends[0].descriptor = descriptor;
+    state.backends[0].backend = KSD_BACKEND_GENERIC;
+    state.backends[0].identity = identity;
+    handle_public_connection(&state, descriptor, peer);
+    ksp_store_destroy(state.store);
+    pthread_mutex_destroy(&state.mutex);
+    return 0;
+}
+#endif

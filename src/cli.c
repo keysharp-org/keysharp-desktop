@@ -117,10 +117,12 @@ static bool format_scopes(uint32_t scopes, char *text, size_t capacity)
         KSD_SCOPE_CLIPBOARD_MONITORING,
     };
     size_t used = 0u;
+    uint32_t named = 0u;
     for (size_t index = 0u; index < sizeof(ordered) / sizeof(ordered[0]);
          index++) {
         if ((scopes & ordered[index]) == 0u)
             continue;
+        named |= ordered[index];
         const char *name = ksd_scope_name(ordered[index]);
         size_t length = strlen(name);
         if (used + (used == 0u ? 0u : 1u) + length >= capacity)
@@ -129,6 +131,14 @@ static bool format_scopes(uint32_t scopes, char *text, size_t capacity)
             text[used++] = ',';
         memcpy(text + used, name, length);
         used += length;
+    }
+    uint32_t unnamed = scopes & ~named;
+    if (unnamed != 0u) {
+        int written = snprintf(text + used, capacity - used, "%s0x%08x",
+                               used == 0u ? "" : ",", unnamed);
+        if (written < 0 || (size_t)written >= capacity - used)
+            return false;
+        used += (size_t)written;
     }
     if (used == 0u || used >= capacity)
         return false;

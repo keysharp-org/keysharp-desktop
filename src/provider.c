@@ -15,6 +15,7 @@
 
 #define KSD_PROVIDER_TIMEOUT_MS 5000
 #define KSD_PROVIDER_CAPTURE_TIMEOUT_MS 30000
+#define KSD_PROVIDER_WATCH_POLL_MS 250u
 #define KSD_PROVIDER_OBJECT_PATH "/org/keysharp/DesktopProvider"
 #define KSD_PROVIDER_INTERFACE "org.keysharp.Desktop.Provider1"
 #define KSD_MAX_WINDOW_HANDLE_BYTES 128u
@@ -665,9 +666,32 @@ static void execute_capture(uid_t uid, ksd_backend backend,
     ksd_cursor cursor;
     ksd_cursor_init(&cursor, request->payload, request->payload_length);
     if (backend != KSD_BACKEND_GNOME
-        || request->opcode != KSD_OP_CAPTURE_AREA) {
+        || (request->opcode != KSD_OP_CAPTURE_AREA
+            && request->opcode != KSD_OP_CAPTURE_WINDOW)) {
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
                          "capture is unavailable on this provider");
+        return;
+    }
+    if (request->opcode == KSD_OP_CAPTURE_WINDOW) {
+        uint32_t flags;
+        uint32_t length;
+        const uint8_t *bytes;
+        uint64_t handle;
+        if (!ksd_cursor_u32(&cursor, &flags)
+            || !ksd_cursor_u32(&cursor, &length)
+            || (flags & ~KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u
+            || length == 0u || length > KSD_MAX_WINDOW_HANDLE_BYTES
+            || !ksd_cursor_bytes(&cursor, length, &bytes)
+            || !ksd_cursor_finished(&cursor)
+            || !parse_decimal_handle(bytes, length, &handle)) {
+            invalid_request(result);
+            return;
+        }
+        reply = provider_call(uid, backend, "CaptureWindow",
+            g_variant_new("(tb)", (guint64)handle,
+                (flags & KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u),
+            G_VARIANT_TYPE("(ay)"), KSD_PROVIDER_CAPTURE_TIMEOUT_MS, &error);
+        capture_result(reply, error, result);
         return;
     }
     int32_t x;
@@ -1233,6 +1257,12 @@ static void clipboard_event(GDBusConnection *connection, const gchar *sender,
         watch->failed = true;
 }
 
+static gboolean watch_wakeup(gpointer user_data)
+{
+    (void)user_data;
+    return G_SOURCE_CONTINUE;
+}
+
 int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
                        ksd_provider_event_fn emit,
                        ksd_provider_cancel_fn cancelled,
@@ -1242,6 +1272,7 @@ int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
     GError *error = NULL;
     GMainContext *context = NULL;
     GDBusConnection *connection = NULL;
+    GSource *timer = NULL;
     guint subscription = 0u;
     watch_state watch = {
         .emit = emit,
@@ -1265,24 +1296,27 @@ int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
         clipboard ? "ClipboardChanged" : "WindowEvent",
         KSD_PROVIDER_OBJECT_PATH, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
         clipboard ? clipboard_event : window_event, &watch, NULL);
-    if (subscription == 0u)
+    timer = g_timeout_source_new(KSD_PROVIDER_WATCH_POLL_MS);
+    if (subscription == 0u || timer == NULL)
         goto popped;
+    g_source_set_callback(timer, watch_wakeup, NULL, NULL);
+    g_source_attach(timer, context);
     while (!watch.failed && !cancelled(user_data)) {
-        unsigned int dispatched = 0u;
-        while (dispatched < 64u && !watch.failed && !cancelled(user_data)
-               && g_main_context_iteration(context, FALSE))
-            dispatched++;
+        (void)g_main_context_iteration(context, TRUE);
         if (g_dbus_connection_is_closed(connection)) {
             watch.failed = true;
             break;
         }
-        if (dispatched == 0u)
-            g_usleep(50000u);
     }
     result = watch.failed ? -1 : 0;
-    g_dbus_connection_signal_unsubscribe(connection, subscription);
 
 popped:
+    if (timer != NULL) {
+        g_source_destroy(timer);
+        g_source_unref(timer);
+    }
+    if (subscription != 0u)
+        g_dbus_connection_signal_unsubscribe(connection, subscription);
     g_main_context_pop_thread_default(context);
 done:
     if (result != 0) {

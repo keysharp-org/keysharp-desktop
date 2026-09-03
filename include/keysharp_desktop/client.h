@@ -22,7 +22,12 @@ extern "C" {
 #endif
 
 #define KSD_CLIENT_ABI_MAJOR 0u
-#define KSD_CLIENT_ABI_MINOR 1u
+/* Minor 2 tolerates a newer service: an unrecognized backend value and
+ * unrecognized operation and scope bits no longer fail the connection. Minor 3
+ * names KSD_BACKEND_GENERIC, the session whose compositor this service has no
+ * backend for. See docs/integrating.md for exactly which masks are narrowed
+ * and which are delivered verbatim. */
+#define KSD_CLIENT_ABI_MINOR 3u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -69,15 +74,32 @@ typedef uint32_t ksd_permission_scopes;
 #define KSD_SCOPE_AUDIO_CAPTURE 0x00000020u
 #define KSD_SCOPE_CAMERA_CAPTURE 0x00000040u
 #define KSD_SCOPE_CLIPBOARD_MONITORING 0x00000080u
+/* Every scope this header names. A newer service may use bits outside it.
+ * A granted mask is narrowed to the scopes this authority manages, so it never
+ * reports a bit named here that this authority does not grant and never
+ * reports an unnamed bit at all. A revoked mask and a stored permission
+ * entry's scopes are delivered verbatim, because understating a revocation or
+ * a stored grant is the unsafe direction. ksd_scope_name returns NULL for a
+ * bit this header does not name; render such a bit numerically. */
 #define KSD_SCOPE_ALL 0x000000ffu
 
+/* A newer service may set operation bits this header does not name. They are
+ * delivered verbatim and match no KSD_OPERATION_* test. */
 typedef uint64_t ksd_operations;
 
+/* KSD_BACKEND_GENERIC is a session whose compositor this service has no
+ * backend for. The connection, the consent path and the permission store all
+ * work; available_operations is zero and every operation is unavailable.
+ * A newer service may report a backend this header does not name. The value is
+ * delivered verbatim, is never KSD_BACKEND_NONE in that case, and
+ * ksd_backend_name reports it as "unknown". Never infer what is supported from
+ * the backend value; read available_operations, which the service computes. */
 typedef uint32_t ksd_backend;
 #define KSD_BACKEND_NONE 0u
 #define KSD_BACKEND_KWIN 1u
 #define KSD_BACKEND_GNOME 2u
 #define KSD_BACKEND_CINNAMON 3u
+#define KSD_BACKEND_GENERIC 4u
 
 #define KSD_OPERATION_CAPTURE_AREA UINT64_C(0x0000000000000001)
 #define KSD_OPERATION_CAPTURE_WINDOW UINT64_C(0x0000000000000002)

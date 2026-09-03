@@ -53,6 +53,13 @@ int main(void)
     assert(ksp_store_prepare(desktop) == 0);
     assert(ksp_store_read_scopes(desktop) == KSD_DESKTOP_ACCEPTED_SCOPES);
     assert(ksp_store_write_scopes(desktop) == KSD_DESKTOP_MANAGED_SCOPES);
+    static_assert((KSD_DESKTOP_ACCEPTED_SCOPES
+        & (KSP_SCOPE_AUDIO_CAPTURE | KSP_SCOPE_CAMERA_CAPTURE))
+        == (KSP_SCOPE_AUDIO_CAPTURE | KSP_SCOPE_CAMERA_CAPTURE),
+        "reserved audio and camera capture stay accepted for a grant");
+    static_assert((KSD_DESKTOP_ACCEPTED_SCOPES
+        & KSP_SCOPE_INPUT_MONITORING) == 0u,
+        "input monitoring stays outside this domain");
 
     ksp_identity identity = { 0 };
     identity.uid = getuid();

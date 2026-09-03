@@ -7,6 +7,7 @@
 
 ksd_backend ksd_backend_resolve(void);
 ksd_backend ksd_backend_resolve_process(pid_t pid);
+bool ksd_backend_session_unsupported(void);
 uint64_t ksd_backend_operations(ksd_backend backend);
 
 #endif

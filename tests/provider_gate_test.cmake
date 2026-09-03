@@ -84,25 +84,34 @@ foreach(provider gnome cinnamon)
     endforeach()
 
     string(REGEX MATCH
-        "const PUBLIC_IFACE_XML =[^;]*GetWindowList"
-        public_window_bypass "${source}")
-    if(public_window_bypass)
+        "const PUBLIC_IFACE_XML =[ \t\r\n]*`[^`]*"
+        public_iface "${source}")
+    if(NOT public_iface)
         message(FATAL_ERROR
-            "${provider} public interface exposes sensitive window methods")
+            "${provider} public interface declaration not found")
     endif()
+    foreach(forbidden GetWindowList CaptureArea GetClipboard)
+        string(FIND "${public_iface}" "${forbidden}" position)
+        if(NOT position EQUAL -1)
+            message(FATAL_ERROR
+                "${provider} public interface exposes ${forbidden}")
+        endif()
+    endforeach()
     string(REGEX MATCH
-        "const PUBLIC_IFACE_XML =[^;]*CaptureArea"
-        public_capture_bypass "${source}")
+        "<(method|signal|property) name=\"[A-Za-z0-9_]*Capture[A-Za-z0-9_]*\""
+        public_capture_bypass "${public_iface}")
     if(public_capture_bypass)
         message(FATAL_ERROR
-            "${provider} public interface exposes capture")
+            "${provider} public interface exposes capture: "
+            "${public_capture_bypass}")
     endif()
     string(REGEX MATCH
-        "const PUBLIC_IFACE_XML =[^;]*GetClipboard"
-        public_clipboard_bypass "${source}")
-    if(public_clipboard_bypass)
+        "<(method|signal|property) name=\"[A-Za-z0-9_]*Window[A-Za-z0-9_]*\""
+        public_window_bypass "${public_iface}")
+    if(public_window_bypass)
         message(FATAL_ERROR
-            "${provider} public interface exposes clipboard reads")
+            "${provider} public interface exposes sensitive window methods: "
+            "${public_window_bypass}")
     endif()
     foreach(forbidden
             "RegisterBroker"
@@ -118,18 +127,62 @@ foreach(provider gnome cinnamon)
 endforeach()
 
 file(READ "${SOURCE_DIR}/providers/gnome/extension.js" gnome_provider)
-string(FIND "${gnome_provider}" "CaptureAreaAsync" gnome_area)
-string(FIND "${gnome_provider}" "CaptureWindowAsync" gnome_window)
-if(gnome_area EQUAL -1 OR NOT gnome_window EQUAL -1)
-    message(FATAL_ERROR
-        "GNOME must expose only its bounded in-memory area capture")
-endif()
+foreach(required
+        "CaptureAreaAsync"
+        "CaptureWindowAsync"
+        "Gio.MemoryOutputStream.new_resizable"
+        "paint_to_content(null)"
+        "Shell.Screenshot.composite_to_stream"
+        "_captureWindowRect"
+        "_fitCaptureRect")
+    string(FIND "${gnome_provider}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "GNOME in-memory capture invariant missing: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "\n    CaptureArea("
+        "\n    CaptureWindow(")
+    string(FIND "${gnome_provider}" "${forbidden}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "GNOME exposes unguarded sync capture: ${forbidden}")
+    endif()
+endforeach()
 file(READ "${SOURCE_DIR}/providers/cinnamon/extension.js" cinnamon_provider)
-foreach(forbidden CaptureAreaAsync CaptureWindowAsync)
+string(FIND "${cinnamon_provider}" "CaptureAreaAsync" cinnamon_area)
+string(FIND "${cinnamon_provider}" "CaptureWindowAsync" cinnamon_window)
+if(NOT cinnamon_area EQUAL -1 OR cinnamon_window EQUAL -1)
+    message(FATAL_ERROR
+        "Cinnamon must expose only its bounded in-memory window capture")
+endif()
+string(FIND "${cinnamon_provider}" "\n    CaptureWindow(" cinnamon_sync)
+if(NOT cinnamon_sync EQUAL -1)
+    message(FATAL_ERROR
+        "cinnamon exposes unguarded sync method: CaptureWindow")
+endif()
+foreach(required
+        "imports.gi.versions.Gdk = '3.0'"
+        "actor.get_image"
+        "_validCaptureGeometry(width, height)"
+        "MAX_CAPTURE_BYTES"
+        "MAX_CAPTURE_DIMENSION"
+        "MAX_CAPTURE_PIXELS")
+    string(FIND "${cinnamon_provider}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "Cinnamon window capture invariant missing: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "Cinnamon.Screenshot"
+        "screenshot_window("
+        "\nconst Gdk =")
     string(FIND "${cinnamon_provider}" "${forbidden}" position)
     if(NOT position EQUAL -1)
         message(FATAL_ERROR
-            "Cinnamon must not expose file-only capture: ${forbidden}")
+            "Cinnamon capture is not in-memory and lazily bound: ${forbidden}")
     endif()
 endforeach()
 
@@ -138,7 +191,8 @@ foreach(required
         "KSD_DESKTOP_MANAGED_SCOPES"
         "KSD_DESKTOP_ACCEPTED_SCOPES"
         "store_config.read_scopes"
-        "KSP_SCOPE_INPUT_CONTROL"
+        "ksd_operation_scope(request->opcode)"
+        "ksd_operation_scope_free(request->opcode)"
         "ksp_identity_revalidate"
         "ksp_store_check_at_generation"
         "KSD_MAX_AUTHORITY_WORKERS"
@@ -146,6 +200,7 @@ foreach(required
         "ksd_backend_registration_magic"
         "registered_backend"
         "KSD_SYSTEM_SOCKET"
+        "backend <= KSD_BACKEND_GENERIC"
         "ksd_capture_worker_execute")
     string(FIND "${authority}" "${required}" position)
     if(position EQUAL -1)
@@ -173,6 +228,42 @@ foreach(required
     endif()
 endforeach()
 
+file(READ "${SOURCE_DIR}/src/provider.c" provider_source)
+foreach(required
+        "g_timeout_source_new(KSD_PROVIDER_WATCH_POLL_MS)"
+        "g_source_attach(timer, context)"
+        "g_main_context_iteration(context, TRUE)")
+    string(FIND "${provider_source}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "provider watch loop is not bounded-blocking: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "g_usleep"
+        "g_main_context_iteration(context, FALSE)")
+    string(FIND "${provider_source}" "${forbidden}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "provider watch loop busy-polls: ${forbidden}")
+    endif()
+endforeach()
+
+file(READ "${SOURCE_DIR}/src/operation_scope.c" operation_scope)
+foreach(required
+        "KSP_SCOPE_SCREEN_CAPTURE"
+        "KSP_SCOPE_WINDOW_MONITORING"
+        "KSP_SCOPE_WINDOW_CONTROL"
+        "KSP_SCOPE_CLIPBOARD_MONITORING"
+        "KSP_SCOPE_INPUT_CONTROL"
+        "ksd_operation_scope_free")
+    string(FIND "${operation_scope}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "operation scope mapping is missing: ${required}")
+    endif()
+endforeach()
+
 file(READ "${SOURCE_DIR}/src/session_backend.c" session_backend)
 foreach(required
         "SOCK_NONBLOCK"
@@ -180,6 +271,8 @@ foreach(required
         "wait_for(descriptor, POLLOUT, deadline)"
         "SO_ERROR"
         "connect_backend(deadline)"
+        "ksd_backend_session_unsupported()"
+        "backend = KSD_BACKEND_GENERIC;"
         "register_backend(descriptor, backend, deadline)")
     string(FIND "${session_backend}" "${required}" position)
     if(position EQUAL -1)
@@ -187,6 +280,26 @@ foreach(required
             "session backend deadline invariant missing: ${required}")
     endif()
 endforeach()
+
+file(READ "${SOURCE_DIR}/src/backend.c" backend_selection)
+foreach(required
+        "kwin_wayland_owner()"
+        "ksd_backend_session_unsupported"
+        "backend == KSD_BACKEND_GENERIC"
+        "strcmp(basename, \"kwin_wayland\") == 0")
+    string(FIND "${backend_selection}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "KWin backend selection is not Wayland-gated: ${required}")
+    endif()
+endforeach()
+file(READ "${SOURCE_DIR}/src/local_capture.c" local_capture)
+string(FIND "${local_capture}" "strcmp(basename, \"kwin_wayland\") == 0"
+    capture_executable_gate)
+if(capture_executable_gate EQUAL -1)
+    message(FATAL_ERROR
+        "KWin capture no longer pins the kwin_wayland executable")
+endif()
 
 file(READ "${SOURCE_DIR}/src/permission_domain.h" domain)
 foreach(required
@@ -215,3 +328,27 @@ foreach(required
         message(FATAL_ERROR "authority unit invariant missing: ${required}")
     endif()
 endforeach()
+
+file(READ "${SOURCE_DIR}/src/authorityd.c" authority_source)
+foreach(required
+        "ksd_request_chunk_admissible"
+        "(uint32_t)KSD_MAX_REQUEST_ASSEMBLY_SECONDS"
+        "set_socket_timeouts(session->descriptor, 130u)")
+    string(FIND "${authority_source}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "authority request-assembly invariant missing: ${required}")
+    endif()
+endforeach()
+
+set(assembly_end "end_assembly(session)")
+string(LENGTH "${assembly_end}" assembly_end_length)
+string(LENGTH "${authority_source}" assembly_full_length)
+string(REPLACE "${assembly_end}" "" assembly_stripped "${authority_source}")
+string(LENGTH "${assembly_stripped}" assembly_stripped_length)
+math(EXPR assembly_end_count
+    "(${assembly_full_length} - ${assembly_stripped_length}) / ${assembly_end_length}")
+if(NOT assembly_end_count EQUAL 2)
+    message(FATAL_ERROR
+        "authorityd.c must end a request assembly on both exit paths")
+endif()

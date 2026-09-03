@@ -19,6 +19,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#define KSD_BACKEND_STARTUP_RETRY_SECONDS 5
+#define KSD_BACKEND_STARTUP_ATTEMPTS 24u
+
 static bool root_owned_path(const char *path, bool socket_path)
 {
     struct stat status;
@@ -164,8 +167,33 @@ int ksd_daemon_main(int argc, char **argv)
         return 1;
     }
     ksd_backend backend;
+    bool waiting = false;
+    unsigned attempts = 0u;
     while ((backend = ksd_backend_resolve()) == KSD_BACKEND_NONE) {
-        struct timespec retry = { .tv_sec = 5 };
+        struct timespec retry = {
+            .tv_sec = KSD_BACKEND_STARTUP_RETRY_SECONDS,
+        };
+        bool unsupported = ksd_backend_session_unsupported();
+        if (unsupported || attempts >= KSD_BACKEND_STARTUP_ATTEMPTS) {
+            backend = KSD_BACKEND_GENERIC;
+            fputs(unsupported
+                  ? "keysharp-desktop daemon: no supported compositor in this"
+                    " session; registering the generic backend, which"
+                    " advertises no operations\n"
+                  : "keysharp-desktop daemon: no provider appeared;"
+                    " registering the generic backend. Enable the shell"
+                    " extension and run systemctl --user restart"
+                    " keysharp-desktop.service\n",
+                  stderr);
+            break;
+        }
+        attempts++;
+        if (!waiting) {
+            waiting = true;
+            fputs("keysharp-desktop daemon: waiting for a supported"
+                  " compositor; KWin capture needs a kwin_wayland session\n",
+                  stderr);
+        }
         while (nanosleep(&retry, &retry) != 0 && errno == EINTR) {
         }
     }

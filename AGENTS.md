@@ -55,6 +55,7 @@ may assume Keysharp is the caller.
 src/
 ├── main.c, cli.c           # CLI entry and subcommands
 ├── authorityd.c            # root authority: peer credentials, grants, session registry
+├── operation_scope.c       # opcode -> permission scope, operation bit, chunkability
 ├── session_backend.c       # per-user session daemon
 ├── backend.c, provider.c   # backend selection and the private provider connection
 ├── capture_worker*.c       # root-only KWin capture worker
@@ -96,13 +97,28 @@ Use `-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path` to develop against a sibl
 
 What a session supports depends on its compositor, so a client reads
 `info.available_operations` before calling an operation. KWin provides area and window
-capture; GNOME Shell and Cinnamon provide window operations and events, clipboard reads
-and events, pointer control, cursor position and work area, with in-memory area capture
-on GNOME.
+capture on a `kwin_wayland` session and falls back to `KSD_BACKEND_GENERIC` on
+KDE X11; GNOME Shell and
+Cinnamon provide window operations and events, clipboard reads and events, pointer
+control, cursor position and work area, with in-memory area and window capture on GNOME. Every
+other compositor registers `KSD_BACKEND_GENERIC`, which advertises no operations at all
+and must never be inferred to support anything.
 
 This service manages the six desktop scopes plus the shared `INPUT_CONTROL` used by
 pointer calls. `INPUT_MONITORING` is a canonical shared value that this service does not
 grant or revoke — that belongs to `keysharp-input`.
+
+`INPUT_CONTROL` is one grant, not one per service. A marker is keyed by UID, executable
+identity, and scope bit only, so an application granted it for `keysharp-input` reaches
+these pointer operations without a second prompt, and a revocation from either side
+removes the one marker. Say so in any documentation that touches the scope.
+
+Maintainer decision: `MOUSE_MOVE_ABSOLUTE` stays broker-owned, because it places the
+pointer at an exact compositor pixel with no evdev axis normalization and no uinput
+dependency. `MOUSE_MOVE_RELATIVE`, `MOUSE_BUTTON`, and `MOUSE_SCROLL` are frozen — a
+documented fallback for callers not using `keysharp-input`. Do not extend them to KWin
+or any new backend, and do not delete them: nothing is removed and no ABI changes.
+`tests/provider_gate_test.cmake` enforces the KWin half.
 
 `ksd_connect` names the scopes an application wants; `ksd_authorize` with
 `KSD_AUTH_REQUEST` opens the polkit dialog. Connecting with no scopes reads

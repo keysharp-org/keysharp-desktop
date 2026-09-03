@@ -69,7 +69,8 @@ target_link_libraries(keysharp-desktop-client PRIVATE
 
 add_library(keysharp-desktop-common STATIC
     src/backend.c
-    src/operation_result.c)
+    src/operation_result.c
+    src/operation_scope.c)
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -234,6 +235,11 @@ if(BUILD_TESTING)
     target_link_libraries(protocol-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME protocol-tests COMMAND protocol-tests)
 
+    add_executable(request-chunk-tests tests/request_chunk_tests.c)
+    target_link_libraries(request-chunk-tests PRIVATE
+        keysharp-desktop-common)
+    add_test(NAME request-chunk-tests COMMAND request-chunk-tests)
+
     add_executable(authority-fd-tests tests/authority_fd_tests.c)
     target_link_libraries(authority-fd-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME authority-fd-tests COMMAND authority-fd-tests)
@@ -280,6 +286,32 @@ if(BUILD_TESTING)
     set_tests_properties(capture-pipe-security-tests PROPERTIES
         SKIP_RETURN_CODE 77)
 
+    add_executable(operation-scope-tests tests/operation_scope_tests.c)
+    target_link_libraries(operation-scope-tests PRIVATE
+        keysharp-desktop-common)
+    add_test(NAME operation-scope-tests COMMAND operation-scope-tests)
+
+    add_executable(backend-session-tests tests/backend_session_tests.c)
+    target_link_libraries(backend-session-tests PRIVATE
+        keysharp-desktop-common)
+    add_test(NAME backend-session-tests COMMAND backend-session-tests)
+
+    add_executable(generic-session-tests
+        tests/generic_session_tests.c
+        src/authorityd.c
+        src/provider.c)
+    target_include_directories(generic-session-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(generic-session-tests PRIVATE
+        KSD_AUTHORITY_TESTING KSD_PKCHECK_PATH="${KSD_PKCHECK_PATH}")
+    target_link_libraries(generic-session-tests PRIVATE
+        keysharp-desktop-common keysharp-desktop-capture
+        PkgConfig::GIO Threads::Threads)
+    add_test(NAME generic-session-tests COMMAND generic-session-tests)
+    set_tests_properties(generic-session-tests PROPERTIES
+        SKIP_RETURN_CODE 77)
+
     add_executable(permissions-core-tests
         ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/identity_tests.c
         ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests/polkit_tests.c
@@ -314,7 +346,8 @@ if(BUILD_TESTING)
         set(KEYSHARP_DESKTOP_TEST_HOME "${CMAKE_CURRENT_BINARY_DIR}/test-home")
         file(MAKE_DIRECTORY "${KEYSHARP_DESKTOP_TEST_HOME}")
     endif()
-    set_tests_properties(permissions-core-tests permission-domain-tests PROPERTIES
+    set_tests_properties(permissions-core-tests permission-domain-tests
+        generic-session-tests PROPERTIES
         ENVIRONMENT HOME=${KEYSHARP_DESKTOP_TEST_HOME})
 
     add_test(NAME version-command COMMAND keysharp-desktop version)
@@ -322,7 +355,7 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "client_abi_minor=1")
+        PASS_REGULAR_EXPRESSION "client_abi_minor=3")
     add_test(NAME unknown-command-rejected
         COMMAND keysharp-desktop unknown-command)
     set_tests_properties(unknown-command-rejected PROPERTIES WILL_FAIL TRUE)
@@ -347,10 +380,14 @@ if(BUILD_TESTING)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         foreach(test_target
                 protocol-tests
+                request-chunk-tests
                 authority-fd-tests
                 client-abi-tests
                 client-stream-tests
                 capture-pipe-security-tests
+                operation-scope-tests
+                backend-session-tests
+                generic-session-tests
                 permission-domain-tests)
             target_compile_options(${test_target} PRIVATE -UNDEBUG)
         endforeach()

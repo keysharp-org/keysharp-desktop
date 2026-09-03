@@ -45,6 +45,8 @@ int main(void)
     assert(strcmp(KSD_CLIENT_PROTOCOL_NAME, "keysharp-desktop/client") == 0);
     assert(KSD_FRAME_HEADER_SIZE == 24u);
     assert(KSD_FRAME_REQUEST_ID_OFFSET == 16u);
+    assert(KSD_MAX_REQUEST_TOTAL_PAYLOAD
+           == 1024u * KSD_MAX_REQUEST_PAYLOAD);
     assert(KSD_OPERATION_CAPTURE_AREA == (UINT64_C(1) << 0u));
     assert(KSD_OPERATION_CLIPBOARD_WATCH == (UINT64_C(1) << 21u));
     assert(KSD_OPERATION_MOUSE_MOVE_ABSOLUTE == (UINT64_C(1) << 22u));
@@ -74,6 +76,17 @@ int main(void)
     assert(!packed_frame_is_valid(&event));
     event.flags = 0x8000u;
     assert(!packed_frame_is_valid(&event));
+
+    ksd_frame chunked = frame(KSD_OP_CLIPBOARD_TEXT, KSD_FLAG_MORE, 4u);
+    assert(packed_frame_is_valid(&chunked));
+    chunked.request_id = 0u;
+    assert(!packed_frame_is_valid(&chunked));
+    chunked.flags = (uint16_t)(KSD_FLAG_MORE | KSD_FLAG_EVENT);
+    assert(!packed_frame_is_valid(&chunked));
+    chunked.flags = (uint16_t)(KSD_FLAG_MORE | KSD_FLAG_RESPONSE);
+    assert(!packed_frame_is_valid(&chunked));
+    ksd_frame chunked_ping = frame(KSD_OP_PING, KSD_FLAG_MORE, 0u);
+    assert(!packed_frame_is_valid(&chunked_ping));
 
     static const uint8_t valid_utf8[] = { 'a', 0xe2u, 0x82u, 0xacu };
     static const uint8_t overlong[] = { 0xc0u, 0x80u };

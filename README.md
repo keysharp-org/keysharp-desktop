@@ -99,7 +99,8 @@ gnome-extensions enable keysharp@keysharp.io
 
 On Cinnamon, enable *Keysharp Desktop Integration* in System Settings ->
 Extensions. Either way, log out and back in afterwards, then confirm the
-operations are advertised with `keysharp-desktop info`. KWin needs no extension.
+operations are advertised with `keysharp-desktop info`. KWin needs no extension,
+but it needs a Plasma Wayland session: a KDE X11 session registers no backend.
 
 ### Check the install
 
@@ -274,16 +275,36 @@ clipboard equivalents watch copies. `ksd_permissions_list` and
 What a session supports depends on its compositor, so check
 `info.available_operations` before calling an operation.
 
-| Operation | KWin | GNOME Shell | Cinnamon |
+| Operation | KWin (Wayland) | GNOME Shell | Cinnamon |
 | --- | --- | --- | --- |
 | Area capture | yes | in-memory | - |
-| Window capture | yes | - | - |
+| Window capture | yes | in-memory | in-memory |
 | Window operations and events | - | yes | yes |
 | Clipboard reads and events | - | yes | yes |
 | Pointer control, cursor position, work area | - | yes | yes |
 
-GNOME window capture and Cinnamon capture are not advertised because the shell
-APIs available for them require named temporary image files.
+Cinnamon *area* capture is not advertised because the shell APIs available for
+it require named temporary image files; Cinnamon window capture reads the
+window actor back through a pixbuf and needs no file. Both GNOME capture paths stream PNG bytes
+into an in-memory output stream inside the shell process; neither writes a
+file. GNOME window capture paints the window's own actor, so it returns the
+window's alpha: a client-side-decorated window has transparent rounded
+corners, where GNOME area capture returns the opaque composited stage. KWin
+returns `KSD_CAPTURE_FORMAT_BGRA8_PREMULTIPLIED` for both capture opcodes, so
+a caller compositing the result itself needs different math per backend.
+KWin capture needs
+a `kwin_wayland` compositor: a KDE X11 session gets the generic backend below,
+so it advertises no operations at all.
+
+On any other compositor - sway, Hyprland, COSMIC and the rest - the service
+registers the generic backend. `keysharp-desktop probe` reports
+`backend=generic` with an empty operation mask. Connecting, prompting through
+polkit, storing a grant, listing it and revoking it all work; every operation
+reports `unavailable`. That is the honest state of an unsupported compositor,
+not a failure.
+
+Pointer control covers `ksd_mouse_move_absolute` plus three frozen fallback
+calls that overlap `keysharp-input`; see Permissions below.
 
 ## Permissions
 
@@ -296,17 +317,64 @@ The shared durable scopes are:
 | `KSD_SCOPE_WINDOW_MONITORING` | inspect or watch windows |
 | `KSD_SCOPE_WINDOW_CONTROL` | change windows |
 | `KSD_SCOPE_SCREEN_CAPTURE` | capture screen content |
-| `KSD_SCOPE_AUDIO_CAPTURE` | capture audio |
-| `KSD_SCOPE_CAMERA_CAPTURE` | capture camera video |
+| `KSD_SCOPE_AUDIO_CAPTURE` | capture audio (reserved) |
+| `KSD_SCOPE_CAMERA_CAPTURE` | capture camera video (reserved) |
 | `KSD_SCOPE_CLIPBOARD_MONITORING` | read or watch the clipboard |
 
 This service manages its six desktop scopes plus the shared InputControl scope
 that pointer calls use. InputMonitoring is a canonical shared value, but this
-service does not accept it for a grant or a revocation.
+service does not accept it for a grant or a revocation: the client library, the
+HELLO parser, the authority's scope check, the polkit action, and the permission
+store each reject it.
+
+AudioCapture and CameraCapture are reserved for planned work. A request for
+either is accepted, prompts through polkit, and produces a durable grant that
+`permissions list` and `permissions revoke` handle like any other scope, but no
+operation consumes them yet.
 
 Polkit authenticates a new grant request, and the result remains until it is
 explicitly revoked. Shared scope values and marker handling come from the pinned
 `keysharp-permissions` library.
+
+### InputControl is one grant shared with keysharp-input
+
+A grant marker is keyed by UID, executable identity, and one scope bit. It
+carries no service name, and every authority reads the same directory, so
+InputControl is a single grant rather than one grant per service.
+
+An application that was granted InputControl for `keysharp-input` synthesis
+therefore already holds it here: `ksd_mouse_*` succeeds with no second prompt.
+The reverse holds too. `keysharp-desktop permissions revoke` with no scope
+argument includes InputControl, so it also stops that application's
+`keysharp-input` synthesis.
+
+Read the scope as one decision about synthesizing input as the user. This
+service only synthesizes pointer events; it neither suppresses input nor
+observes key or button events, which is what InputMonitoring covers. Cursor
+position and work area are unscoped queries.
+
+### Pointer operations are a frozen fallback
+
+`ksd_mouse_move_absolute` stays owned by this service. The GNOME and Cinnamon
+providers hand the compositor an exact pixel position, with no normalization to
+an evdev axis range and no dependency on a uinput device being available.
+
+`ksd_mouse_move_relative`, `ksd_mouse_button`, and `ksd_mouse_scroll` overlap
+with `keysharp-input`, which synthesizes the same events through evdev under the
+same InputControl grant. They are frozen: they keep working, keep their opcodes
+and exported symbols, and stay available on GNOME and Cinnamon, but they gain no
+new backend. If a KWin provider later grows pointer support it will advertise
+`KSD_OPERATION_MOUSE_MOVE_ABSOLUTE` only.
+
+Callers that already link `keysharp-input` should synthesize relative motion,
+buttons, and scrolling there. Callers that do not may keep using these three.
+Relative motion here is not evdev-relative: the provider reads the current
+pointer position and warps to the sum, so pointer acceleration and motion
+coalescing do not apply.
+
+Freezing is a documentation decision and is reversible. No operation, opcode,
+scope, exported symbol, or provider method is removed, and no existing caller
+has to change.
 
 ## Command line
 

@@ -31,6 +31,17 @@ InputControl is intentionally shared: this authority may grant or revoke it
 because its pointer operations exercise that scope. The common lock and store
 make that change immediately visible to every participating authority.
 
+Sharing is at the grant, not only at the store. A marker name carries the UID,
+the executable hash, and one scope bit, and carries no service identifier, so a
+single InputControl marker satisfies every authority. An application granted
+InputControl through `keysharp-input` reaches this authority's pointer
+operations with no further prompt, and a revocation from either side removes the
+one marker for both.
+
+AudioCapture and CameraCapture are managed by this authority and reserved for
+planned work. It grants, stores, and revokes them, but no operation exercises
+them yet.
+
 Revocation advances the UID generation. Active sessions discard affected
 authorization before acknowledging the revoke request and withhold sensitive
 results if their generation changed during work.

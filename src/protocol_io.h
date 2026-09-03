@@ -29,6 +29,20 @@ typedef struct ksd_buffer {
     size_t maximum;
 } ksd_buffer;
 
+typedef enum ksd_assembly_result {
+    KSD_ASSEMBLY_INVALID = 0,
+    KSD_ASSEMBLY_PENDING = 1,
+    KSD_ASSEMBLY_COMPLETE = 2,
+} ksd_assembly_result;
+
+typedef struct ksd_request_assembly {
+    ksd_buffer payload;
+    uint64_t request_id;
+    uint16_t opcode;
+    bool active;
+    bool complete;
+} ksd_request_assembly;
+
 uint16_t ksd_decode_u16(const uint8_t *data);
 uint32_t ksd_decode_u32(const uint8_t *data);
 uint64_t ksd_decode_u64(const uint8_t *data);
@@ -62,6 +76,23 @@ bool ksd_buffer_u16(ksd_buffer *buffer, uint16_t value);
 bool ksd_buffer_u32(ksd_buffer *buffer, uint32_t value);
 bool ksd_buffer_u64(ksd_buffer *buffer, uint64_t value);
 bool ksd_buffer_bytes(ksd_buffer *buffer, const void *data, size_t length);
+
+/*
+ * Reassembly of a chunked request. Every frame of a sequence carries one
+ * opcode and one nonzero request id; each frame flagged KSD_FLAG_MORE is
+ * exactly KSD_MAX_REQUEST_PAYLOAD bytes and the unflagged frame that ends the
+ * sequence is one to KSD_MAX_REQUEST_PAYLOAD bytes. Anything else, including
+ * a frame for another exchange, is KSD_ASSEMBLY_INVALID and the caller must
+ * abandon the connection. ksd_request_assembly_take moves the reassembled
+ * payload into a frame the caller clears with ksd_frame_clear.
+ */
+void ksd_request_assembly_init(ksd_request_assembly *assembly);
+void ksd_request_assembly_clear(ksd_request_assembly *assembly);
+bool ksd_request_assembly_active(const ksd_request_assembly *assembly);
+ksd_assembly_result ksd_request_assembly_accept(
+    ksd_request_assembly *assembly, const ksd_frame *frame);
+bool ksd_request_assembly_take(ksd_request_assembly *assembly,
+                               ksd_frame *frame);
 
 bool ksd_utf8_valid(const uint8_t *data, size_t length, bool allow_nul);
 

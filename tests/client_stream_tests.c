@@ -8,7 +8,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define TEST_FUTURE_SCOPE 0x00000100u
+#define TEST_FUTURE_BACKEND 5u
+#define TEST_FUTURE_OPERATION UINT64_C(0x0000000010000000)
+
 ksd_connection *ksd_client_test_adopt_descriptor(int descriptor);
+void ksd_client_test_set_role(ksd_connection *connection, uint32_t role);
+bool ksd_client_test_parse_hello_tail(const uint8_t *tail,
+                                      uint32_t tail_length,
+                                      uint32_t *granted,
+                                      uint64_t *operations,
+                                      uint32_t *backend);
 
 typedef struct visitor_state {
     unsigned int calls;
@@ -52,19 +62,81 @@ static bool cancel_first_permission(const ksd_permission_entry *entry,
     return false;
 }
 
+static bool accept_future_permission(const ksd_permission_entry *entry,
+                                     void *user_data)
+{
+    visitor_state *state = user_data;
+    state->calls++;
+    assert(entry->scopes
+           == (KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE));
+    assert(strcmp(entry->executable, "/future") == 0);
+    return true;
+}
+
 static void write_permission_entry(int descriptor, const ksd_frame *request,
-                                   const char *path, uint64_t granted_at)
+                                   const char *path, uint32_t scopes,
+                                   uint64_t granted_at)
 {
     uint8_t tail[48u + 32u] = { 0 };
     size_t path_length = strlen(path);
     assert(path_length <= 32u);
-    ksd_encode_u32(tail, KSD_SCOPE_SCREEN_CAPTURE);
+    ksd_encode_u32(tail, scopes);
     ksd_encode_u32(tail + 4u, (uint32_t)path_length);
     ksd_encode_u64(tail + 8u, granted_at);
     memset(tail + 16u, (int)(granted_at & 0xffu), 32u);
     memcpy(tail + 48u, path, path_length);
     write_ok_response(descriptor, request, tail,
                       48u + (uint32_t)path_length, true);
+}
+
+static void encode_hello_tail(uint8_t tail[24], uint32_t granted,
+                              uint64_t operations, uint32_t backend)
+{
+    memset(tail, 0, 24u);
+    ksd_encode_u32(tail, granted);
+    ksd_encode_u64(tail + 8u, operations);
+    ksd_encode_u32(tail + 16u, backend);
+}
+
+static void check_hello_tail_compatibility(void)
+{
+    uint8_t tail[24];
+    uint32_t granted = 0u;
+    uint64_t operations = 0u;
+    uint32_t backend = 0u;
+
+    encode_hello_tail(tail, KSD_SCOPE_SCREEN_CAPTURE,
+                      KSD_OPERATION_CAPTURE_AREA, KSD_BACKEND_GNOME);
+    assert(ksd_client_test_parse_hello_tail(tail, 24u, &granted,
+                                            &operations, &backend));
+    assert(granted == KSD_SCOPE_SCREEN_CAPTURE);
+    assert(operations == KSD_OPERATION_CAPTURE_AREA);
+    assert(backend == KSD_BACKEND_GNOME);
+
+    encode_hello_tail(tail,
+                      KSD_SCOPE_SCREEN_CAPTURE | KSD_SCOPE_INPUT_MONITORING
+                          | TEST_FUTURE_SCOPE,
+                      KSD_OPERATION_CAPTURE_AREA | TEST_FUTURE_OPERATION,
+                      TEST_FUTURE_BACKEND);
+    assert(ksd_client_test_parse_hello_tail(tail, 24u, &granted,
+                                            &operations, &backend));
+    assert(granted == KSD_SCOPE_SCREEN_CAPTURE);
+    assert(operations
+           == (KSD_OPERATION_CAPTURE_AREA | TEST_FUTURE_OPERATION));
+    assert(backend == TEST_FUTURE_BACKEND);
+    assert(strcmp(ksd_backend_name(backend), "unknown") == 0);
+
+    encode_hello_tail(tail, 0u, 0u, KSD_BACKEND_NONE);
+    tail[4] = 1u;
+    assert(!ksd_client_test_parse_hello_tail(tail, 24u, &granted,
+                                             &operations, &backend));
+    encode_hello_tail(tail, 0u, 0u, KSD_BACKEND_NONE);
+    tail[20] = 1u;
+    assert(!ksd_client_test_parse_hello_tail(tail, 24u, &granted,
+                                             &operations, &backend));
+    encode_hello_tail(tail, 0u, 0u, KSD_BACKEND_NONE);
+    assert(!ksd_client_test_parse_hello_tail(tail, 23u, &granted,
+                                             &operations, &backend));
 }
 
 int main(void)
@@ -76,8 +148,10 @@ int main(void)
         .opcode = KSD_OP_PERMISSIONS_LIST,
         .request_id = 1u,
     };
-    write_permission_entry(sockets[1], &list_request, "/first", 1u);
-    write_permission_entry(sockets[1], &list_request, "/second", 2u);
+    write_permission_entry(sockets[1], &list_request, "/first",
+                           KSD_SCOPE_SCREEN_CAPTURE, 1u);
+    write_permission_entry(sockets[1], &list_request, "/second",
+                           KSD_SCOPE_SCREEN_CAPTURE, 2u);
     write_ok_response(sockets[1], &list_request, NULL, 0u, false);
 
     uint8_t position_tail[8u];
@@ -89,6 +163,16 @@ int main(void)
     };
     write_ok_response(sockets[1], &position_request, position_tail,
                       sizeof(position_tail), false);
+
+    ksd_frame future_list_request = {
+        .opcode = KSD_OP_PERMISSIONS_LIST,
+        .request_id = 3u,
+    };
+    write_permission_entry(sockets[1], &future_list_request, "/future",
+                           KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE, 3u);
+    write_ok_response(sockets[1], &future_list_request, NULL, 0u, false);
+
+    check_hello_tail_compatibility();
 
     ksd_connection *connection =
         ksd_client_test_adopt_descriptor(sockets[0]);
@@ -155,7 +239,44 @@ int main(void)
     assert(ksd_cursor_position(connection, &point, &error) == KSD_STATUS_OK);
     assert(point.x == 12 && point.y == 34);
 
+    visitor_state future = { 0 };
+    assert(ksd_permissions_list(connection, accept_future_permission,
+                                &future, &error) == KSD_STATUS_OK);
+    assert(future.calls == 1u);
+
     ksd_disconnect(connection);
     close(sockets[1]);
+
+    int lease_sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                      lease_sockets) == 0);
+    uint8_t revoked_payload[8] = { 0 };
+    ksd_encode_u32(revoked_payload,
+                   KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE);
+    ksd_frame revoked_event = {
+        .magic = {
+            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+        },
+        .major = KSD_PROTOCOL_MAJOR,
+        .minor = KSD_PROTOCOL_MINOR,
+        .opcode = KSD_OP_SESSION_REVOKED,
+        .flags = KSD_FLAG_EVENT,
+        .payload_length = 8u,
+        .request_id = 0u,
+        .payload = revoked_payload,
+    };
+    assert(ksd_frame_write(lease_sockets[1], &revoked_event));
+
+    ksd_connection *lease =
+        ksd_client_test_adopt_descriptor(lease_sockets[0]);
+    assert(lease != NULL);
+    ksd_client_test_set_role(lease, KSD_ROLE_AUTHORIZATION_LEASE);
+    uint32_t revoked = 0u;
+    ksd_error_init(&error);
+    assert(ksd_lease_next(lease, 1000u, &revoked, &error) == KSD_STATUS_OK);
+    assert(revoked == (KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE));
+    ksd_disconnect(lease);
+    close(lease_sockets[1]);
     return 0;
 }

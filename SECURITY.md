@@ -50,12 +50,25 @@ spool. Its short-lived D-Bus child closes every capture descriptor except the
 write end before becoming dumpable, and returns only fixed-size metadata.
 The worker drains concurrently, seals the exact validated bytes, and converts
 them only after the child exits. KWin capture requires Linux Yama
-`ptrace_scope=1`; other values fail closed.
+`ptrace_scope=1`; other values fail closed. It also requires a root-owned
+`kwin_wayland` compositor, which backend selection checks before registering, so
+a KDE X11 session falls back to the generic backend and advertises no capture.
 
-GNOME area capture stays in an in-memory stream. GNOME window capture and all
-Cinnamon capture are disabled because the available shell APIs require named
-temporary files that other same-UID processes could open. Provider operation
-bits report this accurately.
+A session with no supported compositor registers the generic backend. The
+authority accepts it from the same authenticated peer as any other backend:
+non-root, and an executable whose inode is the authority binary. It maps to an
+empty operation mask, so it grants no capability and every typed operation is
+refused. It is the only backend the authority does not cross-check against the
+session the daemon runs in, because there is nothing for it to authorize.
+
+GNOME area and window capture both stay in an in-memory stream. Window capture
+paints the window actor to a content texture and composites the cropped
+sub-texture straight into that stream, so no capture path on any backend writes
+a named file another same-UID process could open. The provider rejects the
+window's scaled pixel count before it asks the compositor to paint, so an
+oversized window costs no offscreen paint and no GPU readback. All Cinnamon
+capture stays disabled because the available Cinnamon shell APIs require named
+temporary files. Provider operation bits report this accurately.
 
 ## Grants and revocation
 
@@ -71,6 +84,13 @@ release returns `REVOKED` and discards sensitive output.
 The authority manages the six desktop scopes plus shared InputControl. It
 rejects InputMonitoring. Another authority may grant or revoke InputControl;
 the common prompt lock and generation fence keep the shared marker coherent.
+
+InputControl is one grant, not one grant per service. A marker is keyed by UID,
+executable identity, and scope bit only, so an application granted InputControl
+for `keysharp-input` synthesis already satisfies this authority's pointer
+operations and prompts no second time. Revoking it here likewise stops that
+application's `keysharp-input` synthesis. Consent to InputControl is consent to
+synthesize input as the user through either service.
 
 Do not put grants, hashes, screenshots, clipboard data, or full command lines
 in public diagnostics. Report vulnerabilities privately through the

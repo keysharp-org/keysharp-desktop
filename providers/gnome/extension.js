@@ -246,6 +246,20 @@ const DBUS_IFACE_XML = `
       <arg type="ay" direction="out" name="pngData"/>
     </method>
 
+    <!-- Capture one window and return raw PNG bytes. Same in-memory path as
+         CaptureArea: no flash, no file, no compositor round trip outside this
+         process. handle is the stable_sequence uint32 of Meta.Window (the "id"
+         field of the window JSON). includeDecoration keeps the buffer-rect
+         margin Mutter draws outside the visible frame rect -- on Mutter that
+         margin is the shadow and invisible border, since server-side
+         decoration already lives inside the frame rect. The bytes carry the
+         window's own alpha. Returns an empty array on failure. -->
+    <method name="CaptureWindow">
+      <arg type="t" direction="in"  name="handle"/>
+      <arg type="b" direction="in"  name="includeDecoration"/>
+      <arg type="ay" direction="out" name="pngData"/>
+    </method>
+
     <!-- Draw (or update) a click-through rectangle-outline overlay on the compositor stage — the
          GNOME counterpart of the wlr-layer-shell highlight Keysharp uses on KWin/wlroots (GNOME has
          no layer-shell, so the overlay has to live inside the shell process). id is a caller-chosen
@@ -1574,6 +1588,187 @@ export default class KeysharpExtension {
         } catch (e) {
             logError(e, 'Keysharp: CaptureArea failed');
             empty();
+        }
+    }
+
+    // Window capture never leaves the compositor either: paint_to_content renders the window actor into an
+    // offscreen texture and composite_to_stream encodes a crop of it straight into a memory stream. Same
+    // async shape as CaptureArea -- the reply is sent from the composite callback, so the shell's main loop
+    // keeps running in between and concurrent captures never nest.
+    CaptureWindowAsync(params, invocation) {
+        if (!this._callerIsProviderPeer(invocation)) {
+            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
+                'Screen capture is only permitted through keysharp-desktop.');
+            return;
+        }
+
+        const [handle, includeDecoration] = params;
+        let replied = false;
+        let watchdog = 0;
+        const reply = bytes => {
+            if (replied)
+                return;
+            replied = true;
+            if (watchdog !== 0) {
+                GLib.source_remove(watchdog);
+                watchdog = 0;
+            }
+            invocation.return_value(new GLib.Variant('(ay)',
+                [bytes && bytes.length <= MAX_CAPTURE_BYTES
+                    ? bytes : new Uint8Array(0)]));
+        };
+        const empty = () => reply(null);
+
+        try {
+            const win = this._findWindow(handle);
+
+            // get_compositor_private() is null independently of the window being live -- a managed window
+            // that is not composited yet has none -- so it is checked on its own.
+            const actor = (win && typeof win.get_compositor_private === 'function')
+                ? win.get_compositor_private() : null;
+
+            if (!actor || typeof actor.paint_to_content !== 'function') {
+                empty();
+                return;
+            }
+
+            // Bound the pixel count BEFORE painting. CaptureArea's rectangle arrives already bounded by the
+            // broker; a window's size is whatever its client asked for, and paint_to_content costs a full
+            // offscreen paint plus a GPU readback that no later check could refund.
+            const wanted = this._captureWindowRect(win, actor, Boolean(includeDecoration));
+
+            if (!wanted) {
+                empty();
+                return;
+            }
+
+            // paint_to_content returns null for a window it cannot paint WITHOUT setting a GError, so null is
+            // an ordinary outcome here and not something the catch below would ever see.
+            let content = actor.paint_to_content(null);
+            const texture = (content && typeof content.get_texture === 'function')
+                ? content.get_texture() : null;
+            const rect = texture ? this._fitCaptureRect(wanted, texture) : null;
+
+            if (!rect) {
+                empty();
+                return;
+            }
+
+            const stream = Gio.MemoryOutputStream.new_resizable();
+
+            // A composite that never calls back would hold the broker's whole capture budget until its
+            // 30s timeout, starving every other client. Reply on a shorter deadline so a dropped callback
+            // costs one empty capture instead.
+            watchdog = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 15000, () => {
+                watchdog = 0;
+                content = null;
+                reply(null);
+                return GLib.SOURCE_REMOVE;
+            });
+
+            this._compositeToStream(texture, rect, stream, (_obj, result) => {
+                // Clearing the reference here is what keeps the content -- and the texture it owns -- alive
+                // across the whole composite: the callback closes over it only because it is used.
+                content = null;
+                try {
+                    Shell.Screenshot.composite_to_stream_finish(result);
+                    stream.close(null);
+                    const bytes = new Uint8Array(
+                        stream.steal_as_bytes().get_data());
+                    reply(bytes);
+                } catch (e) {
+                    logError(e, 'Keysharp: CaptureWindow composite failed');
+                    empty();
+                }
+            });
+        } catch (e) {
+            logError(e, 'Keysharp: CaptureWindow failed');
+            empty();
+        }
+    }
+
+    // shell_screenshot_composite_to_stream takes no GCancellable: 13 C parameters, and GI drops user_data,
+    // so the GJS-visible arity is 12. Byte-identical at gnome-shell 45, 46, 47 and 48. The 13-argument form
+    // is kept only as a fallback; marshalling is checked before any work starts, so a rejected first call
+    // can never composite twice.
+    _compositeToStream(texture, rect, stream, done) {
+        try {
+            Shell.Screenshot.composite_to_stream(texture,
+                rect.x, rect.y, rect.width, rect.height, 1,
+                null, 0, 0, 1, stream, done);
+        } catch (_e) {
+            Shell.Screenshot.composite_to_stream(texture,
+                rect.x, rect.y, rect.width, rect.height, 1,
+                null, 0, 0, 1, stream, null, done);
+        }
+    }
+
+    // composite_to_stream crops with cogl_sub_texture_new, so x/y/width/height are offsets INSIDE the texture
+    // paint_to_content produced -- never stage coordinates. Passing a stage rect double-crops. That texture
+    // covers the actor's buffer rect at its resource scale, so the visible window is (frame - buffer) * scale.
+    // The same delta is the only thing includeDecoration can mean here: Mutter draws the shadow and invisible
+    // border in the buffer margin outside the frame rect, and server-side decoration is already inside it.
+    _captureWindowRect(win, actor, includeDecoration) {
+        let buffer = null;
+        let frame = null;
+
+        try {
+            buffer = win.get_buffer_rect();
+            frame = includeDecoration ? buffer : win.get_frame_rect();
+        } catch (_e) {
+            return null;
+        }
+
+        if (!buffer || !frame)
+            return null;
+
+        const scale = this._actorResourceScale(actor);
+        const x = Math.round((frame.x - buffer.x) * scale);
+        const y = Math.round((frame.y - buffer.y) * scale);
+        const width = Math.floor(frame.width * scale);
+        const height = Math.floor(frame.height * scale);
+
+        return x >= 0 && y >= 0 && this._validCaptureGeometry(width, height)
+            ? {x, y, width, height} : null;
+    }
+
+    // The pre-flight rect comes from logical geometry, so rounding can put it a pixel past what was actually
+    // painted and cogl_sub_texture_new would fail the whole capture. Clamp to the real texture, and drop the
+    // capture if what is left no longer passes the same bounds.
+    _fitCaptureRect(rect, texture) {
+        let width = 0;
+        let height = 0;
+
+        try {
+            width = Number(texture.get_width());
+            height = Number(texture.get_height());
+        } catch (_e) {
+            return null;
+        }
+
+        if (!Number.isInteger(width) || !Number.isInteger(height)
+            || rect.x >= width || rect.y >= height)
+            return null;
+
+        const fitted = {
+            x: rect.x,
+            y: rect.y,
+            width: Math.min(rect.width, width - rect.x),
+            height: Math.min(rect.height, height - rect.y),
+        };
+
+        return this._validCaptureGeometry(fitted.width, fitted.height)
+            ? fitted : null;
+    }
+
+    _actorResourceScale(actor) {
+        try {
+            const scale = (typeof actor.get_resource_scale === 'function')
+                ? Number(actor.get_resource_scale()) : 1;
+            return Number.isFinite(scale) && scale > 0 && scale <= 16
+                ? scale : 1;
+        } catch (_e) {
+            return 1;
         }
     }
 

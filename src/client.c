@@ -233,10 +233,12 @@ const char *ksd_status_name(ksd_status status)
 const char *ksd_backend_name(ksd_backend backend)
 {
     switch (backend) {
+        case KSD_BACKEND_NONE: return "none";
         case KSD_BACKEND_KWIN: return "kwin";
         case KSD_BACKEND_GNOME: return "gnome";
         case KSD_BACKEND_CINNAMON: return "cinnamon";
-        default: return "none";
+        case KSD_BACKEND_GENERIC: return "generic";
+        default: return "unknown";
     }
 }
 
@@ -551,8 +553,7 @@ static bool apply_revoked_event(ksd_connection *connection,
         || ksd_decode_u32(frame->payload + 4u) != 0u)
         return false;
     uint32_t revoked = ksd_decode_u32(frame->payload);
-    if (revoked == 0u
-        || (revoked & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u)
+    if (revoked == 0u)
         return false;
     connection->granted_scopes &= ~revoked;
     if (revoked_scopes != NULL)
@@ -654,25 +655,49 @@ static ksd_status read_response_locked(ksd_connection *connection,
     }
 }
 
+static bool write_request_locked(ksd_connection *connection, uint16_t opcode,
+                                 const void *payload, uint32_t payload_length,
+                                 uint64_t request_id)
+{
+    const uint8_t *cursor = payload;
+    uint32_t offset = 0u;
+
+    if (payload_length > KSD_MAX_REQUEST_TOTAL_PAYLOAD
+        || (payload_length != 0u && cursor == NULL)) {
+        errno = EINVAL;
+        return false;
+    }
+    do {
+        uint32_t remaining = payload_length - offset;
+        bool more = remaining > KSD_MAX_REQUEST_PAYLOAD;
+        ksd_frame request = {
+            .magic = {
+                KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+                KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+            },
+            .major = KSD_PROTOCOL_MAJOR,
+            .minor = KSD_PROTOCOL_MINOR,
+            .opcode = opcode,
+            .flags = (uint16_t)(more ? KSD_FLAG_MORE : 0u),
+            .payload_length = more ? KSD_MAX_REQUEST_PAYLOAD : remaining,
+            .request_id = request_id,
+            .payload = cursor == NULL ? NULL : (uint8_t *)(cursor + offset),
+        };
+        if (!set_remaining_timeout(connection,
+                                   connection->request_deadline_ms)
+            || !ksd_frame_write(connection->descriptor, &request))
+            return false;
+        offset += request.payload_length;
+    } while (offset < payload_length);
+    return true;
+}
+
 static ksd_status request_locked(ksd_connection *connection, uint16_t opcode,
                                  const void *payload, uint32_t payload_length,
                                  ksd_client_response *response,
                                  ksd_error *error)
 {
     uint64_t request_id = next_request_id(connection);
-    ksd_frame request = {
-        .magic = {
-            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
-            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
-        },
-        .major = KSD_PROTOCOL_MAJOR,
-        .minor = KSD_PROTOCOL_MINOR,
-        .opcode = opcode,
-        .flags = 0u,
-        .payload_length = payload_length,
-        .request_id = request_id,
-        .payload = (uint8_t *)payload,
-    };
     if (connection->descriptor < 0) {
         errno = ENOTCONN;
         return system_failure(connection, error,
@@ -688,7 +713,8 @@ static ksd_status request_locked(ksd_connection *connection, uint16_t opcode,
     if (!set_remaining_timeout(connection, connection->request_deadline_ms))
         return system_failure(connection, error,
                               "desktop service request timed out");
-    if (!ksd_frame_write(connection->descriptor, &request))
+    if (!write_request_locked(connection, opcode, payload, payload_length,
+                              request_id))
         return system_failure(connection, error,
                               "desktop service request failed");
     return read_response_locked(connection, opcode, request_id,
@@ -706,6 +732,26 @@ static ksd_status request(ksd_connection *connection, uint16_t opcode,
                                        payload_length, response, error);
     pthread_mutex_unlock(&connection->mutex);
     return status;
+}
+
+static bool parse_hello_tail(const uint8_t *tail, uint32_t tail_length,
+                             uint32_t *granted, uint64_t *operations,
+                             uint32_t *backend)
+{
+    ksd_cursor cursor;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    ksd_cursor_init(&cursor, tail, tail_length);
+    if (!ksd_cursor_u32(&cursor, granted)
+        || !ksd_cursor_u32(&cursor, &reserved0)
+        || !ksd_cursor_u64(&cursor, operations)
+        || !ksd_cursor_u32(&cursor, backend)
+        || !ksd_cursor_u32(&cursor, &reserved1)
+        || !ksd_cursor_finished(&cursor)
+        || reserved0 != 0u || reserved1 != 0u)
+        return false;
+    *granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
+    return true;
 }
 
 ksd_status ksd_connect(const ksd_connect_options *options,
@@ -762,23 +808,12 @@ ksd_status ksd_connect(const ksd_connect_options *options,
     if (status != KSD_STATUS_OK)
         goto failed;
 
-    ksd_cursor cursor;
     uint32_t granted;
-    uint32_t reserved0;
     uint64_t operations;
     uint32_t backend;
-    uint32_t reserved1;
-    ksd_cursor_init(&cursor, response.tail, response.tail_length);
     if ((response.frame.flags & KSD_FLAG_MORE) != 0u
-        || !ksd_cursor_u32(&cursor, &granted)
-        || !ksd_cursor_u32(&cursor, &reserved0)
-        || !ksd_cursor_u64(&cursor, &operations)
-        || !ksd_cursor_u32(&cursor, &backend)
-        || !ksd_cursor_u32(&cursor, &reserved1)
-        || !ksd_cursor_finished(&cursor) || reserved0 != 0u
-        || reserved1 != 0u
-        || (granted & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u
-        || backend > KSD_BACKEND_CINNAMON) {
+        || !parse_hello_tail(response.tail, response.tail_length,
+                             &granted, &operations, &backend)) {
         response_clear(&response);
         errno = EPROTO;
         status = system_failure(created, error,
@@ -837,6 +872,21 @@ ksd_connection *ksd_client_test_adopt_descriptor(int descriptor)
     }
     return connection;
 }
+
+void ksd_client_test_set_role(ksd_connection *connection, uint32_t role)
+{
+    if (connection != NULL)
+        connection->role = role;
+}
+
+bool ksd_client_test_parse_hello_tail(const uint8_t *tail,
+                                      uint32_t tail_length,
+                                      uint32_t *granted,
+                                      uint64_t *operations,
+                                      uint32_t *backend)
+{
+    return parse_hello_tail(tail, tail_length, granted, operations, backend);
+}
 #endif
 
 ksd_status ksd_authorize(ksd_connection *connection,
@@ -867,13 +917,13 @@ ksd_status ksd_authorize(ksd_connection *connection,
     if ((response.frame.flags & KSD_FLAG_MORE) != 0u
         || !ksd_cursor_u32(&cursor, &granted)
         || !ksd_cursor_u32(&cursor, &reserved)
-        || !ksd_cursor_finished(&cursor) || reserved != 0u
-        || (granted & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u) {
+        || !ksd_cursor_finished(&cursor) || reserved != 0u) {
         response_clear(&response);
         errno = EPROTO;
         return system_failure(connection, error,
                               "desktop service returned invalid authorization");
     }
+    granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
     connection->granted_scopes = granted;
     *granted_scopes = granted;
     response_clear(&response);
@@ -970,8 +1020,6 @@ static bool parse_permission_entry(const ksd_client_response *response,
         || !ksd_cursor_bytes(&cursor, path_length, &path)
         || !ksd_cursor_finished(&cursor)
         || entry->scopes == 0u
-        || (entry->scopes
-            & ~(uint32_t)KSD_DESKTOP_MANAGED_SCOPES) != 0u
         || !ksd_utf8_valid(path, path_length, false))
         return false;
     raw_hash_to_text(hash, entry->hash);
