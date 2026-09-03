@@ -44,6 +44,7 @@ foreach(provider gnome cinnamon)
             KillWindow
             ReserveWindow
             GetReservedWindow
+            SetClipboardContent
             SendMouseMoveAbsolute
             SendMouseMoveRelative
             SendMouseButton
@@ -90,7 +91,7 @@ foreach(provider gnome cinnamon)
         message(FATAL_ERROR
             "${provider} public interface declaration not found")
     endif()
-    foreach(forbidden GetWindowList CaptureArea GetClipboard)
+    foreach(forbidden GetWindowList CaptureArea GetClipboard SetClipboard)
         string(FIND "${public_iface}" "${forbidden}" position)
         if(NOT position EQUAL -1)
             message(FATAL_ERROR
@@ -113,7 +114,16 @@ foreach(provider gnome cinnamon)
             "${provider} public interface exposes sensitive window methods: "
             "${public_window_bypass}")
     endif()
+    string(REGEX MATCH
+        "<(method|signal|property) name=\"[A-Za-z0-9_]*Clipboard[A-Za-z0-9_]*\""
+        public_clipboard_bypass "${public_iface}")
+    if(public_clipboard_bypass)
+        message(FATAL_ERROR
+            "${provider} public interface exposes the clipboard: "
+            "${public_clipboard_bypass}")
+    endif()
     foreach(forbidden
+            "SetClipboardText"
             "RegisterBroker"
             "_emitBrokerSignal"
             "this._dbusImpl.emit_signal('WindowEvent'"

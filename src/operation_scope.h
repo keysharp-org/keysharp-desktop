@@ -14,8 +14,10 @@
  * applies before a sequence may start.
  * ksd_operation_chunkable names the opcodes whose request payload may arrive
  * as a KSD_FLAG_MORE sequence; every other opcode ends the session on the
- * first chunk. tests/operation_scope_tests.c pins all four over the whole
- * opcode space.
+ * first chunk. Only the clipboard write is chunkable, and it is scope free,
+ * so a session with no grant can spend one assembly reservation; the per-user
+ * and global assembly budgets bound that. tests/operation_scope_tests.c pins
+ * all four over the whole opcode space.
  */
 uint32_t ksd_operation_scope(uint16_t opcode);
 bool ksd_operation_scope_free(uint16_t opcode);

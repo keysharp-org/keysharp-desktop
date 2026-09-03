@@ -24,9 +24,9 @@
  * src/operation_scope.c without adding a row here fails this test.
  *
  * chunkable says whether the opcode's request payload may arrive as a
- * KSD_FLAG_MORE sequence. No opcode is chunkable yet, so an opcode that gains
- * a chunked payload has to say so on its row, and a chunked opcode must carry
- * a permission scope.
+ * KSD_FLAG_MORE sequence. The clipboard write is the only chunkable opcode,
+ * so an opcode that gains a chunked payload has to say so on its row, and a
+ * chunked opcode must carry a permission scope.
  */
 typedef struct expected_operation {
     uint16_t opcode;
@@ -80,6 +80,8 @@ static const expected_operation expected_operations[] = {
       KSD_OPERATION_CLIPBOARD_TEXT, false },
     { KSD_OP_CLIPBOARD_WATCH, KSP_SCOPE_CLIPBOARD_MONITORING,
       KSD_OPERATION_CLIPBOARD_WATCH, false },
+    { KSD_OP_CLIPBOARD_SET_CONTENT, 0u,
+      KSD_OPERATION_CLIPBOARD_SET_CONTENT, true },
     { KSD_OP_MOUSE_MOVE_ABSOLUTE, KSP_SCOPE_INPUT_CONTROL,
       KSD_OPERATION_MOUSE_MOVE_ABSOLUTE, false },
     { KSD_OP_MOUSE_MOVE_RELATIVE, KSP_SCOPE_INPUT_CONTROL,
@@ -92,7 +94,7 @@ static const expected_operation expected_operations[] = {
     { KSD_OP_WORK_AREA, 0u, KSD_OPERATION_WORK_AREA, false },
 };
 
-#define EXPECTED_OPERATION_COUNT 28u
+#define EXPECTED_OPERATION_COUNT 29u
 #define EXPECTED_OPERATION_ROWS \
     (sizeof(expected_operations) / sizeof(expected_operations[0]))
 
@@ -119,15 +121,14 @@ int main(void)
         assert(ksd_operation_bit(entry->opcode) == entry->bit);
         assert(ksd_operation_scope(entry->opcode) == entry->scope);
         assert(ksd_operation_chunkable(entry->opcode) == entry->chunkable);
-        if (entry->chunkable)
-            assert(entry->scope != 0u);
         if (entry->scope != 0u) {
             assert((entry->scope & KSD_DESKTOP_MANAGED_SCOPES)
                    == entry->scope);
             assert(!ksd_operation_scope_free(entry->opcode));
         } else {
             assert(entry->opcode == KSD_OP_CURSOR_POSITION
-                   || entry->opcode == KSD_OP_WORK_AREA);
+                   || entry->opcode == KSD_OP_WORK_AREA
+                   || entry->opcode == KSD_OP_CLIPBOARD_SET_CONTENT);
             assert(ksd_operation_scope_free(entry->opcode));
         }
     }

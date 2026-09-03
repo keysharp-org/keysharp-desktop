@@ -42,6 +42,7 @@
 #define KSD_MAX_AUTHORITY_INFLIGHT_BYTES \
     (KSD_MAX_CAPTURE_BYTES + 16u * 1024u * 1024u)
 #define KSD_MAX_AUTHORITY_ASSEMBLY_BYTES (64u * 1024u * 1024u)
+#define KSD_MAX_ASSEMBLIES_PER_UID 4u
 #define KSD_MAX_REQUEST_ASSEMBLY_SECONDS 10u
 #define KSD_GENERATION_POLL_MS 250
 #ifndef KSD_PKCHECK_PATH
@@ -61,6 +62,10 @@ typedef struct authority_state {
         uid_t uid;
         size_t count;
     } worker_usage[KSD_MAX_AUTHORITY_WORKERS];
+    struct {
+        uid_t uid;
+        size_t count;
+    } assembly_usage[KSD_MAX_AUTHORITY_WORKERS];
     struct {
         bool active;
         uid_t uid;
@@ -1003,24 +1008,46 @@ static void release_capture_memory(authority_state *state)
     pthread_mutex_unlock(&state->mutex);
 }
 
-static bool reserve_assembly_memory(authority_state *state)
+static bool reserve_assembly_memory(authority_state *state, uid_t uid)
 {
+    size_t slot = KSD_MAX_AUTHORITY_WORKERS;
     bool reserved = false;
     pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->assembly_usage[index].count != 0u
+            && state->assembly_usage[index].uid == uid) {
+            slot = index;
+            break;
+        }
+        if (slot == KSD_MAX_AUTHORITY_WORKERS
+            && state->assembly_usage[index].count == 0u)
+            slot = index;
+    }
     if (state->assembly_bytes <= KSD_MAX_AUTHORITY_ASSEMBLY_BYTES
-            - KSD_MAX_REQUEST_TOTAL_PAYLOAD) {
+            - KSD_MAX_REQUEST_TOTAL_PAYLOAD
+        && slot < KSD_MAX_AUTHORITY_WORKERS
+        && state->assembly_usage[slot].count < KSD_MAX_ASSEMBLIES_PER_UID) {
         state->assembly_bytes += KSD_MAX_REQUEST_TOTAL_PAYLOAD;
+        state->assembly_usage[slot].uid = uid;
+        state->assembly_usage[slot].count++;
         reserved = true;
     }
     pthread_mutex_unlock(&state->mutex);
     return reserved;
 }
 
-static void release_assembly_memory(authority_state *state)
+static void release_assembly_memory(authority_state *state, uid_t uid)
 {
     pthread_mutex_lock(&state->mutex);
     if (state->assembly_bytes >= KSD_MAX_REQUEST_TOTAL_PAYLOAD)
         state->assembly_bytes -= KSD_MAX_REQUEST_TOTAL_PAYLOAD;
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->assembly_usage[index].count != 0u
+            && state->assembly_usage[index].uid == uid) {
+            state->assembly_usage[index].count--;
+            break;
+        }
+    }
     pthread_mutex_unlock(&state->mutex);
 }
 
@@ -1196,8 +1223,12 @@ static bool handle_public_frame(authority_session *session,
         ksd_request_assembly_accept(&session->assembly, frame);
     if (accepted == KSD_ASSEMBLY_INVALID)
         return false;
-    if (starting && !reserve_assembly_memory(session->state)) {
+    if (starting && !reserve_assembly_memory(session->state,
+                                             session->identity.uid)) {
         end_assembly(session);
+        (void)forward_response(session, frame,
+                               KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
+                               "assembly budget exhausted", NULL, 0u, false);
         return false;
     }
     if (accepted == KSD_ASSEMBLY_PENDING)
@@ -1205,7 +1236,7 @@ static bool handle_public_frame(authority_session *session,
     ksd_frame assembled;
     bool taken = ksd_request_assembly_take(&session->assembly, &assembled);
     end_assembly(session);
-    release_assembly_memory(session->state);
+    release_assembly_memory(session->state, session->identity.uid);
     if (!taken)
         return false;
     bool ok = handle_public_request(session, &assembled);
@@ -1343,7 +1374,7 @@ static void handle_public_connection(authority_state *state, int descriptor,
     }
     if (ksd_request_assembly_active(&session.assembly)) {
         end_assembly(&session);
-        release_assembly_memory(state);
+        release_assembly_memory(state, session.identity.uid);
     }
 }
 
@@ -1501,6 +1532,17 @@ int ksd_authority_main(int argc, char **argv)
 }
 
 #ifdef KSD_AUTHORITY_TESTING
+int ksd_authority_test_assembly_budget(unsigned int uid, int reserve)
+{
+    static authority_state budget_state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    if (reserve == 0) {
+        release_assembly_memory(&budget_state, (uid_t)uid);
+        return 1;
+    }
+    return reserve_assembly_memory(&budget_state, (uid_t)uid) ? 1 : 0;
+}
+
+
 int ksd_authority_test_generic_session(int descriptor,
                                        const struct ucred *peer,
                                        const char *persistent_directory,

@@ -9,7 +9,7 @@
 int main(void)
 {
     assert(KSD_CLIENT_ABI_MAJOR == 0u);
-    assert(KSD_CLIENT_ABI_MINOR == 3u);
+    assert(KSD_CLIENT_ABI_MINOR == 4u);
     assert(KSD_ROLE_AUTHORIZATION_LEASE == 3u);
     assert(KSD_BACKEND_GENERIC == 4u);
     assert(strcmp(KSD_DEFAULT_SOCKET_PATH,
@@ -106,6 +106,7 @@ int main(void)
     assert(strcmp(ksd_backend_name(KSD_BACKEND_GENERIC + 1u),
                   "unknown") == 0);
     assert(ksd_scope_name(0x00000100u) == NULL);
+    assert(KSD_SCOPE_ALL == 0x000000ffu);
     assert(strcmp(ksd_status_name(KSD_STATUS_REVOKED), "revoked") == 0);
     assert(ksd_status_for_system_error(ETIMEDOUT) == KSD_STATUS_TIMEOUT);
     assert(ksd_status_for_system_error(EAGAIN) == KSD_STATUS_TIMEOUT);

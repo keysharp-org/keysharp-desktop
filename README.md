@@ -1,7 +1,7 @@
 # keysharp-desktop
 
 A Linux desktop-automation service and C library. It provides screen capture,
-window inspection and control, clipboard observation, and compositor pointer
+window inspection and control, clipboard access, and compositor pointer
 control, without giving applications direct access to privileged compositor
 interfaces.
 
@@ -281,6 +281,7 @@ What a session supports depends on its compositor, so check
 | Window capture | yes | in-memory | in-memory |
 | Window operations and events | - | yes | yes |
 | Clipboard reads and events | - | yes | yes |
+| Clipboard writes | - | yes | yes |
 | Pointer control, cursor position, work area | - | yes | yes |
 
 Cinnamon *area* capture is not advertised because the shell APIs available for

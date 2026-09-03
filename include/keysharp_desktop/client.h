@@ -25,9 +25,10 @@ extern "C" {
 /* Minor 2 tolerates a newer service: an unrecognized backend value and
  * unrecognized operation and scope bits no longer fail the connection. Minor 3
  * names KSD_BACKEND_GENERIC, the session whose compositor this service has no
- * backend for. See docs/integrating.md for exactly which masks are narrowed
- * and which are delivered verbatim. */
-#define KSD_CLIENT_ABI_MINOR 3u
+ * backend for. Minor 4 names the brokered clipboard write, which needs no
+ * grant; an older library has no symbol for its operation bit. See docs/integrating.md for exactly which
+ * masks are narrowed and which are delivered verbatim. */
+#define KSD_CLIENT_ABI_MINOR 4u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -129,6 +130,13 @@ typedef uint32_t ksd_backend;
 #define KSD_OPERATION_MOUSE_SCROLL UINT64_C(0x0000000002000000)
 #define KSD_OPERATION_CURSOR_POSITION UINT64_C(0x0000000004000000)
 #define KSD_OPERATION_WORK_AREA UINT64_C(0x0000000008000000)
+#define KSD_OPERATION_CLIPBOARD_SET_CONTENT UINT64_C(0x0000000010000000)
+
+/* The mimetype ksd_clipboard_set_text writes. A caller that wants the same
+ * bytes through ksd_clipboard_set_content must use this exact string; the
+ * service validates UTF-8 only for this one mimetype and passes every other
+ * mimetype through as opaque bytes. */
+#define KSD_CLIPBOARD_TEXT_MIMETYPE "text/plain;charset=utf-8"
 
 typedef uint16_t ksd_capture_format;
 #define KSD_CAPTURE_FORMAT_PNG 1u
@@ -406,6 +414,16 @@ KSD_API ksd_status ksd_clipboard_content(ksd_connection *connection,
 KSD_API ksd_status ksd_clipboard_text(ksd_connection *connection,
                               ksd_string *text,
                               ksd_error *error);
+/* Replace the whole selection with one mimetype's bytes. Needs no grant:
+ * reading the selection is gated, replacing it is not. length may be zero,
+ * which clears the selection. length is at most 4193272 bytes; the request is split across
+ * frames by the library. */
+KSD_API ksd_status ksd_clipboard_set_content(ksd_connection *connection,
+                                     const char *mimetype,
+                                     const void *data, size_t length,
+                                     ksd_error *error);
+KSD_API ksd_status ksd_clipboard_set_text(ksd_connection *connection,
+                                  const char *text, ksd_error *error);
 
 KSD_API ksd_status ksd_mouse_move_absolute(ksd_connection *connection,
                                    int32_t x, int32_t y,

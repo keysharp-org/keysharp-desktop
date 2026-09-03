@@ -1058,6 +1058,42 @@ static void execute_clipboard(uid_t uid, ksd_backend backend,
             g_error_free(error);
         return;
     }
+    if (request->opcode == KSD_OP_CLIPBOARD_SET_CONTENT) {
+        static const uint8_t empty = 0u;
+        ksd_cursor cursor;
+        uint32_t length;
+        uint32_t content_length;
+        const uint8_t *bytes;
+        const uint8_t *content;
+        ksd_cursor_init(&cursor, request->payload, request->payload_length);
+        if (!ksd_cursor_u32(&cursor, &length) || length == 0u
+            || length > KSD_MAX_MIMETYPE_BYTES
+            || !ksd_cursor_bytes(&cursor, length, &bytes)
+            || !ksd_utf8_valid(bytes, length, false)
+            || !ksd_cursor_u32(&cursor, &content_length)
+            || content_length > KSD_MAX_CLIPBOARD_WRITE_BYTES
+            || !ksd_cursor_bytes(&cursor, content_length, &content)
+            || !ksd_cursor_finished(&cursor)) {
+            invalid_request(result);
+            return;
+        }
+        char mimetype[KSD_MAX_MIMETYPE_BYTES + 1u];
+        memcpy(mimetype, bytes, length);
+        mimetype[length] = '\0';
+        if (strcmp(mimetype, KSD_CLIPBOARD_TEXT_MIMETYPE) == 0
+            && !ksd_utf8_valid(content, content_length, false)) {
+            invalid_request(result);
+            return;
+        }
+        reply = provider_call(uid, backend, "SetClipboardContent",
+            g_variant_new("(s@ay)", mimetype,
+                g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                    content_length == 0u ? &empty : content,
+                    (gsize)content_length, sizeof(uint8_t))),
+            G_VARIANT_TYPE("(b)"), KSD_PROVIDER_TIMEOUT_MS, &error);
+        boolean_result(reply, error, result);
+        return;
+    }
     invalid_request(result);
 }
 
@@ -1150,8 +1186,9 @@ void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
         execute_window(uid, pid, backend, request, result);
         return;
     }
-    if (request->opcode >= KSD_OP_CLIPBOARD_MIMETYPES
-        && request->opcode <= KSD_OP_CLIPBOARD_TEXT) {
+    if ((request->opcode >= KSD_OP_CLIPBOARD_MIMETYPES
+         && request->opcode <= KSD_OP_CLIPBOARD_TEXT)
+        || request->opcode == KSD_OP_CLIPBOARD_SET_CONTENT) {
         execute_clipboard(uid, backend, request, result);
         return;
     }

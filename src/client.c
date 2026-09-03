@@ -41,6 +41,8 @@ _Static_assert(KSD_SCOPE_CAMERA_CAPTURE == KSP_SCOPE_CAMERA_CAPTURE,
 _Static_assert(KSD_SCOPE_CLIPBOARD_MONITORING
                    == KSP_SCOPE_CLIPBOARD_MONITORING,
                "clipboard monitoring scope drifted");
+_Static_assert(KSD_SCOPE_ALL == KSP_SCOPE_ALL,
+               "public and shared scope vocabularies drifted");
 _Static_assert(offsetof(ksd_error, message) == 16u,
                "ksd_error common layout drifted");
 _Static_assert(offsetof(ksd_service_info, available_operations) == 16u,
@@ -1751,6 +1753,57 @@ ksd_status ksd_clipboard_text(ksd_connection *connection, ksd_string *text,
 {
     return request_string_result(connection, KSD_OP_CLIPBOARD_TEXT,
                                  NULL, 0u, text, error);
+}
+
+static ksd_status clipboard_write(ksd_connection *connection,
+                                  const char *mimetype, const void *data,
+                                  size_t length, ksd_error *error)
+{
+    if (!valid_rpc(connection) || mimetype == NULL || !valid_error(error))
+        return invalid_argument(error, "invalid clipboard write request");
+    size_t mimetype_length = strlen(mimetype);
+    if (mimetype_length == 0u || mimetype_length > KSD_MAX_MIMETYPE_BYTES
+        || !ksd_utf8_valid((const uint8_t *)mimetype, mimetype_length, false)
+        || length > KSD_MAX_CLIPBOARD_WRITE_BYTES
+        || (length != 0u && data == NULL))
+        return invalid_argument(error, "invalid clipboard write request");
+    if (strcmp(mimetype, KSD_CLIPBOARD_TEXT_MIMETYPE) == 0
+        && !ksd_utf8_valid(data, length, false))
+        return invalid_argument(error, "clipboard text is not valid UTF-8");
+    uint32_t payload_length =
+        (uint32_t)(8u + mimetype_length + length);
+    uint8_t *payload = malloc((size_t)payload_length);
+    if (payload == NULL) {
+        set_error(error, 0u, ENOMEM,
+                  "clipboard write buffer is unavailable");
+        return KSD_STATUS_RESOURCE_EXHAUSTED;
+    }
+    ksd_encode_u32(payload, (uint32_t)mimetype_length);
+    memcpy(payload + 4u, mimetype, mimetype_length);
+    ksd_encode_u32(payload + 4u + mimetype_length, (uint32_t)length);
+    if (length != 0u)
+        memcpy(payload + 8u + mimetype_length, data, length);
+    ksd_status status = request_empty_result(connection,
+        KSD_OP_CLIPBOARD_SET_CONTENT, payload, payload_length, error);
+    free(payload);
+    return status;
+}
+
+ksd_status ksd_clipboard_set_content(ksd_connection *connection,
+                                     const char *mimetype,
+                                     const void *data, size_t length,
+                                     ksd_error *error)
+{
+    return clipboard_write(connection, mimetype, data, length, error);
+}
+
+ksd_status ksd_clipboard_set_text(ksd_connection *connection,
+                                  const char *text, ksd_error *error)
+{
+    if (text == NULL)
+        return invalid_argument(error, "invalid clipboard text");
+    return clipboard_write(connection, KSD_CLIPBOARD_TEXT_MIMETYPE, text,
+                           strlen(text), error);
 }
 
 static ksd_status request_pair(ksd_connection *connection, uint16_t opcode,

@@ -20,6 +20,23 @@ int ksd_authority_test_generic_session(int descriptor,
                                        const struct ucred *peer,
                                        const char *persistent_directory,
                                        const char *runtime_directory);
+int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
+
+static void check_assembly_budget(void)
+{
+    for (unsigned int index = 0u; index < 4u; index++)
+        assert(ksd_authority_test_assembly_budget(1000u, 1) == 1);
+    assert(ksd_authority_test_assembly_budget(1000u, 1) == 0);
+    assert(ksd_authority_test_assembly_budget(1001u, 1) == 1);
+    assert(ksd_authority_test_assembly_budget(1000u, 0) == 1);
+    assert(ksd_authority_test_assembly_budget(1000u, 1) == 1);
+    for (unsigned int index = 0u; index < 3u; index++)
+        assert(ksd_authority_test_assembly_budget(1001u, 1) == 1);
+    for (unsigned int uid = 1002u; uid < 1004u; uid++)
+        for (unsigned int index = 0u; index < 4u; index++)
+            assert(ksd_authority_test_assembly_budget(uid, 1) == 1);
+    assert(ksd_authority_test_assembly_budget(1005u, 1) == 0);
+}
 
 typedef struct authority_arguments {
     int descriptor;
@@ -96,6 +113,25 @@ static void send_request(int descriptor, uint16_t opcode, uint64_t request_id,
         .minor = KSD_PROTOCOL_MINOR,
         .opcode = opcode,
         .flags = 0u,
+        .payload_length = payload_length,
+        .request_id = request_id,
+        .payload = payload,
+    };
+    assert(ksd_frame_write(descriptor, &frame));
+}
+
+static void send_chunk(int descriptor, uint16_t opcode, uint64_t request_id,
+                       uint8_t *payload, uint32_t payload_length, bool more)
+{
+    ksd_frame frame = {
+        .magic = {
+            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+        },
+        .major = KSD_PROTOCOL_MAJOR,
+        .minor = KSD_PROTOCOL_MINOR,
+        .opcode = opcode,
+        .flags = (uint16_t)(more ? KSD_FLAG_MORE : 0u),
         .payload_length = payload_length,
         .request_id = request_id,
         .payload = payload,
@@ -216,6 +252,21 @@ int main(void)
                  sizeof(revoke));
     assert(read_status(sockets[0], KSD_OP_PERMISSIONS_REVOKE, 6u, NULL, 0u,
                        NULL) == KSD_STATUS_OK);
+
+    static uint8_t chunk[KSD_MAX_REQUEST_PAYLOAD];
+    const uint32_t mimetype_length =
+        (uint32_t)sizeof(KSD_CLIPBOARD_TEXT_MIMETYPE) - 1u;
+    ksd_encode_u32(chunk, mimetype_length);
+    memcpy(chunk + 4u, KSD_CLIPBOARD_TEXT_MIMETYPE, mimetype_length);
+    ksd_encode_u32(chunk + 4u + mimetype_length, KSD_MAX_REQUEST_PAYLOAD);
+    send_chunk(sockets[0], KSD_OP_CLIPBOARD_SET_CONTENT, 7u, chunk,
+               KSD_MAX_REQUEST_PAYLOAD, true);
+    send_chunk(sockets[0], KSD_OP_CLIPBOARD_SET_CONTENT, 7u, chunk,
+               8u + mimetype_length, false);
+    assert(read_status(sockets[0], KSD_OP_CLIPBOARD_SET_CONTENT, 7u, NULL,
+                       0u, NULL) == KSD_STATUS_UNAVAILABLE);
+
+    check_assembly_budget();
 
     assert(close(sockets[0]) == 0);
     assert(pthread_join(thread, NULL) == 0);

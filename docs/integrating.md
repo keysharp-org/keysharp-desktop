@@ -39,6 +39,19 @@ Requested, listed, and revoked scopes are the six desktop scopes plus shared
 InputControl. This authority never grants InputMonitoring, and a zero-valued
 permission entry is rejected.
 
+Reading the clipboard is gated; replacing it is not.
+`KSD_SCOPE_CLIPBOARD_MONITORING` covers `ksd_clipboard_mimetypes`,
+`ksd_clipboard_content`, `ksd_clipboard_text` and the clipboard watch.
+`ksd_clipboard_set_content` and `ksd_clipboard_set_text` need no grant and
+raise no prompt. The compositor withholds selection writes from a client with
+no focused surface, which is why the broker offers them at all, but replacing
+the selection is not treated as privileged here: reading it can exfiltrate
+what the user copied, and a script that sets the clipboard is ordinary. Content is at most 4193272 bytes; the library splits a larger
+request across frames itself. Writing
+`KSD_CLIPBOARD_TEXT_MIMETYPE` requires valid UTF-8 and is what
+`ksd_clipboard_set_text` does; every other mimetype is passed through as
+opaque bytes.
+
 InputControl is one shared grant, not one grant per service. An application that
 holds it for `keysharp-input` holds it here too, so `ksd_mouse_*` raises no
 second prompt, and revoking it through this service also stops that

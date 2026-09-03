@@ -96,19 +96,18 @@ const DBUS_IFACE_XML = `
       <arg type="s" direction="in" name="mimetype"/>
       <arg type="ay" direction="out" name="bytes"/>
     </method>
-    <!-- Replace the whole selection with a single MIME type's bytes. -->
+    <!-- Replace the whole selection with a single MIME type's bytes. Reachable only on the
+         root authenticated provider peer. keysharp-desktop needs no grant for it: reading
+         the selection is gated, replacing it is not. -->
     <method name="SetClipboardContent">
       <arg type="s" direction="in" name="mimetype"/>
       <arg type="ay" direction="in" name="bytes"/>
       <arg type="b" direction="out" name="ok"/>
     </method>
-    <!-- UTF-8 text convenience (the common A_Clipboard path). -->
+    <!-- UTF-8 text convenience (the common A_Clipboard path) is read only here; the broker
+         writes text through SetClipboardContent. -->
     <method name="GetClipboardText">
       <arg type="s" direction="out" name="text"/>
-    </method>
-    <method name="SetClipboardText">
-      <arg type="s" direction="in" name="text"/>
-      <arg type="b" direction="out" name="ok"/>
     </method>
 
     <!-- Register this client as an overlay owner. ownerKey = "pid:starttime"; busName = the caller's
@@ -373,15 +372,6 @@ const PUBLIC_IFACE_XML = `
       <arg type="i" direction="out" name="y"/>
       <arg type="i" direction="out" name="width"/>
       <arg type="i" direction="out" name="height"/>
-    </method>
-    <method name="SetClipboardContent">
-      <arg type="s" direction="in" name="mimetype"/>
-      <arg type="ay" direction="in" name="bytes"/>
-      <arg type="b" direction="out" name="ok"/>
-    </method>
-    <method name="SetClipboardText">
-      <arg type="s" direction="in" name="text"/>
-      <arg type="b" direction="out" name="ok"/>
     </method>
     <method name="RegisterHighlightOwner">
       <arg type="s" direction="in" name="ownerKey"/>
@@ -835,6 +825,8 @@ export default class KeysharpExtension {
         invocation.return_value(new GLib.Variant('(as)', [this._getClipboardMimetypes()]));
     }
 
+    SetClipboardContentAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_setClipboardContent'); }
+
     FocusWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_focusWindow'); }
     RaiseWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_raiseWindow'); }
     LowerWindowAsync(params, invocation) { this._returnSensitiveBoolean(params, invocation, '_lowerWindow'); }
@@ -978,7 +970,7 @@ export default class KeysharpExtension {
         }
     }
 
-    SetClipboardContent(mimetype, bytes) {
+    _setClipboardContent(mimetype, bytes) {
         try {
             const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
             const type = String(mimetype || '');
@@ -994,8 +986,9 @@ export default class KeysharpExtension {
         }
     }
 
-    // Text conveniences (the common A_Clipboard path). Read via St.Clipboard.get_text (async); write goes
-    // through SetClipboardContent so the owner is a proper MetaSelection source.
+    // Text reads use the common A_Clipboard path via St.Clipboard.get_text (async). Writing text is not a
+    // provider method: keysharp-desktop encodes UTF-8 itself and calls SetClipboardContent, so the owner is
+    // a proper MetaSelection source and one scope check covers every format.
     GetClipboardTextAsync(_params, invocation) {
         if (!this._requireProviderPeer(invocation))
             return;
@@ -1009,13 +1002,6 @@ export default class KeysharpExtension {
         } catch (_e) {
             try { invocation.return_value(new GLib.Variant('(s)', [''])); } catch (_e2) {}
         }
-    }
-
-    SetClipboardText(text) {
-        const value = String(text || '');
-        return value.length <= MAX_CLIPBOARD_BYTES / 4
-            && this.SetClipboardContent('text/plain;charset=utf-8',
-                                        new TextEncoder().encode(value));
     }
 
     _emitClipboardChanged() {

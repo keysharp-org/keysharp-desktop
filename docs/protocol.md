@@ -29,16 +29,20 @@ exactly 4 KiB and the unflagged frame that ends the sequence is 1 byte to
 4 KiB, so a payload of 4 KiB or less is never chunked and no payload has two
 legal encodings. The reassembled total is at most 4 MiB, that is 1024 frames.
 Only an RPC session may chunk, and only for an opcode the authority marks
-chunkable; no opcode is marked chunkable yet, so the whole path is currently
-refused at the first frame. Nothing may be interleaved with a sequence, not
+chunkable; the clipboard write is the only such opcode, so every other opcode
+is refused at the first frame. A chunked request is fully reassembled before
+its permission scope is checked, so a session with no grant can spend one
+assembly reservation before being denied; the per-user and global assembly
+budgets and the ten-second deadline bound that. Nothing may be interleaved with a sequence, not
 even a `PING`: a short chunk, an empty chunk, a chunk for another opcode or
 request ID, a response or event frame, an oversized total, a sequence from a
 role that may not chunk, and a sequence still incomplete after ten seconds all
 end the connection with no reply. The only chunk failure that answers first is
 the authority's assembly budget, which replies `RESOURCE_EXHAUSTED` and then
 ends the connection. That budget is separate from the capture budget so
-neither can starve the other, and a session's partial request is freed with
-the session. There is no way to cancel a sequence except by disconnecting, and
+neither can starve the other, and it is capped per user as well as globally so
+no one user can exhaust it for every other user. A session's partial request is
+freed with the session. There is no way to cancel a sequence except by disconnecting, and
 responses and events are not chunked this way; `PERMISSIONS_LIST` keeps its
 own `MORE`-per-entry form.
 
@@ -50,7 +54,8 @@ unchanged, so nothing understates a grant or a revocation. The authority still
 rejects any scope an application requests that it does not name.
 
 Typed operation families cover capture, window monitoring/control, clipboard
-monitoring, pointer control, cursor position, and work area. Each operation
+monitoring, clipboard writing, pointer control, cursor position, and work
+area. Each operation
 has an availability bit. Sensitive families map to exactly one durable scope;
 cursor-position and work-area queries have no scope and do not consult the
 grant store.

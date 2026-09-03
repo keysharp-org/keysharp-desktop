@@ -25,13 +25,13 @@ uint32_t ksd_operation_scope(uint16_t opcode)
 
 bool ksd_operation_scope_free(uint16_t opcode)
 {
-    return opcode == KSD_OP_CURSOR_POSITION || opcode == KSD_OP_WORK_AREA;
+    return opcode == KSD_OP_CURSOR_POSITION || opcode == KSD_OP_WORK_AREA
+        || opcode == KSD_OP_CLIPBOARD_SET_CONTENT;
 }
 
 bool ksd_operation_chunkable(uint16_t opcode)
 {
-    (void)opcode;
-    return false;
+    return opcode == KSD_OP_CLIPBOARD_SET_CONTENT;
 }
 
 bool ksd_request_chunk_admissible(uint16_t opcode, uint16_t flags,
@@ -77,6 +77,8 @@ uint64_t ksd_operation_bit(uint16_t opcode)
             return KSD_OPERATION_CLIPBOARD_CONTENT;
         case KSD_OP_CLIPBOARD_TEXT: return KSD_OPERATION_CLIPBOARD_TEXT;
         case KSD_OP_CLIPBOARD_WATCH: return KSD_OPERATION_CLIPBOARD_WATCH;
+        case KSD_OP_CLIPBOARD_SET_CONTENT:
+            return KSD_OPERATION_CLIPBOARD_SET_CONTENT;
         case KSD_OP_MOUSE_MOVE_ABSOLUTE:
             return KSD_OPERATION_MOUSE_MOVE_ABSOLUTE;
         case KSD_OP_MOUSE_MOVE_RELATIVE:

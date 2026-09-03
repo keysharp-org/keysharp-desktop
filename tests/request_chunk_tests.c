@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define TEST_CHUNK_OPCODE KSD_OP_CLIPBOARD_TEXT
+#define TEST_CHUNK_OPCODE KSD_OP_CLIPBOARD_SET_CONTENT
 #define TEST_CHUNK_REQUEST_ID 7u
 
 static uint8_t block[KSD_MAX_REQUEST_PAYLOAD];
@@ -69,13 +69,19 @@ int main(void)
     assert(!ksd_request_chunk_admissible(KSD_OP_HELLO, 0u, 1u));
     assert(!ksd_request_chunk_admissible(KSD_OP_AUTHORIZE, 0u, 1u));
     assert(!ksd_request_chunk_admissible(KSD_OP_PING, 0u, 0u));
-    assert(!ksd_request_chunk_admissible(KSD_OP_CLIPBOARD_TEXT, 0u, 0u));
-    assert(!ksd_request_chunk_admissible(KSD_OP_CLIPBOARD_TEXT,
+    assert(!ksd_request_chunk_admissible(KSD_OP_CLIPBOARD_TEXT, 0u, 1u));
+    assert(!ksd_request_chunk_admissible(KSD_OP_CLIPBOARD_CONTENT, 0u, 1u));
+    assert(!ksd_request_chunk_admissible(TEST_CHUNK_OPCODE, 0u, 0u));
+    assert(!ksd_request_chunk_admissible(TEST_CHUNK_OPCODE,
                                          KSD_FLAG_RESPONSE, 1u));
-    assert(!ksd_request_chunk_admissible(KSD_OP_CLIPBOARD_TEXT,
+    assert(!ksd_request_chunk_admissible(TEST_CHUNK_OPCODE,
                                          KSD_FLAG_EVENT, 1u));
+    assert(ksd_request_chunk_admissible(TEST_CHUNK_OPCODE, 0u, 1u));
+    assert(ksd_request_chunk_admissible(TEST_CHUNK_OPCODE,
+                                        KSD_FLAG_MORE, 1u));
     for (uint32_t opcode = 0u; opcode <= 0xFFFFu; opcode++)
-        assert(!ksd_request_chunk_admissible((uint16_t)opcode, 0u, 1u));
+        assert(ksd_request_chunk_admissible((uint16_t)opcode, 0u, 1u)
+               == (opcode == TEST_CHUNK_OPCODE));
     ksd_request_assembly assembly;
     ksd_frame taken;
 
