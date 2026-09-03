@@ -108,18 +108,34 @@ static void check_capture_memfd_is_sealed(void)
     assert(ksd_capture_tail_valid(tail, (uint32_t)sizeof(tail)));
     assert(close(descriptor) == 0);
 }
-int ksd_authority_test_capture_budget(unsigned int uid, int reserve);
+int ksd_authority_test_capture_budget(unsigned int uid, unsigned int pid,
+                                      int reserve);
 
 static void check_capture_budget(void)
 {
-    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
-    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
-    assert(ksd_authority_test_capture_budget(1000u, 1) == 0);
-    assert(ksd_authority_test_capture_budget(1001u, 1) == 1);
-    assert(ksd_authority_test_capture_budget(1000u, 0) == 1);
-    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
-    assert(ksd_authority_test_capture_budget(1001u, 1) == 1);
-    assert(ksd_authority_test_capture_budget(1002u, 1) == 0);
+    /* One capture per process. Every consumer of a desktop shares a uid, so
+     * without this a single process holds both of its uid slots and answers
+     * RESOURCE_EXHAUSTED to every other process on that desktop. */
+    assert(ksd_authority_test_capture_budget(1000u, 10u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 10u, 1) == 0);
+
+    /* A second process of the same user still gets the other uid slot. */
+    assert(ksd_authority_test_capture_budget(1000u, 11u, 1) == 1);
+
+    /* And a third does not, because the per-uid cap is still two. */
+    assert(ksd_authority_test_capture_budget(1000u, 12u, 1) == 0);
+
+    /* A second user is unaffected, which is the guarantee the per-uid cap
+     * exists to give and the reason it was not simply re-keyed on pid. */
+    assert(ksd_authority_test_capture_budget(1001u, 20u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1001u, 21u, 1) == 1);
+
+    /* Four slots globally, so a third user is refused. */
+    assert(ksd_authority_test_capture_budget(1002u, 30u, 1) == 0);
+
+    /* Releasing frees both the uid slot and the pid slot. */
+    assert(ksd_authority_test_capture_budget(1000u, 10u, 0) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 10u, 1) == 1);
 }
 
 static void check_assembly_budget(void)

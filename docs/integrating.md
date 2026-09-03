@@ -138,6 +138,20 @@ unknown status or malformed result invalidates the connection.
 Use separate connections for concurrency. Watch timeouts are 1 through 60000
 milliseconds. Finite lease timeouts make shutdown straightforward.
 
+One connection carries one request at a time, and the service answers each on
+that connection's own thread. A capture holds its thread for as long as the
+capture takes, which on a large window can be seconds, so **a caller that wants
+a capture and other work to proceed at the same time must hold two
+connections**. Handing the pixels over as a descriptor removed the transfer
+from that window; it did not remove the window.
+
+A capture is admitted against a budget: one per process, two per user, four
+across the service. The per-process limit exists because every consumer of one
+desktop shares a user, so without it a single process could hold both of its
+user's slots and every other process on that desktop would be refused for the
+duration. A refused capture answers `RESOURCE_EXHAUSTED` immediately rather
+than queueing, so a caller that would rather do something else is told at once.
+
 ## Pointer operations
 
 `ksd_mouse_move_absolute` places the pointer at an exact compositor pixel

@@ -41,6 +41,14 @@
 #define KSD_GENERIC_REGISTRATION_POLL_MS 30000
 #define KSD_MAX_CONCURRENT_CAPTURES 4u
 #define KSD_MAX_CAPTURES_PER_UID 2u
+/* Every consumer of one desktop shares a uid, so the per-uid cap alone lets a
+ * single process hold both of its slots and answer RESOURCE_EXHAUSTED to every
+ * other process on that desktop for as long as a capture takes. The per-uid
+ * cap stays, because it is the only cross-uid guarantee there is: two slots
+ * per uid against four global means a second user can always capture.
+ * Re-keying purely on pid would trade a same-user annoyance for a cross-user
+ * denial. A process that forks past this is bounded by the per-uid cap. */
+#define KSD_MAX_CAPTURES_PER_PID 1u
 #define KSD_MAX_AUTHORITY_INFLIGHT_BYTES \
     (KSD_MAX_CONCURRENT_CAPTURES * (size_t)KSD_MAX_CAPTURE_BYTES \
      + 16u * 1024u * 1024u)
@@ -73,6 +81,10 @@ typedef struct authority_state {
         uid_t uid;
         size_t count;
     } capture_usage[KSD_MAX_AUTHORITY_WORKERS];
+    struct {
+        pid_t pid;
+        size_t count;
+    } capture_pid_usage[KSD_MAX_AUTHORITY_WORKERS];
     struct {
         bool active;
         uid_t uid;
@@ -1043,9 +1055,11 @@ static bool start_watch(authority_session *session,
     return false;
 }
 
-static bool reserve_capture_memory(authority_state *state, uid_t uid)
+static bool reserve_capture_memory(authority_state *state, uid_t uid,
+                                   pid_t pid)
 {
     size_t slot = KSD_MAX_AUTHORITY_WORKERS;
+    size_t pid_slot = KSD_MAX_AUTHORITY_WORKERS;
     bool reserved = false;
     pthread_mutex_lock(&state->mutex);
     for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
@@ -1058,20 +1072,36 @@ static bool reserve_capture_memory(authority_state *state, uid_t uid)
             && state->capture_usage[index].count == 0u)
             slot = index;
     }
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->capture_pid_usage[index].count != 0u
+            && state->capture_pid_usage[index].pid == pid) {
+            pid_slot = index;
+            break;
+        }
+        if (pid_slot == KSD_MAX_AUTHORITY_WORKERS
+            && state->capture_pid_usage[index].count == 0u)
+            pid_slot = index;
+    }
     if (state->inflight_bytes <= KSD_MAX_AUTHORITY_INFLIGHT_BYTES
             - KSD_MAX_CAPTURE_BYTES
         && slot < KSD_MAX_AUTHORITY_WORKERS
-        && state->capture_usage[slot].count < KSD_MAX_CAPTURES_PER_UID) {
+        && pid_slot < KSD_MAX_AUTHORITY_WORKERS
+        && state->capture_usage[slot].count < KSD_MAX_CAPTURES_PER_UID
+        && state->capture_pid_usage[pid_slot].count
+            < KSD_MAX_CAPTURES_PER_PID) {
         state->inflight_bytes += KSD_MAX_CAPTURE_BYTES;
         state->capture_usage[slot].uid = uid;
         state->capture_usage[slot].count++;
+        state->capture_pid_usage[pid_slot].pid = pid;
+        state->capture_pid_usage[pid_slot].count++;
         reserved = true;
     }
     pthread_mutex_unlock(&state->mutex);
     return reserved;
 }
 
-static void release_capture_memory(authority_state *state, uid_t uid)
+static void release_capture_memory(authority_state *state, uid_t uid,
+                                   pid_t pid)
 {
     pthread_mutex_lock(&state->mutex);
     if (state->inflight_bytes >= KSD_MAX_CAPTURE_BYTES)
@@ -1080,6 +1110,13 @@ static void release_capture_memory(authority_state *state, uid_t uid)
         if (state->capture_usage[index].count != 0u
             && state->capture_usage[index].uid == uid) {
             state->capture_usage[index].count--;
+            break;
+        }
+    }
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->capture_pid_usage[index].count != 0u
+            && state->capture_pid_usage[index].pid == pid) {
+            state->capture_pid_usage[index].count--;
             break;
         }
     }
@@ -1174,7 +1211,8 @@ static bool execute_operation(authority_session *session,
     bool capture = request->opcode == KSD_OP_CAPTURE_AREA
         || request->opcode == KSD_OP_CAPTURE_WINDOW;
     if (capture && !reserve_capture_memory(session->state,
-                                           session->identity.uid))
+                                           session->identity.uid,
+                                           session->identity.pid))
         return forward_response(session, request,
                                 KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
                                 "capture memory budget is busy",
@@ -1221,7 +1259,8 @@ static bool execute_operation(authority_session *session,
             result.tail, result.tail_length, false);
     ksd_result_clear(&result);
     if (capture)
-        release_capture_memory(session->state, session->identity.uid);
+        release_capture_memory(session->state, session->identity.uid,
+                               session->identity.pid);
     return ok;
 }
 
@@ -1620,14 +1659,16 @@ int ksd_authority_main(int argc, char **argv)
 }
 
 #ifdef KSD_AUTHORITY_TESTING
-int ksd_authority_test_capture_budget(unsigned int uid, int reserve)
+int ksd_authority_test_capture_budget(unsigned int uid, unsigned int pid,
+                                      int reserve)
 {
     static authority_state capture_state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
     if (reserve == 0) {
-        release_capture_memory(&capture_state, (uid_t)uid);
+        release_capture_memory(&capture_state, (uid_t)uid, (pid_t)pid);
         return 1;
     }
-    return reserve_capture_memory(&capture_state, (uid_t)uid) ? 1 : 0;
+    return reserve_capture_memory(&capture_state, (uid_t)uid, (pid_t)pid)
+        ? 1 : 0;
 }
 
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve)
