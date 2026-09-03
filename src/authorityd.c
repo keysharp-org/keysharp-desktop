@@ -39,8 +39,11 @@
 #define KSD_MAX_BACKEND_REGISTRATIONS 128u
 #define KSD_BACKEND_REGISTRATION_POLL_MS 1000
 #define KSD_GENERIC_REGISTRATION_POLL_MS 30000
+#define KSD_MAX_CONCURRENT_CAPTURES 4u
+#define KSD_MAX_CAPTURES_PER_UID 2u
 #define KSD_MAX_AUTHORITY_INFLIGHT_BYTES \
-    (KSD_MAX_CAPTURE_BYTES + 16u * 1024u * 1024u)
+    (KSD_MAX_CONCURRENT_CAPTURES * (size_t)KSD_MAX_CAPTURE_BYTES \
+     + 16u * 1024u * 1024u)
 #define KSD_MAX_AUTHORITY_ASSEMBLY_BYTES (64u * 1024u * 1024u)
 #define KSD_MAX_ASSEMBLIES_PER_UID 4u
 #define KSD_MAX_REQUEST_ASSEMBLY_SECONDS 10u
@@ -66,6 +69,10 @@ typedef struct authority_state {
         uid_t uid;
         size_t count;
     } assembly_usage[KSD_MAX_AUTHORITY_WORKERS];
+    struct {
+        uid_t uid;
+        size_t count;
+    } capture_usage[KSD_MAX_AUTHORITY_WORKERS];
     struct {
         bool active;
         uid_t uid;
@@ -987,24 +994,46 @@ static bool start_watch(authority_session *session,
     return false;
 }
 
-static bool reserve_capture_memory(authority_state *state)
+static bool reserve_capture_memory(authority_state *state, uid_t uid)
 {
+    size_t slot = KSD_MAX_AUTHORITY_WORKERS;
     bool reserved = false;
     pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->capture_usage[index].count != 0u
+            && state->capture_usage[index].uid == uid) {
+            slot = index;
+            break;
+        }
+        if (slot == KSD_MAX_AUTHORITY_WORKERS
+            && state->capture_usage[index].count == 0u)
+            slot = index;
+    }
     if (state->inflight_bytes <= KSD_MAX_AUTHORITY_INFLIGHT_BYTES
-            - KSD_MAX_CAPTURE_BYTES) {
+            - KSD_MAX_CAPTURE_BYTES
+        && slot < KSD_MAX_AUTHORITY_WORKERS
+        && state->capture_usage[slot].count < KSD_MAX_CAPTURES_PER_UID) {
         state->inflight_bytes += KSD_MAX_CAPTURE_BYTES;
+        state->capture_usage[slot].uid = uid;
+        state->capture_usage[slot].count++;
         reserved = true;
     }
     pthread_mutex_unlock(&state->mutex);
     return reserved;
 }
 
-static void release_capture_memory(authority_state *state)
+static void release_capture_memory(authority_state *state, uid_t uid)
 {
     pthread_mutex_lock(&state->mutex);
     if (state->inflight_bytes >= KSD_MAX_CAPTURE_BYTES)
         state->inflight_bytes -= KSD_MAX_CAPTURE_BYTES;
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->capture_usage[index].count != 0u
+            && state->capture_usage[index].uid == uid) {
+            state->capture_usage[index].count--;
+            break;
+        }
+    }
     pthread_mutex_unlock(&state->mutex);
 }
 
@@ -1095,7 +1124,8 @@ static bool execute_operation(authority_session *session,
                                 NULL, 0u, false);
     bool capture = request->opcode == KSD_OP_CAPTURE_AREA
         || request->opcode == KSD_OP_CAPTURE_WINDOW;
-    if (capture && !reserve_capture_memory(session->state))
+    if (capture && !reserve_capture_memory(session->state,
+                                           session->identity.uid))
         return forward_response(session, request,
                                 KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
                                 "capture memory budget is busy",
@@ -1133,7 +1163,7 @@ static bool execute_operation(authority_session *session,
             result.tail, result.tail_length, false);
     ksd_result_clear(&result);
     if (capture)
-        release_capture_memory(session->state);
+        release_capture_memory(session->state, session->identity.uid);
     return ok;
 }
 
@@ -1532,6 +1562,16 @@ int ksd_authority_main(int argc, char **argv)
 }
 
 #ifdef KSD_AUTHORITY_TESTING
+int ksd_authority_test_capture_budget(unsigned int uid, int reserve)
+{
+    static authority_state capture_state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    if (reserve == 0) {
+        release_capture_memory(&capture_state, (uid_t)uid);
+        return 1;
+    }
+    return reserve_capture_memory(&capture_state, (uid_t)uid) ? 1 : 0;
+}
+
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve)
 {
     static authority_state budget_state = { .mutex = PTHREAD_MUTEX_INITIALIZER };

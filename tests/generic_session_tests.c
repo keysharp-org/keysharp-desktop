@@ -21,6 +21,19 @@ int ksd_authority_test_generic_session(int descriptor,
                                        const char *persistent_directory,
                                        const char *runtime_directory);
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
+int ksd_authority_test_capture_budget(unsigned int uid, int reserve);
+
+static void check_capture_budget(void)
+{
+    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 1) == 0);
+    assert(ksd_authority_test_capture_budget(1001u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 0) == 1);
+    assert(ksd_authority_test_capture_budget(1000u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1001u, 1) == 1);
+    assert(ksd_authority_test_capture_budget(1002u, 1) == 0);
+}
 
 static void check_assembly_budget(void)
 {
@@ -267,6 +280,7 @@ int main(void)
                        0u, NULL) == KSD_STATUS_UNAVAILABLE);
 
     check_assembly_budget();
+    check_capture_budget();
 
     assert(close(sockets[0]) == 0);
     assert(pthread_join(thread, NULL) == 0);

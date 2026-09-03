@@ -46,6 +46,17 @@ freed with the session. There is no way to cancel a sequence except by disconnec
 responses and events are not chunked this way; `PERMISSIONS_LIST` keeps its
 own `MORE`-per-entry form.
 
+A capture is admitted against its own budget, which bounds how many captures
+may be in flight at once rather than how much a capture may return. Four are
+admitted across the whole service and two per user, so one user cannot deny
+captures to another and a busy user cannot deny them to everyone. A capture
+refused on either limit answers `RESOURCE_EXHAUSTED` immediately; it is never
+queued, because a caller that would rather do something else should not be made
+to wait to find out. Only the two capture opcodes consult this budget, so a
+capture in flight does not delay a window, clipboard or pointer request. Each
+reservation is the worst case a capture may return, not what it does return, so
+the bound is deliberately pessimistic.
+
 Framing is strict; vocabulary is not. The client library carries an
 unrecognized backend value and unrecognized operation bits through to its
 caller, narrows a granted scope mask to the scopes this authority manages, and
