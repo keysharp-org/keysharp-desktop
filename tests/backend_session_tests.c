@@ -104,7 +104,7 @@ static void check_session_type_table(void)
     session_environment nodisplay = { "GNOME", "x11", NULL, NULL };
     assert(child_resolve(&nodisplay) == KSD_BACKEND_X11);
 
-    assert(ksd_backend_operations(KSD_BACKEND_X11) == 0u);
+    assert(ksd_backend_operations(KSD_BACKEND_X11) != 0u);
     assert(ksd_backend_x11_route(KSD_BACKEND_X11, false) == 0u);
 }
 int main(int argc, char **argv)

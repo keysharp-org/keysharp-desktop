@@ -95,7 +95,7 @@ target_compile_definitions(keysharp-desktop-capture PUBLIC
     _GNU_SOURCE _POSIX_C_SOURCE=200809L
     KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
 target_link_libraries(keysharp-desktop-capture PUBLIC
-    keysharp-desktop-common PkgConfig::GIO)
+    keysharp-desktop-common keysharp-desktop-x11 PkgConfig::GIO)
 
 # Linked into the worker executable and nothing else. The whole argument that
 # root never touches X rests on this one edge, so it is a separate target
@@ -105,7 +105,8 @@ add_library(keysharp-desktop-x11 STATIC
     src/x11/x11_display.c
     src/x11/x11_connect.c
     src/x11/x11_query.c
-    src/x11/x11_windows.c)
+    src/x11/x11_windows.c
+    src/x11/x11_worker.c)
 target_include_directories(keysharp-desktop-x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -312,19 +313,22 @@ if(BUILD_TESTING)
     target_include_directories(capture-pipe-security-tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(capture-pipe-security-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/x11)
     target_compile_definitions(capture-pipe-security-tests PRIVATE
         _GNU_SOURCE _POSIX_C_SOURCE=200809L
         KSD_CAPTURE_WORKER_TESTING
         KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
     target_link_libraries(capture-pipe-security-tests PRIVATE
-        keysharp-desktop-common PkgConfig::GIO)
+        keysharp-desktop-common keysharp-desktop-x11 PkgConfig::GIO)
     add_test(NAME capture-pipe-security-tests
         COMMAND capture-pipe-security-tests)
     set_tests_properties(capture-pipe-security-tests PROPERTIES
         SKIP_RETURN_CODE 77)
 
     add_executable(x11-display-tests tests/x11_display_tests.c)
-    target_link_libraries(x11-display-tests PRIVATE keysharp-desktop-x11)
+    target_link_libraries(x11-display-tests PRIVATE
+        keysharp-desktop-x11 keysharp-desktop-common)
     add_test(NAME x11-display-tests COMMAND x11-display-tests)
 
     add_executable(x11-server-tests tests/x11_server_tests.c)

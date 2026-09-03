@@ -2,6 +2,7 @@
 
 #include "protocol.h"
 #include "local_capture.h"
+#include "x11_worker.h"
 #include "transport.h"
 
 #include <errno.h>
@@ -885,14 +886,25 @@ int ksd_capture_worker_main(int argc, char **argv)
     bool unpacked = ksd_frame_unpack(packed, frame_length, public_magic,
         KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
         KSD_CAPTURE_WORKER_MAX_REQUEST, true, &request);
+    bool x11 = unpacked && ksd_x11_request_valid(&request);
     if (!unpacked || request.flags != 0u || request.request_id == 0u
-        || !ksd_local_capture_request_valid(&request)) {
+        || !(x11 || ksd_local_capture_request_valid(&request))) {
         if (unpacked)
             ksd_frame_clear(&request);
         goto failed;
     }
-    ksd_local_capture_execute(&request, capture_pipe[0], capture_pipe[1],
-                              capture_spool, &result);
+    if (x11) {
+        /* The X11 verbs need no capture pipe or spool, and holding them open
+         * across an X round trip would keep descriptors the operation cannot
+         * use. */
+        close(capture_pipe[0]);
+        close(capture_pipe[1]);
+        close(capture_spool);
+        ksd_x11_execute(&request, header.session_pid, &result);
+    } else {
+        ksd_local_capture_execute(&request, capture_pipe[0], capture_pipe[1],
+                                  capture_spool, &result);
+    }
     capture_pipe[0] = -1;
     capture_pipe[1] = -1;
     capture_spool = -1;

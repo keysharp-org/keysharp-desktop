@@ -245,12 +245,8 @@ uint64_t ksd_backend_operations(ksd_backend backend)
 {
     if (backend == KSD_BACKEND_GENERIC)
         return 0u;
-    /* Zero until the authority dispatches to the X11 worker. Advertising the
-     * coordinate group before anything serves it is the same defect this file
-     * carried for Cinnamon window capture: announced, and refused every time.
-     * The mask and the dispatch land in one commit. */
     if (backend == KSD_BACKEND_X11)
-        return 0u;
+        return KSD_X11_COORDINATE_OPERATIONS;
     if (backend == KSD_BACKEND_KWIN)
         return KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW;
     if (backend != KSD_BACKEND_GNOME && backend != KSD_BACKEND_CINNAMON)
