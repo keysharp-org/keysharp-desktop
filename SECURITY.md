@@ -41,6 +41,21 @@ lock is held while connecting or performing D-Bus I/O.
 Provider executable validation has the same-UID runtime-integrity limit
 as application grants. Executable paths alone do not defeat same-UID injection.
 
+A compositor with no extension mechanism of its own is driven by a script the
+package installs read-only, which the daemon names to the compositor by
+absolute path. The compositor opens that path itself, so the daemon writes
+nothing: its unit keeps `ProtectSystem=strict` and `ProtectHome=read-only` with
+no `ReadWritePaths=`, `RuntimeDirectory=`, `StateDirectory=`, or `BindPaths=`
+exception. This does not make the loaded script trustworthy: the daemon is
+itself a same-UID session-bus client and can name any path it likes, so the
+read-only delivery bounds packaging drift, not a compromised daemon. Nothing
+in such a script is secret. The compositor runs as the session
+user, so any file it can read, any same-UID process can read, and any same-UID
+process can load a script of its own through the same unrestricted session-bus
+interface. Script contents therefore carry no nonce and confer no authority.
+The authority still identifies a compositor peer by its root-owned executable,
+exactly as it does for GNOME and Cinnamon.
+
 ## Capture
 
 KWin capture runs in a separate root-only executable. The authority supplies a

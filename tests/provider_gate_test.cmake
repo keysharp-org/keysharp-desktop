@@ -329,6 +329,17 @@ foreach(required
     endif()
 endforeach()
 
+file(READ "${SOURCE_DIR}/data/keysharp-desktop.service.in" broker)
+foreach(required
+        "ProtectSystem=strict"
+        "ProtectHome=read-only")
+    string(FIND "${broker}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "compositor resources must stay read-only to the daemon: ${required}")
+    endif()
+endforeach()
+
 file(READ "${SOURCE_DIR}/src/authorityd.c" authority_source)
 foreach(required
         "ksd_request_chunk_admissible"

@@ -48,6 +48,23 @@ removing the SONAME library. They reload systemd, enable the system socket,
 and refresh the invoking graphical user's service. Other active users refresh
 at their next login or with `systemctl --user daemon-reload`.
 
+## Compositor scripts
+
+A compositor with no extension mechanism of its own is driven by a script
+installed read-only under `share/keysharp-desktop/`. The compositor opens that
+path itself, so the per-user daemon only names it and never materializes,
+copies, or rewrites it. The user unit therefore declares no `ReadWritePaths=`,
+`RuntimeDirectory=`, `StateDirectory=`, or `BindPaths=`; `release-layout-test`
+fails if one appears in `data/keysharp-desktop.service.in` or in
+`nix/module.nix`, and `provider-gate-test` fails if the unit stops declaring
+`ProtectSystem=strict` and `ProtectHome=read-only`.
+
+`/run/user/<uid>/keysharp-desktop` belongs to the GNOME and Cinnamon
+extensions, which create it at mode 0700 and bind their provider sockets
+inside it. No unit may claim it as a `RuntimeDirectory=`: systemd would adjust
+its ownership at start and remove it at stop, unlinking a live provider socket
+that the extension does not recreate.
+
 ## Ownership and removal
 
 Package managers own their dependency graph. The portable installer refuses a

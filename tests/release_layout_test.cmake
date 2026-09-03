@@ -51,6 +51,52 @@ foreach(required
         message(FATAL_ERROR "Nix socket is missing ${required}")
     endif()
 endforeach()
+set(nix_writable "ReadWritePaths")
+string(LENGTH "${nix_writable}" nix_writable_length)
+string(LENGTH "${nix_module}" nix_module_length)
+string(REPLACE "${nix_writable}" "" nix_module_stripped "${nix_module}")
+string(LENGTH "${nix_module_stripped}" nix_module_stripped_length)
+math(EXPR nix_writable_count
+    "(${nix_module_length} - ${nix_module_stripped_length}) / ${nix_writable_length}")
+if(NOT nix_writable_count EQUAL 1)
+    message(FATAL_ERROR
+        "only the Nix authority service may declare ReadWritePaths")
+endif()
+string(FIND "${nix_module}" "systemd.user.services.keysharp-desktop = {"
+    nix_user_start)
+if(nix_user_start EQUAL -1)
+    message(FATAL_ERROR "Nix module is missing the user service")
+endif()
+string(SUBSTRING "${nix_module}" ${nix_user_start} -1 nix_user_service)
+foreach(required
+        "ProtectSystem = \"strict\""
+        "ProtectHome = \"read-only\"")
+    string(FIND "${nix_user_service}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "Nix user service is missing ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "ReadWritePaths"
+        "RuntimeDirectory"
+        "StateDirectory"
+        "BindPaths")
+    string(FIND "${nix_user_service}" "${forbidden}" found)
+    if(NOT found EQUAL -1)
+        message(FATAL_ERROR
+            "Nix user service must stay read-only; ${forbidden} is not allowed")
+    endif()
+endforeach()
+foreach(forbidden
+        "RuntimeDirectory"
+        "StateDirectory"
+        "BindPaths")
+    string(FIND "${nix_module}" "${forbidden}" found)
+    if(NOT found EQUAL -1)
+        message(FATAL_ERROR
+            "Nix module must not open a writable namespace through ${forbidden}")
+    endif()
+endforeach()
 foreach(installer_source release_installer source_installer debian_postinst)
     foreach(required
             "refresh_invoking_user_manager"
@@ -84,10 +130,28 @@ file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.socket" authority_socke
 foreach(required
         "PartOf=graphical-session.target"
         "WantedBy=graphical-session.target"
-        "Restart=on-failure")
+        "Restart=on-failure"
+        "NoNewPrivileges=true"
+        "PrivateTmp=true"
+        "ProtectSystem=strict"
+        "ProtectHome=read-only"
+        "RestrictAddressFamilies=AF_UNIX"
+        "LockPersonality=true")
     string(FIND "${broker_unit}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "user service is missing ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "ReadWritePaths"
+        "RuntimeDirectory"
+        "StateDirectory"
+        "BindPaths"
+        "%t")
+    string(FIND "${broker_unit}" "${forbidden}" found)
+    if(NOT found EQUAL -1)
+        message(FATAL_ERROR
+            "user service must stay read-only; ${forbidden} is not allowed")
     endif()
 endforeach()
 foreach(required
