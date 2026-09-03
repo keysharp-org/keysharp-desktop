@@ -735,16 +735,71 @@ class KeysharpExtension {
         if (!this._requireProviderPeer(invocation))
             return;
 
-        let bytes = new Uint8Array(0);
+        let replied = false;
+        let watchdog = 0;
+        const reply = bytes => {
+            if (replied)
+                return;
+
+            replied = true;
+
+            if (watchdog !== 0) {
+                GLib.source_remove(watchdog);
+                watchdog = 0;
+            }
+
+            invocation.return_value(new GLib.Variant('(ay)',
+                [bytes && bytes.length > 0 && bytes.length <= MAX_CAPTURE_BYTES
+                    ? bytes : new Uint8Array(0)]));
+        };
+
+        let pixbuf = null;
 
         try {
-            bytes = this._captureWindow(params[0], Boolean(params[1]));
+            pixbuf = this._captureWindowPixbuf(params[0], Boolean(params[1]));
         } catch (e) {
             global.logError(e, 'Keysharp: CaptureWindow failed');
-            bytes = new Uint8Array(0);
         }
 
-        invocation.return_value(new GLib.Variant('(ay)', [bytes]));
+        if (pixbuf === null) {
+            reply(null);
+            return;
+        }
+
+        // The readback above has to happen on this thread, because it needs the compositor's GL
+        // context. PNG encoding does not, and it is the expensive half. An extension runs on the
+        // compositor main loop, so encoding here freezes every application on the desktop for the
+        // duration of the capture, not just this broker's callers. save_to_streamv_async hands the
+        // encode to the GdkPixbuf thread pool instead.
+        if (typeof pixbuf.save_to_streamv_async !== 'function') {
+            reply(this._encodePixbuf(pixbuf));
+            return;
+        }
+
+        const stream = Gio.MemoryOutputStream.new_resizable();
+
+        // A callback that never fires would leave the caller blocked until its own timeout, so the
+        // reply is armed independently, as the GNOME provider does for composite_to_stream.
+        watchdog = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 15000, () => {
+            watchdog = 0;
+            reply(null);
+            return GLib.SOURCE_REMOVE;
+        });
+
+        pixbuf.save_to_streamv_async(stream, 'png', [], [], null, (source, result) => {
+            try {
+                if (!GdkPixbuf.Pixbuf.save_to_stream_finish(result)) {
+                    reply(null);
+                    return;
+                }
+
+                stream.close(null);
+                reply(stream.steal_as_bytes().get_data());
+            } catch (e) {
+                global.logError(e, 'Keysharp: CaptureWindow encode failed');
+                reply(null);
+            }
+        });
     }
 
     // Gdk 3 is what turns a cairo surface into a pixbuf. It is resolved on the first capture, never at
@@ -778,14 +833,13 @@ class KeysharpExtension {
         return this._gdk;
     }
 
-    _captureWindow(handle, includeDecoration) {
-        const empty = new Uint8Array(0);
+    _captureWindowPixbuf(handle, includeDecoration) {
         const gdk = this._gdkPixbufBridge();
         const win = this._findWindow(handle);
         const actor = win ? win.get_compositor_private() : null;
 
         if (gdk === null || !actor || typeof actor.get_image !== 'function')
-            return empty;
+            return null;
 
         // get_image allocates ceil(clip * resource_scale) ARGB32 inside the compositor, so the logical
         // clip alone is not the bound that matters: on a 2x session a 64 Mi-pixel clip is a 1 GiB
@@ -817,7 +871,7 @@ class KeysharpExtension {
                                            clip.height * captureScale)
             || clip.x + clip.width > Math.round(buffer.width)
             || clip.y + clip.height > Math.round(buffer.height))
-            return empty;
+            return null;
 
         const surface = actor.get_image(clip);
 
@@ -825,28 +879,31 @@ class KeysharpExtension {
         // pixels came back. A surface that cannot say is not converted at all rather than cropped.
         if (!surface || typeof surface.getWidth !== 'function'
             || typeof surface.getHeight !== 'function')
-            return empty;
+            return null;
 
         const width = surface.getWidth();
         const height = surface.getHeight();
 
         if (!this._validCaptureGeometry(width, height))
-            return empty;
+            return null;
 
         const pixbuf = gdk.pixbuf_get_from_surface(surface, 0, 0, width, height);
 
         if (!pixbuf || pixbuf.get_width() !== width
             || pixbuf.get_height() !== height)
-            return empty;
+            return null;
 
+        return pixbuf;
+    }
+
+    // Encoding on the calling thread is the fallback for a GdkPixbuf too old to have the async form.
+    _encodePixbuf(pixbuf) {
         const saved = pixbuf.save_to_bufferv('png', [], []);
         const data = Array.isArray(saved) ? saved[saved.length - 1] : saved;
-        const png = data instanceof Uint8Array
+
+        return data instanceof Uint8Array
             ? data
             : (data && typeof data.length === 'number' ? new Uint8Array(data) : null);
-
-        return (png !== null && png.length > 0 && png.length <= MAX_CAPTURE_BYTES)
-            ? png : empty;
     }
 
     _validCaptureGeometry(width, height) {

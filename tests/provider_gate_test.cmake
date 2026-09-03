@@ -176,6 +176,9 @@ foreach(required
         "imports.gi.versions.Gdk = '3.0'"
         "actor.get_image"
         "_validCaptureGeometry(width, height)"
+        "typeof pixbuf.save_to_streamv_async !== 'function'"
+        "pixbuf.save_to_streamv_async(stream, 'png', [], [], null,"
+        "GdkPixbuf.Pixbuf.save_to_stream_finish(result)"
         "MAX_CAPTURE_BYTES"
         "MAX_CAPTURE_DIMENSION"
         "MAX_CAPTURE_PIXELS")
