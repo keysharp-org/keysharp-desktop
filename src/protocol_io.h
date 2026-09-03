@@ -54,6 +54,17 @@ int ksd_frame_read(int descriptor, const uint8_t magic[4],
                    uint16_t major, uint16_t minor, uint32_t maximum_payload,
                    bool public_rules, ksd_frame *frame);
 bool ksd_frame_write(int descriptor, const ksd_frame *frame);
+/* A capture response carries its pixels as a sealed memfd rather than in the
+ * payload, so the frame header travels by sendmsg with the descriptor
+ * attached. A reader must therefore use ksd_frame_read_fd on any path that can
+ * see one: a plain read consumes the header and the kernel discards the
+ * descriptor along with the ancillary data. received_fd is -1 when the frame
+ * carried none, so the same call serves both forms. */
+bool ksd_frame_write_fd(int descriptor, const ksd_frame *frame, int passed_fd);
+int ksd_frame_read_fd(int descriptor, const uint8_t magic[4],
+                      uint16_t major, uint16_t minor,
+                      uint32_t maximum_payload, bool public_rules,
+                      ksd_frame *frame, int *received_fd);
 void ksd_frame_clear(ksd_frame *frame);
 bool ksd_frame_is_request(const ksd_frame *frame);
 bool ksd_frame_pack(const ksd_frame *frame, ksd_buffer *buffer);

@@ -2,7 +2,11 @@
 #include "protocol_io.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 static ksd_frame frame(uint16_t opcode, uint16_t flags, uint64_t request_id)
 {
@@ -18,6 +22,82 @@ static ksd_frame frame(uint16_t opcode, uint16_t flags, uint64_t request_id)
         .request_id = request_id,
     };
     return value;
+}
+
+static const uint8_t wire_magic[4] = {
+    KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+    KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+};
+
+static int sealed_memfd(const char *contents, size_t length)
+{
+    int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    int descriptor = memfd_create("keysharp-desktop-test",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (descriptor < 0)
+        return -1;
+    if (write(descriptor, contents, length) != (ssize_t)length
+        || fcntl(descriptor, F_ADD_SEALS, seals) != 0) {
+        close(descriptor);
+        return -1;
+    }
+    return descriptor;
+}
+
+static void check_frame_fd_round_trip(void)
+{
+    static const char pixels[] = "not really a png";
+    static const uint8_t payload[] = { 1u, 2u, 3u, 4u };
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+
+    ksd_frame sent = frame(KSD_OP_CAPTURE_AREA, KSD_FLAG_RESPONSE, 7u);
+    sent.payload = (uint8_t *)payload;
+    sent.payload_length = (uint32_t)sizeof(payload);
+
+    int passed = sealed_memfd(pixels, sizeof(pixels));
+    assert(passed >= 0);
+    assert(ksd_frame_write_fd(pair[0], &sent, passed));
+    assert(close(passed) == 0);
+
+    ksd_frame received;
+    int got = -1;
+    assert(ksd_frame_read_fd(pair[1], wire_magic, KSD_PROTOCOL_MAJOR,
+                             KSD_PROTOCOL_MINOR, KSD_MAX_REQUEST_PAYLOAD,
+                             false, &received, &got) == 1);
+    assert(received.opcode == KSD_OP_CAPTURE_AREA);
+    assert(received.request_id == 7u);
+    assert(received.payload_length == sizeof(payload));
+    assert(memcmp(received.payload, payload, sizeof(payload)) == 0);
+
+    /* The descriptor must arrive sealed against every kind of change, or a
+     * peer could rewrite the pixels after their length has been agreed. */
+    assert(got >= 0);
+    int seals = fcntl(got, F_GET_SEALS);
+    assert((seals & F_SEAL_WRITE) != 0);
+    assert((seals & F_SEAL_SHRINK) != 0);
+    assert((seals & F_SEAL_GROW) != 0);
+    char echoed[sizeof(pixels)] = { 0 };
+    assert(pread(got, echoed, sizeof(echoed), 0) == (ssize_t)sizeof(echoed));
+    assert(memcmp(echoed, pixels, sizeof(pixels)) == 0);
+    ksd_frame_clear(&received);
+    assert(close(got) == 0);
+
+    /* A frame written without a descriptor must still read back through the
+     * descriptor-aware path, because a reader cannot know in advance which
+     * form a response will take. */
+    ksd_frame plain = frame(KSD_OP_PING, KSD_FLAG_RESPONSE, 9u);
+    assert(ksd_frame_write(pair[0], &plain));
+    int none = 0;
+    assert(ksd_frame_read_fd(pair[1], wire_magic, KSD_PROTOCOL_MAJOR,
+                             KSD_PROTOCOL_MINOR, KSD_MAX_REQUEST_PAYLOAD,
+                             false, &received, &none) == 1);
+    assert(none == -1);
+    assert(received.opcode == KSD_OP_PING);
+    ksd_frame_clear(&received);
+
+    assert(close(pair[0]) == 0);
+    assert(close(pair[1]) == 0);
 }
 
 static bool packed_frame_is_valid(ksd_frame *value)
@@ -95,5 +175,7 @@ int main(void)
     assert(!ksd_utf8_valid(overlong, sizeof(overlong), false));
     assert(!ksd_utf8_valid(surrogate, sizeof(surrogate), false));
     assert(!ksd_utf8_valid((const uint8_t *)"a\0b", 3u, false));
+
+    check_frame_fd_round_trip();
     return 0;
 }

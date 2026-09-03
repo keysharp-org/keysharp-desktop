@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -165,6 +166,109 @@ static bool write_until(int descriptor, const void *data, size_t length,
     return true;
 }
 
+static void close_received_fd(int *received_fd)
+{
+    if (*received_fd >= 0) {
+        close(*received_fd);
+        *received_fd = -1;
+    }
+}
+
+static void encode_frame_header(const ksd_frame *frame,
+                                uint8_t header[KSD_FRAME_HEADER_SIZE])
+{
+    memset(header, 0, KSD_FRAME_HEADER_SIZE);
+    memcpy(header + KSD_FRAME_MAGIC_OFFSET, frame->magic, sizeof(frame->magic));
+    ksd_encode_u16(header + KSD_FRAME_MAJOR_OFFSET, frame->major);
+    ksd_encode_u16(header + KSD_FRAME_MINOR_OFFSET, frame->minor);
+    ksd_encode_u16(header + KSD_FRAME_OPCODE_OFFSET, frame->opcode);
+    ksd_encode_u16(header + KSD_FRAME_FLAGS_OFFSET, frame->flags);
+    ksd_encode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET,
+                   frame->payload_length);
+    ksd_encode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET, frame->request_id);
+}
+
+static void decode_frame_header(ksd_frame *frame,
+                                const uint8_t header[KSD_FRAME_HEADER_SIZE])
+{
+    memcpy(frame->magic, header + KSD_FRAME_MAGIC_OFFSET, sizeof(frame->magic));
+    frame->major = ksd_decode_u16(header + KSD_FRAME_MAJOR_OFFSET);
+    frame->minor = ksd_decode_u16(header + KSD_FRAME_MINOR_OFFSET);
+    frame->opcode = ksd_decode_u16(header + KSD_FRAME_OPCODE_OFFSET);
+    frame->flags = ksd_decode_u16(header + KSD_FRAME_FLAGS_OFFSET);
+    frame->payload_length =
+        ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
+    frame->request_id = ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET);
+}
+
+static bool frame_header_acceptable(const ksd_frame *frame,
+                                    const uint8_t magic[4], uint16_t major,
+                                    uint16_t minor, uint32_t maximum_payload,
+                                    bool public_rules)
+{
+    return memcmp(frame->magic, magic, sizeof(frame->magic)) == 0
+        && frame->major == major && frame->minor == minor
+        && frame->payload_length <= maximum_payload
+        && (!public_rules || valid_public_header(frame));
+}
+
+int ksd_frame_read_fd(int descriptor, const uint8_t magic[4],
+                      uint16_t major, uint16_t minor,
+                      uint32_t maximum_payload, bool public_rules,
+                      ksd_frame *frame, int *received_fd)
+{
+    uint8_t header[KSD_FRAME_HEADER_SIZE];
+
+    if (descriptor < 0 || magic == NULL || frame == NULL
+        || received_fd == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(frame, 0, sizeof(*frame));
+    *received_fd = -1;
+    if (ksd_receive_optional_fd(descriptor, header, sizeof header,
+                                received_fd) != 0)
+        return -1;
+    decode_frame_header(frame, header);
+    if (!frame_header_acceptable(frame, magic, major, minor, maximum_payload,
+                                 public_rules)) {
+        close_received_fd(received_fd);
+        errno = EPROTO;
+        return -1;
+    }
+    if (frame->payload_length == 0u)
+        return 1;
+    uint64_t deadline = socket_deadline(descriptor, SO_RCVTIMEO);
+    frame->payload = malloc(frame->payload_length);
+    if (frame->payload == NULL) {
+        close_received_fd(received_fd);
+        return -1;
+    }
+    if (read_until(descriptor, frame->payload, frame->payload_length,
+                   deadline) != (ssize_t)frame->payload_length) {
+        close_received_fd(received_fd);
+        ksd_frame_clear(frame);
+        return -1;
+    }
+    return 1;
+}
+
+bool ksd_frame_write_fd(int descriptor, const ksd_frame *frame, int passed_fd)
+{
+    uint8_t header[KSD_FRAME_HEADER_SIZE];
+
+    if (descriptor < 0 || frame == NULL || passed_fd < 0
+        || (frame->payload_length != 0u && frame->payload == NULL))
+        return false;
+    encode_frame_header(frame, header);
+    if (!ksd_send_with_fd(descriptor, header, sizeof header, passed_fd))
+        return false;
+    uint64_t deadline = socket_deadline(descriptor, SO_SNDTIMEO);
+    return frame->payload_length == 0u
+        || write_until(descriptor, frame->payload, frame->payload_length,
+                       deadline);
+}
+
 int ksd_frame_read(int descriptor, const uint8_t magic[4],
                    uint16_t major, uint16_t minor, uint32_t maximum_payload,
                    bool public_rules, ksd_frame *frame)
@@ -213,19 +317,12 @@ int ksd_frame_read(int descriptor, const uint8_t magic[4],
 
 bool ksd_frame_write(int descriptor, const ksd_frame *frame)
 {
-    uint8_t header[KSD_FRAME_HEADER_SIZE] = { 0 };
+    uint8_t header[KSD_FRAME_HEADER_SIZE];
 
     if (descriptor < 0 || frame == NULL
         || (frame->payload_length != 0u && frame->payload == NULL))
         return false;
-    memcpy(header + KSD_FRAME_MAGIC_OFFSET, frame->magic, sizeof(frame->magic));
-    ksd_encode_u16(header + KSD_FRAME_MAJOR_OFFSET, frame->major);
-    ksd_encode_u16(header + KSD_FRAME_MINOR_OFFSET, frame->minor);
-    ksd_encode_u16(header + KSD_FRAME_OPCODE_OFFSET, frame->opcode);
-    ksd_encode_u16(header + KSD_FRAME_FLAGS_OFFSET, frame->flags);
-    ksd_encode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET,
-                   frame->payload_length);
-    ksd_encode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET, frame->request_id);
+    encode_frame_header(frame, header);
     uint64_t deadline = socket_deadline(descriptor, SO_SNDTIMEO);
     return write_until(descriptor, header, sizeof(header), deadline)
         && (frame->payload_length == 0u
