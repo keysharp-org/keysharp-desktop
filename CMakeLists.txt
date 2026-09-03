@@ -100,14 +100,18 @@ target_link_libraries(keysharp-desktop-capture PUBLIC
 # Linked into the worker executable and nothing else. The whole argument that
 # root never touches X rests on this one edge, so it is a separate target
 # rather than a few files added to an existing library.
+pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb>=1.14)
 add_library(keysharp-desktop-x11 STATIC
-    src/x11/x11_display.c)
+    src/x11/x11_display.c
+    src/x11/x11_connect.c)
 target_include_directories(keysharp-desktop-x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/x11)
 target_compile_definitions(keysharp-desktop-x11 PUBLIC
     _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+target_link_libraries(keysharp-desktop-x11 PUBLIC
+    keysharp-desktop-wire PkgConfig::XCB)
 
 add_executable(keysharp-desktop-capture-worker
     src/capture_worker_entry.c)
@@ -320,6 +324,13 @@ if(BUILD_TESTING)
     add_executable(x11-display-tests tests/x11_display_tests.c)
     target_link_libraries(x11-display-tests PRIVATE keysharp-desktop-x11)
     add_test(NAME x11-display-tests COMMAND x11-display-tests)
+
+    add_executable(x11-server-tests tests/x11_server_tests.c)
+    target_link_libraries(x11-server-tests PRIVATE keysharp-desktop-x11)
+    add_test(NAME x11-server-tests
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
+            $<TARGET_FILE:x11-server-tests>)
+    set_tests_properties(x11-server-tests PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
