@@ -379,6 +379,11 @@ if(BUILD_TESTING)
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_layout_test.cmake)
 
+    add_test(NAME provider-syntax-test
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/provider_syntax_test.sh
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(provider-syntax-test PROPERTIES SKIP_RETURN_CODE 77)
+
     add_test(NAME portable-compatibility-tests
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/portable_compatibility_tests.sh
             ${CMAKE_CURRENT_SOURCE_DIR})
