@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 #define TEST_FUTURE_SCOPE 0x00000100u
-#define TEST_FUTURE_BACKEND 5u
+#define TEST_FUTURE_BACKEND 6u
 #define TEST_FUTURE_OPERATION UINT64_C(0x0000000020000000)
 
 ksd_connection *ksd_client_test_adopt_descriptor(int descriptor);

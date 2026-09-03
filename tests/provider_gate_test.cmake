@@ -213,7 +213,7 @@ foreach(required
         "ksd_backend_registration_magic"
         "registered_backend"
         "KSD_SYSTEM_SOCKET"
-        "backend <= KSD_BACKEND_GENERIC"
+        "backend <= KSD_BACKEND_X11"
         "ksd_capture_worker_execute")
     string(FIND "${authority}" "${required}" position)
     if(position EQUAL -1)

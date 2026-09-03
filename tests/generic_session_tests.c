@@ -24,6 +24,22 @@ int ksd_authority_test_generic_session(int descriptor,
                                        const char *persistent_directory,
                                        const char *runtime_directory);
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
+bool ksd_authority_test_backend_matches(uint32_t backend, pid_t pid);
+bool ksd_session_is_x11_process(pid_t pid);
+
+/* GENERIC is exempt from the session cross-check because it means "no
+ * compositor this service knows". X11 must NOT be exempt the same way, or a
+ * Wayland session could register as X11 and keep the registration. The row
+ * is vacuous when the tests themselves run on an X11 session, and is not on
+ * this machine or in CI. */
+static void check_backend_cross_check(void)
+{
+    pid_t self = getpid();
+    assert(ksd_authority_test_backend_matches(KSD_BACKEND_GENERIC, self));
+    assert(ksd_authority_test_backend_matches(KSD_BACKEND_X11, self)
+           == ksd_session_is_x11_process(self));
+}
+
 int ksd_provider_test_capture_memfd(uint32_t width, uint32_t height,
                                     const uint8_t *data, size_t length);
 bool ksd_capture_tail_valid(const void *tail, uint32_t tail_length);
@@ -351,6 +367,7 @@ int main(void)
                        0u, NULL) == KSD_STATUS_UNAVAILABLE);
 
     check_assembly_budget();
+    check_backend_cross_check();
     check_capture_mask_matches_dispatch();
     check_capture_memfd_is_sealed();
     check_capture_budget();

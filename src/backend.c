@@ -111,19 +111,48 @@ ksd_backend ksd_backend_resolve(void)
         return KSD_BACKEND_GNOME;
     if (name_has_owner("io.github.keysharp.CinnamonShell"))
         return KSD_BACKEND_CINNAMON;
+    /* Last, for now. A provider that is present still answers, so an existing
+     * GNOME-on-X11 or Cinnamon-on-X11 user keeps exactly what they had; this
+     * only replaces the generic backend on an X11 session with no provider. */
+    if (ksd_session_is_x11_process(getpid()))
+        return KSD_BACKEND_X11;
     return KSD_BACKEND_NONE;
 }
 
-ksd_backend ksd_backend_resolve_process(pid_t pid)
+typedef struct session_facts {
+    ksd_backend compositor;
+    bool session_type_x11;
+    bool wayland_display;
+} session_facts;
+
+static bool entry_value(const char *entry, size_t entry_length,
+                        const char *prefix, size_t prefix_length,
+                        const char **value)
+{
+    if (entry_length < prefix_length
+        || memcmp(entry, prefix, prefix_length) != 0)
+        return false;
+    *value = entry + prefix_length;
+    return true;
+}
+
+/* One walk of the environment, two answers. The compositor comes from
+ * XDG_CURRENT_DESKTOP as before; the session type is new and is read in the
+ * same pass rather than by opening /proc twice. */
+static bool read_session_facts(pid_t pid, session_facts *facts)
 {
     char path[64];
     char environment[64u * 1024u + 1u];
     int length = snprintf(path, sizeof(path), "/proc/%ld/environ", (long)pid);
+
+    facts->compositor = KSD_BACKEND_NONE;
+    facts->session_type_x11 = false;
+    facts->wayland_display = false;
     if (pid <= 0 || length <= 0 || (size_t)length >= sizeof(path))
-        return KSD_BACKEND_NONE;
+        return false;
     int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0)
-        return KSD_BACKEND_NONE;
+        return false;
     size_t offset = 0u;
     while (offset < sizeof(environment) - 1u) {
         ssize_t count = read(descriptor, environment + offset,
@@ -138,28 +167,52 @@ ksd_backend ksd_backend_resolve_process(pid_t pid)
     ssize_t overflow = read(descriptor, &extra, sizeof(extra));
     close(descriptor);
     if (overflow != 0)
-        return KSD_BACKEND_NONE;
+        return false;
     environment[offset] = '\0';
     for (size_t index = 0u; index < offset;) {
         const char *entry = environment + index;
         size_t remaining = offset - index;
         size_t entry_length = strnlen(entry, remaining);
+        const char *value;
+
         if (entry_length == remaining)
-            return KSD_BACKEND_NONE;
-        static const char prefix[] = "XDG_CURRENT_DESKTOP=";
-        if (entry_length >= sizeof(prefix) - 1u
-            && memcmp(entry, prefix, sizeof(prefix) - 1u) == 0) {
-            const char *desktop = entry + sizeof(prefix) - 1u;
-            if (strcasestr(desktop, "KDE") != NULL)
-                return KSD_BACKEND_KWIN;
-            if (strcasestr(desktop, "Cinnamon") != NULL)
-                return KSD_BACKEND_CINNAMON;
-            if (strcasestr(desktop, "GNOME") != NULL)
-                return KSD_BACKEND_GNOME;
+            return false;
+        if (entry_value(entry, entry_length, "XDG_CURRENT_DESKTOP=", 20u,
+                        &value)
+            && facts->compositor == KSD_BACKEND_NONE) {
+            if (strcasestr(value, "KDE") != NULL)
+                facts->compositor = KSD_BACKEND_KWIN;
+            else if (strcasestr(value, "Cinnamon") != NULL)
+                facts->compositor = KSD_BACKEND_CINNAMON;
+            else if (strcasestr(value, "GNOME") != NULL)
+                facts->compositor = KSD_BACKEND_GNOME;
         }
+        /* A whole-value match. XDG_SESSION_TYPE=x11-fallback is not an X11
+         * session, and a substring test would call it one. */
+        if (entry_value(entry, entry_length, "XDG_SESSION_TYPE=", 17u, &value))
+            facts->session_type_x11 = strcasecmp(value, "x11") == 0;
+        if (entry_value(entry, entry_length, "WAYLAND_DISPLAY=", 16u, &value))
+            facts->wayland_display = value[0] != '\0';
         index += entry_length + 1u;
     }
-    return KSD_BACKEND_NONE;
+    return true;
+}
+
+ksd_backend ksd_backend_resolve_process(pid_t pid)
+{
+    session_facts facts;
+    if (!read_session_facts(pid, &facts))
+        return KSD_BACKEND_NONE;
+    return facts.compositor;
+}
+
+bool ksd_session_is_x11_process(pid_t pid)
+{
+    session_facts facts;
+    /* DISPLAY is not consulted. XWayland sets it on nearly every Wayland
+     * session, so consulting it would call those sessions X11. */
+    return read_session_facts(pid, &facts)
+        && facts.session_type_x11 && !facts.wayland_display;
 }
 
 bool ksd_backend_session_unsupported(void)
@@ -169,7 +222,7 @@ bool ksd_backend_session_unsupported(void)
 
 uint64_t ksd_backend_operations(ksd_backend backend)
 {
-    if (backend == KSD_BACKEND_GENERIC)
+    if (backend == KSD_BACKEND_GENERIC || backend == KSD_BACKEND_X11)
         return 0u;
     if (backend == KSD_BACKEND_KWIN)
         return KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW;

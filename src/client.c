@@ -250,6 +250,7 @@ const char *ksd_backend_name(ksd_backend backend)
         case KSD_BACKEND_GNOME: return "gnome";
         case KSD_BACKEND_CINNAMON: return "cinnamon";
         case KSD_BACKEND_GENERIC: return "generic";
+        case KSD_BACKEND_X11: return "x11";
         default: return "unknown";
     }
 }

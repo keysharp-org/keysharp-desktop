@@ -103,7 +103,8 @@ int main(void)
     assert(strcmp(ksd_backend_name(KSD_BACKEND_GNOME), "gnome") == 0);
     assert(strcmp(ksd_backend_name(KSD_BACKEND_NONE), "none") == 0);
     assert(strcmp(ksd_backend_name(KSD_BACKEND_GENERIC), "generic") == 0);
-    assert(strcmp(ksd_backend_name(KSD_BACKEND_GENERIC + 1u),
+    assert(strcmp(ksd_backend_name(KSD_BACKEND_X11), "x11") == 0);
+    assert(strcmp(ksd_backend_name(KSD_BACKEND_X11 + 1u),
                   "unknown") == 0);
     assert(ksd_scope_name(0x00000100u) == NULL);
     assert(KSD_SCOPE_ALL == 0x000000ffu);

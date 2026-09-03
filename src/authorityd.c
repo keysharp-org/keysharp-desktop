@@ -306,7 +306,7 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
                           (long)peer->pid);
     return peer->uid != 0u && peer->pid > 0
         && backend >= KSD_BACKEND_KWIN
-        && backend <= KSD_BACKEND_GENERIC
+        && backend <= KSD_BACKEND_X11
         && length > 0 && (size_t)length < sizeof(proc_path)
         && stat("/proc/self/exe", &authority_status) == 0
         && stat(proc_path, &peer_status) == 0
@@ -364,6 +364,26 @@ static void unregister_backend(authority_state *state, uid_t uid,
     pthread_mutex_unlock(&state->mutex);
 }
 
+/* A registration is only honoured while the process still looks like what it
+ * registered as. GENERIC is the one exemption, because it means precisely "no
+ * compositor this service knows"; X11 is NOT exempt, it is checked against the
+ * session type, or a Wayland session could register as X11 and keep it. */
+static bool backend_matches_session(uint32_t backend, pid_t pid)
+{
+    if (backend == KSD_BACKEND_GENERIC)
+        return true;
+    if (backend == KSD_BACKEND_X11)
+        return ksd_session_is_x11_process(pid);
+    return ksd_backend_resolve_process(pid) == backend;
+}
+
+#ifdef KSD_AUTHORITY_TESTING
+bool ksd_authority_test_backend_matches(uint32_t backend, pid_t pid)
+{
+    return backend_matches_session(backend, pid);
+}
+#endif
+
 static pid_t registered_backend_pid(authority_state *state, uid_t uid)
 {
     pid_t pid = -1;
@@ -398,8 +418,7 @@ static uint32_t registered_backend(authority_state *state, uid_t uid)
     ksp_identity verified;
     if (ksp_identity_revalidate(&expected, &verified) != 0
         || !same_identity(&expected, &verified)
-        || (backend != KSD_BACKEND_GENERIC
-            && ksd_backend_resolve_process(expected.pid) != backend))
+        || !backend_matches_session(backend, expected.pid))
         return KSD_BACKEND_NONE;
     pthread_mutex_lock(&state->mutex);
     uint32_t result = KSD_BACKEND_NONE;
