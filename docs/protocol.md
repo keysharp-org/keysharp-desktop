@@ -55,7 +55,13 @@ queued, because a caller that would rather do something else should not be made
 to wait to find out. Only the two capture opcodes consult this budget, so a
 capture in flight does not delay a window, clipboard or pointer request. Each
 reservation is the worst case a capture may return, not what it does return, so
-the bound is deliberately pessimistic.
+the bound is deliberately pessimistic in that direction. It is optimistic in
+another: a reservation counts the returned bytes once, while the operation
+result and the response payload are both live from the moment the response is
+built until the write to the client completes, so the real peak is about twice
+the reservation. The reservation is also held across that write, and the send
+timeout is long, so a client that reads slowly holds its slot for as long as it
+takes to drain.
 
 Framing is strict; vocabulary is not. The client library carries an
 unrecognized backend value and unrecognized operation bits through to its
