@@ -1,14 +1,17 @@
 #include "provider.h"
 
 #include "protocol.h"
+#include "transport.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <gio/gio.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -457,6 +460,31 @@ static void provider_error(ksd_operation_result *result, GError *error)
         g_error_free(error);
 }
 
+static int sealed_capture_memfd(uint32_t width, uint32_t height,
+                                const uint8_t *data, size_t length)
+{
+    uint8_t header[20];
+    int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    int descriptor = memfd_create("keysharp-desktop-capture",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+
+    if (descriptor < 0)
+        return -1;
+    ksd_encode_u16(header, KSD_CAPTURE_FORMAT_PNG);
+    ksd_encode_u16(header + 2u, 0u);
+    ksd_encode_u32(header + 4u, width);
+    ksd_encode_u32(header + 8u, height);
+    ksd_encode_u32(header + 12u, 0u);
+    ksd_encode_u32(header + 16u, (uint32_t)length);
+    if (!ksd_write_all(descriptor, header, sizeof header)
+        || !ksd_write_all(descriptor, data, length)
+        || fcntl(descriptor, F_ADD_SEALS, seals) != 0) {
+        close(descriptor);
+        return -1;
+    }
+    return descriptor;
+}
+
 static bool buffer_to_result(ksd_buffer *buffer, ksd_operation_result *result)
 {
     if (buffer->length > UINT32_MAX)
@@ -500,7 +528,6 @@ static void capture_result(GVariant *reply, GError *error,
     gsize length = 0u;
     uint32_t width;
     uint32_t height;
-    ksd_buffer tail;
 
     if (reply == NULL) {
         provider_error(result, error);
@@ -516,17 +543,12 @@ static void capture_result(GVariant *reply, GError *error,
             0u, "desktop provider returned an invalid PNG capture");
         goto done;
     }
-    ksd_buffer_init(&tail, KSD_MAX_CAPTURE_BYTES + 20u);
-    if (!ksd_buffer_u16(&tail, KSD_CAPTURE_FORMAT_PNG)
-        || !ksd_buffer_u16(&tail, 0u)
-        || !ksd_buffer_u32(&tail, width)
-        || !ksd_buffer_u32(&tail, height)
-        || !ksd_buffer_u32(&tail, 0u)
-        || !ksd_buffer_u32(&tail, (uint32_t)length)
-        || !ksd_buffer_bytes(&tail, data, (size_t)length)
-        || !buffer_to_result(&tail, result))
-        ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "out of memory");
-    ksd_buffer_clear(&tail);
+    int payload_fd = sealed_capture_memfd(width, height, data, (size_t)length);
+    if (payload_fd < 0
+        || !ksd_result_take_fd(result, payload_fd,
+                               (uint32_t)(20u + (size_t)length)))
+        ksd_result_error(result, KSD_STATUS_INTERNAL, 0u,
+                         "capture buffer is unavailable");
 
 done:
     g_variant_unref(bytes);
@@ -1162,6 +1184,14 @@ static void execute_pointer(uid_t uid, ksd_backend backend,
     }
     boolean_result(reply, error, result);
 }
+
+#ifdef KSD_AUTHORITY_TESTING
+int ksd_provider_test_capture_memfd(uint32_t width, uint32_t height,
+                                    const uint8_t *data, size_t length)
+{
+    return sealed_capture_memfd(width, height, data, length);
+}
+#endif
 
 void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
                           const ksd_frame *request,

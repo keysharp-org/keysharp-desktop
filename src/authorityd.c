@@ -509,6 +509,22 @@ static bool forward_public(authority_session *session,
         && ksd_frame_write(session->client_fd, public_frame);
 }
 
+/* A capture answers with a sealed memfd instead of a payload, so the pixels
+ * are never written through the socket and never copied into a response. */
+static bool forward_capture(authority_session *session,
+                            const ksd_frame *request,
+                            const ksd_operation_result *result)
+{
+    ksd_frame response;
+    if (!build_response(request, result->status, result->detail, NULL,
+                        NULL, 0u, false, &response))
+        return false;
+    bool ok = ksd_frame_write_fd(session->client_fd, &response,
+                                 result->payload_fd);
+    ksd_frame_clear(&response);
+    return ok;
+}
+
 static bool forward_response(authority_session *session,
                              const ksd_frame *request,
                              uint32_t status, uint32_t detail,
@@ -1156,6 +1172,8 @@ static bool execute_operation(authority_session *session,
                                 ? "application identity or backend changed"
                                 : "permission changed during the operation",
                               NULL, 0u, false);
+    else if (result.payload_fd >= 0)
+        ok = forward_capture(session, request, &result);
     else
         ok = forward_response(session, request, result.status, result.detail,
             result.status == KSD_STATUS_OK || result.diagnostic[0] == '\0'

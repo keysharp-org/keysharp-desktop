@@ -404,19 +404,25 @@ static bool receive_worker_response(int descriptor,
         return false;
     }
     if (status == KSD_STATUS_OK) {
-        uint8_t *tail = malloc(tail_length);
-        if (diagnostic_length != 0u || tail == NULL
-            || !sealed_capture_file(payload_fd, tail_length)
-            || lseek(payload_fd, 0, SEEK_SET) < 0
-            || !ksd_read_all(payload_fd, tail, tail_length)
-            || !ksd_capture_tail_valid(tail, tail_length)
-            || !ksd_result_take(result, tail, tail_length)) {
-            free(tail);
+        if (diagnostic_length != 0u
+            || !sealed_capture_file(payload_fd, tail_length)) {
+            if (payload_fd >= 0)
+                close(payload_fd);
+            return false;
+        }
+        void *mapped = mmap(NULL, tail_length, PROT_READ, MAP_PRIVATE,
+                            payload_fd, 0);
+        if (mapped == MAP_FAILED) {
             close(payload_fd);
             return false;
         }
-        close(payload_fd);
-        return true;
+        bool shaped = ksd_capture_tail_valid(mapped, tail_length);
+        munmap(mapped, tail_length);
+        if (!shaped) {
+            close(payload_fd);
+            return false;
+        }
+        return ksd_result_take_fd(result, payload_fd, tail_length);
     }
     if (payload_fd >= 0 || tail_length != 0u) {
         if (payload_fd >= 0)

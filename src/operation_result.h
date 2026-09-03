@@ -12,6 +12,11 @@ typedef struct ksd_operation_result {
     char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
     uint8_t *tail;
     uint32_t tail_length;
+    /* A capture answers with its bytes in a sealed memfd rather than in tail,
+     * so they are never copied into the response. -1 when the result carries
+     * none, which is every operation but a capture. Exactly one of tail and
+     * payload_fd is ever set. */
+    int payload_fd;
 } ksd_operation_result;
 
 void ksd_result_init(ksd_operation_result *result);
@@ -22,5 +27,9 @@ bool ksd_result_take(ksd_operation_result *result, uint8_t *tail,
                      uint32_t tail_length);
 bool ksd_result_copy(ksd_operation_result *result, const void *tail,
                      uint32_t tail_length);
+/* Takes ownership of payload_fd, which must be sealed and hold exactly
+ * tail_length bytes. */
+bool ksd_result_take_fd(ksd_operation_result *result, int payload_fd,
+                        uint32_t tail_length);
 
 #endif

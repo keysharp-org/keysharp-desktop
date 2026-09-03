@@ -3,8 +3,11 @@
 #include "protocol_io.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -139,6 +142,52 @@ static void check_hello_tail_compatibility(void)
                                              &operations, &backend));
 }
 
+/* A capture arrives as a sealed memfd, never as payload bytes. The contents
+ * only have to satisfy parse_capture_tail, which checks the 20-byte header and
+ * the declared length; it does not decode the image. */
+static int capture_memfd(uint32_t width, uint32_t height,
+                         uint32_t byte_length, bool seal)
+{
+    uint8_t header[20] = { 0 };
+    uint8_t *pixels = calloc(byte_length, 1u);
+    int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    int descriptor = memfd_create("keysharp-desktop-test",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    assert(pixels != NULL && descriptor >= 0);
+    ksd_encode_u16(header, KSD_CAPTURE_FORMAT_PNG);
+    ksd_encode_u32(header + 4u, width);
+    ksd_encode_u32(header + 8u, height);
+    ksd_encode_u32(header + 16u, byte_length);
+    assert(write(descriptor, header, sizeof(header)) == (ssize_t)sizeof(header));
+    assert(write(descriptor, pixels, byte_length) == (ssize_t)byte_length);
+    free(pixels);
+    if (seal)
+        assert(fcntl(descriptor, F_ADD_SEALS, seals) == 0);
+    return descriptor;
+}
+
+static void write_capture_response(int descriptor, const ksd_frame *request,
+                                   int payload_fd)
+{
+    uint8_t payload[8] = { 0 };
+    ksd_encode_u32(payload, KSD_STATUS_OK);
+    ksd_frame response = {
+        .magic = {
+            KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+            KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+        },
+        .major = KSD_PROTOCOL_MAJOR,
+        .minor = KSD_PROTOCOL_MINOR,
+        .opcode = request->opcode,
+        .flags = KSD_FLAG_RESPONSE,
+        .request_id = request->request_id,
+        .payload = payload,
+        .payload_length = (uint32_t)sizeof(payload),
+    };
+    assert(ksd_frame_write_fd(descriptor, &response, payload_fd));
+    assert(close(payload_fd) == 0);
+}
+
 int main(void)
 {
     int sockets[2];
@@ -171,6 +220,20 @@ int main(void)
     write_permission_entry(sockets[1], &future_list_request, "/future",
                            KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE, 3u);
     write_ok_response(sockets[1], &future_list_request, NULL, 0u, false);
+
+    ksd_frame capture_request = {
+        .opcode = KSD_OP_CAPTURE_AREA,
+        .request_id = 4u,
+    };
+    write_capture_response(sockets[1], &capture_request,
+                           capture_memfd(2u, 2u, 64u, true));
+
+    ksd_frame unsealed_request = {
+        .opcode = KSD_OP_CAPTURE_AREA,
+        .request_id = 5u,
+    };
+    write_capture_response(sockets[1], &unsealed_request,
+                           capture_memfd(2u, 2u, 64u, false));
 
     check_hello_tail_compatibility();
 
@@ -243,6 +306,26 @@ int main(void)
     assert(ksd_permissions_list(connection, accept_future_permission,
                                 &future, &error) == KSD_STATUS_OK);
     assert(future.calls == 1u);
+
+    /* The pixels travel in the descriptor, so the response payload carries
+     * none of them and the client reads them out of the mapping. */
+    ksd_capture received;
+    ksd_capture_init(&received);
+    ksd_error_init(&error);
+    assert(ksd_capture_area(connection, 0, 0, 2u, 2u, &received, &error)
+           == KSD_STATUS_OK);
+    assert(received.width == 2u && received.height == 2u);
+    assert(received.data.length == 64u && received.data.data != NULL);
+    ksd_capture_clear(&received);
+
+    /* An unsealed descriptor could be rewritten after its length was agreed,
+     * so it is refused rather than mapped. */
+    ksd_capture unsealed;
+    ksd_capture_init(&unsealed);
+    ksd_error_init(&error);
+    assert(ksd_capture_area(connection, 0, 0, 2u, 2u, &unsealed, &error)
+           != KSD_STATUS_OK);
+    ksd_capture_clear(&unsealed);
 
     ksd_disconnect(connection);
     close(sockets[1]);

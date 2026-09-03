@@ -3,6 +3,7 @@
 #include "protocol_io.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -21,6 +22,31 @@ int ksd_authority_test_generic_session(int descriptor,
                                        const char *persistent_directory,
                                        const char *runtime_directory);
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
+int ksd_provider_test_capture_memfd(uint32_t width, uint32_t height,
+                                    const uint8_t *data, size_t length);
+bool ksd_capture_tail_valid(const void *tail, uint32_t tail_length);
+
+/* The capture descriptor handed to a client must be sealed against every
+ * kind of change. Unsealed, a peer could rewrite the pixels after their
+ * length had been agreed, and the client maps it read-only expecting not to
+ * have to re-check. */
+static void check_capture_memfd_is_sealed(void)
+{
+    static const uint8_t png[] = { 0x89u, 0x50u, 0x4eu, 0x47u, 0u, 1u, 2u, 3u };
+    int required = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    int descriptor = ksd_provider_test_capture_memfd(4u, 4u, png,
+                                                     sizeof(png));
+    assert(descriptor >= 0);
+
+    int seals = fcntl(descriptor, F_GET_SEALS);
+    assert(seals >= 0 && (seals & required) == required);
+
+    uint8_t tail[20u + sizeof(png)];
+    assert(pread(descriptor, tail, sizeof(tail), 0)
+           == (ssize_t)sizeof(tail));
+    assert(ksd_capture_tail_valid(tail, (uint32_t)sizeof(tail)));
+    assert(close(descriptor) == 0);
+}
 int ksd_authority_test_capture_budget(unsigned int uid, int reserve);
 
 static void check_capture_budget(void)
@@ -280,6 +306,7 @@ int main(void)
                        0u, NULL) == KSD_STATUS_UNAVAILABLE);
 
     check_assembly_budget();
+    check_capture_memfd_is_sealed();
     check_capture_budget();
 
     assert(close(sockets[0]) == 0);

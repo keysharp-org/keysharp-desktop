@@ -6,6 +6,7 @@
 #include "client_status.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <keysharp_permissions/permissions.h>
 #include <limits.h>
 #include <poll.h>
@@ -14,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -71,6 +74,13 @@ typedef struct ksd_client_response {
     uint32_t detail;
     const uint8_t *tail;
     uint32_t tail_length;
+    /* A capture arrives as a sealed memfd rather than in the payload, so its
+     * bytes are never copied through the socket. mapped points into that
+     * descriptor once it has been checked; both are released with the
+     * response. */
+    int payload_fd;
+    void *mapped;
+    size_t mapped_length;
 } ksd_client_response;
 
 static const uint8_t client_magic[4] = {
@@ -611,9 +621,45 @@ static bool parse_response(const ksd_frame *frame, uint16_t opcode,
 static void response_clear(ksd_client_response *response)
 {
     if (response != NULL) {
+        if (response->mapped != NULL)
+            munmap(response->mapped, response->mapped_length);
+        if (response->payload_fd >= 0)
+            close(response->payload_fd);
         ksd_frame_clear(&response->frame);
         memset(response, 0, sizeof(*response));
+        response->payload_fd = -1;
     }
+}
+
+/* The service may only ever hand over a descriptor that cannot change under
+ * the caller: unsealed, it could be rewritten after its length was agreed. */
+static bool sealed_capture_descriptor(int descriptor, size_t *length)
+{
+    struct stat status;
+    int required = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    int seals = fcntl(descriptor, F_GET_SEALS);
+    if (descriptor < 0 || seals < 0 || (seals & required) != required
+        || fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)
+        || status.st_size < 20 || status.st_size > (off_t)KSD_MAX_CAPTURE_TAIL)
+        return false;
+    *length = (size_t)status.st_size;
+    return true;
+}
+
+static bool map_capture_payload(ksd_client_response *response)
+{
+    size_t length = 0u;
+    if (!sealed_capture_descriptor(response->payload_fd, &length))
+        return false;
+    void *mapped = mmap(NULL, length, PROT_READ, MAP_PRIVATE,
+                        response->payload_fd, 0);
+    if (mapped == MAP_FAILED)
+        return false;
+    response->mapped = mapped;
+    response->mapped_length = length;
+    response->tail = mapped;
+    response->tail_length = (uint32_t)length;
+    return true;
 }
 
 static ksd_status read_response_locked(ksd_connection *connection,
@@ -628,13 +674,16 @@ static ksd_status read_response_locked(ksd_connection *connection,
                                    connection->request_deadline_ms))
             return system_failure(connection, error,
                                   "desktop service response timed out");
-        int received = ksd_frame_read(connection->descriptor, client_magic,
+        int payload_fd = -1;
+        int received = ksd_frame_read_fd(connection->descriptor, client_magic,
             KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_CLIENT_MAX_RESPONSE,
-            true, &frame);
+            true, &frame, &payload_fd);
         if (received != 1)
             return system_failure(connection, error,
                                   "desktop service response failed");
         if ((frame.flags & KSD_FLAG_EVENT) != 0u) {
+            if (payload_fd >= 0)
+                close(payload_fd);
             bool valid = apply_revoked_event(connection, &frame, NULL);
             ksd_frame_clear(&frame);
             if (!valid) {
@@ -646,6 +695,7 @@ static ksd_status read_response_locked(ksd_connection *connection,
         }
         memset(response, 0, sizeof(*response));
         response->frame = frame;
+        response->payload_fd = payload_fd;
         if (!parse_response(&response->frame, opcode, request_id,
                             response, error)) {
             response_clear(response);
@@ -1354,6 +1404,7 @@ static ksd_status request_capture(ksd_connection *connection,
     ksd_capture parsed;
     ksd_capture_init(&parsed);
     if ((response.frame.flags & KSD_FLAG_MORE) != 0u
+        || response.payload_fd < 0 || !map_capture_payload(&response)
         || !parse_capture_tail(response.tail, response.tail_length, &parsed)) {
         ksd_capture_clear(&parsed);
         return invalid_response(connection, &response, error,

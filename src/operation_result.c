@@ -5,11 +5,20 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 void ksd_result_init(ksd_operation_result *result)
 {
     memset(result, 0, sizeof(*result));
     result->status = KSD_STATUS_INTERNAL;
+    result->payload_fd = -1;
+}
+
+static void release_payload_fd(ksd_operation_result *result)
+{
+    if (result->payload_fd >= 0)
+        close(result->payload_fd);
+    result->payload_fd = -1;
 }
 
 void ksd_result_clear(ksd_operation_result *result)
@@ -17,6 +26,7 @@ void ksd_result_clear(ksd_operation_result *result)
     if (result == NULL)
         return;
     free(result->tail);
+    release_payload_fd(result);
     ksd_result_init(result);
 }
 
@@ -26,6 +36,7 @@ void ksd_result_error(ksd_operation_result *result, uint32_t status,
     if (result == NULL)
         return;
     free(result->tail);
+    release_payload_fd(result);
     result->tail = NULL;
     result->tail_length = 0u;
     result->status = status;
@@ -52,11 +63,31 @@ bool ksd_result_take(ksd_operation_result *result, uint8_t *tail,
         return false;
     }
     free(result->tail);
+    release_payload_fd(result);
     result->status = KSD_STATUS_OK;
     result->detail = 0u;
     result->diagnostic[0] = '\0';
     result->tail = tail;
     result->tail_length = tail_length;
+    return true;
+}
+
+bool ksd_result_take_fd(ksd_operation_result *result, int payload_fd,
+                        uint32_t tail_length)
+{
+    if (result == NULL || payload_fd < 0 || tail_length == 0u) {
+        if (payload_fd >= 0)
+            close(payload_fd);
+        return false;
+    }
+    free(result->tail);
+    release_payload_fd(result);
+    result->status = KSD_STATUS_OK;
+    result->detail = 0u;
+    result->diagnostic[0] = '\0';
+    result->tail = NULL;
+    result->tail_length = tail_length;
+    result->payload_fd = payload_fd;
     return true;
 }
 
