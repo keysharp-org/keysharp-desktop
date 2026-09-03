@@ -103,7 +103,9 @@ target_link_libraries(keysharp-desktop-capture PUBLIC
 pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb>=1.14)
 add_library(keysharp-desktop-x11 STATIC
     src/x11/x11_display.c
-    src/x11/x11_connect.c)
+    src/x11/x11_connect.c
+    src/x11/x11_query.c
+    src/x11/x11_windows.c)
 target_include_directories(keysharp-desktop-x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -326,7 +328,8 @@ if(BUILD_TESTING)
     add_test(NAME x11-display-tests COMMAND x11-display-tests)
 
     add_executable(x11-server-tests tests/x11_server_tests.c)
-    target_link_libraries(x11-server-tests PRIVATE keysharp-desktop-x11)
+    target_link_libraries(x11-server-tests PRIVATE
+        keysharp-desktop-x11 keysharp-desktop-common)
     add_test(NAME x11-server-tests
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
             $<TARGET_FILE:x11-server-tests>)

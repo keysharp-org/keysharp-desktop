@@ -2,12 +2,10 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "x11_connect_internal.h"
+
 #include <xcb/xcb.h>
 
-struct ksd_x11 {
-    xcb_connection_t *connection;
-    xcb_screen_t *screen;
-};
 
 /* xcb latches a connection error and no-ops every later call, which is the
  * shape this service already wants: one unavailable answer rather than a

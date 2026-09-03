@@ -1,0 +1,238 @@
+#include "x11_internal.h"
+
+#include "protocol.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static xcb_atom_t intern(xcb_connection_t *c, const char *name)
+{
+    /* only_if_exists. Interning with creation would add every EWMH name to
+     * the atom table of a server that has no window manager, and would make a
+     * property that cannot exist look merely empty. */
+    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(c, 1,
+        (uint16_t)strlen(name), name);
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c, cookie, NULL);
+    xcb_atom_t atom = XCB_ATOM_NONE;
+
+    if (reply != NULL) {
+        atom = reply->atom;
+        free(reply);
+    }
+    return atom;
+}
+
+void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
+{
+    atoms->client_list = intern(c, "_NET_CLIENT_LIST");
+    atoms->active_window = intern(c, "_NET_ACTIVE_WINDOW");
+    atoms->work_area = intern(c, "_NET_WORKAREA");
+    atoms->current_desktop = intern(c, "_NET_CURRENT_DESKTOP");
+    atoms->wm_desktop = intern(c, "_NET_WM_DESKTOP");
+    atoms->wm_name = intern(c, "_NET_WM_NAME");
+    atoms->wm_pid = intern(c, "_NET_WM_PID");
+    atoms->wm_state = intern(c, "_NET_WM_STATE");
+    atoms->state_hidden = intern(c, "_NET_WM_STATE_HIDDEN");
+    atoms->state_above = intern(c, "_NET_WM_STATE_ABOVE");
+    atoms->state_max_vert = intern(c, "_NET_WM_STATE_MAXIMIZED_VERT");
+    atoms->state_max_horz = intern(c, "_NET_WM_STATE_MAXIMIZED_HORZ");
+    atoms->frame_extents = intern(c, "_NET_FRAME_EXTENTS");
+    atoms->opacity = intern(c, "_NET_WM_WINDOW_OPACITY");
+    atoms->utf8_string = intern(c, "UTF8_STRING");
+}
+
+xcb_get_property_reply_t *ksd_x11_property(xcb_connection_t *c,
+                                           xcb_window_t window,
+                                           xcb_atom_t name, xcb_atom_t type,
+                                           uint32_t words)
+{
+    xcb_get_property_reply_t *reply;
+
+    if (name == XCB_ATOM_NONE)
+        return NULL;
+    reply = xcb_get_property_reply(c,
+        xcb_get_property(c, 0, window, name, type, 0u, words), NULL);
+    /* A property that is not set answers with a reply whose type is None, not
+     * with no reply. Reporting that as an empty value would turn "this server
+     * has no window manager" into "this session has no windows". */
+    if (reply != NULL && reply->type == XCB_ATOM_NONE) {
+        free(reply);
+        return NULL;
+    }
+    return reply;
+}
+
+bool ksd_x11_cardinal(xcb_connection_t *c, xcb_window_t window,
+                      xcb_atom_t name, uint32_t *value)
+{
+    xcb_get_property_reply_t *reply = ksd_x11_property(c, window, name,
+                                                       XCB_ATOM_ANY, 1u);
+    bool ok = false;
+
+    if (reply != NULL) {
+        if (xcb_get_property_value_length(reply) >= 4) {
+            memcpy(value, xcb_get_property_value(reply), sizeof(*value));
+            ok = true;
+        }
+        free(reply);
+    }
+    return ok;
+}
+
+bool ksd_x11_has_state(xcb_connection_t *c, const x11_atoms *atoms,
+                       xcb_window_t window, xcb_atom_t wanted)
+{
+    xcb_get_property_reply_t *reply;
+    bool found = false;
+
+    if (wanted == XCB_ATOM_NONE)
+        return false;
+    reply = ksd_x11_property(c, window, atoms->wm_state, XCB_ATOM_ATOM, 64u);
+    if (reply == NULL)
+        return false;
+    int length = xcb_get_property_value_length(reply);
+    const xcb_atom_t *states = xcb_get_property_value(reply);
+    size_t count = length > 0 ? (size_t)length / sizeof(xcb_atom_t) : 0u;
+    for (size_t index = 0u; index < count && !found; index++)
+        found = states[index] == wanted;
+    free(reply);
+    return found;
+}
+
+static bool append_json_string(ksd_buffer *out, const char *value,
+                               size_t length)
+{
+    if (!ksd_buffer_bytes(out, "\"", 1u))
+        return false;
+    for (size_t index = 0u; index < length; index++) {
+        unsigned char byte = (unsigned char)value[index];
+        char escaped[8];
+        size_t pieces = 1u;
+
+        if (byte == 34u || byte == 92u) {
+            escaped[0] = '\\';
+            escaped[1] = (char)byte;
+            pieces = 2u;
+        } else if (byte < 32u || byte == 127u) {
+            int written = snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
+            if (written != 6)
+                return false;
+            pieces = 6u;
+        } else {
+            escaped[0] = (char)byte;
+        }
+        if (!ksd_buffer_bytes(out, escaped, pieces))
+            return false;
+    }
+    return ksd_buffer_bytes(out, "\"", 1u);
+}
+
+bool ksd_x11_append_text(ksd_buffer *out, xcb_connection_t *c,
+                         xcb_window_t window, xcb_atom_t name,
+                         xcb_atom_t type)
+{
+    xcb_get_property_reply_t *reply = ksd_x11_property(c, window, name, type,
+                                                       KSD_X11_MAX_TEXT / 4u);
+    bool ok;
+
+    if (reply == NULL)
+        return append_json_string(out, "", 0u);
+    int raw = xcb_get_property_value_length(reply);
+    const char *value = xcb_get_property_value(reply);
+    size_t length = raw > 0 ? (size_t)raw : 0u;
+
+    if (length > KSD_X11_MAX_TEXT)
+        length = KSD_X11_MAX_TEXT;
+    /* WM_CLASS is two NUL-separated strings. Stopping at the first NUL yields
+     * the instance name, which is what the providers report as the app id. */
+    for (size_t index = 0u; index < length; index++)
+        if (value[index] == 0) {
+            length = index;
+            break;
+        }
+    while (length != 0u
+        && !ksd_utf8_valid((const uint8_t *)value, length, false))
+        length--;
+    ok = append_json_string(out, value, length);
+    free(reply);
+    return ok;
+}
+
+static void numeric_result(ksd_operation_result *result,
+                           const uint32_t *values, size_t count)
+{
+    uint8_t encoded[16];
+
+    if (count > 4u) {
+        ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "bad reply");
+        return;
+    }
+    for (size_t index = 0u; index < count; index++)
+        ksd_encode_u32(encoded + index * 4u, values[index]);
+    if (!ksd_result_copy(result, encoded, (uint32_t)(count * 4u)))
+        ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "out of memory");
+}
+
+void ksd_x11_cursor_position(ksd_x11 *connection, ksd_operation_result *result)
+{
+    xcb_query_pointer_reply_t *reply = xcb_query_pointer_reply(
+        connection->connection,
+        xcb_query_pointer(connection->connection, connection->screen->root),
+        NULL);
+    uint32_t values[2];
+
+    if (reply == NULL) {
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "the X server did not report the pointer");
+        return;
+    }
+    /* Widened from int16 and reinterpreted as the wire u32, which is exactly
+     * what the compositor providers put on the wire for this opcode. */
+    values[0] = (uint32_t)(int32_t)reply->root_x;
+    values[1] = (uint32_t)(int32_t)reply->root_y;
+    free(reply);
+    numeric_result(result, values, 2u);
+}
+
+void ksd_x11_work_area(ksd_x11 *connection, ksd_operation_result *result)
+{
+    x11_atoms atoms;
+    uint32_t desktop = 0u;
+    uint32_t values[4];
+
+    ksd_x11_load_atoms(connection->connection, &atoms);
+    (void)ksd_x11_cardinal(connection->connection, connection->screen->root,
+                           atoms.current_desktop, &desktop);
+    if (desktop > 1024u) {
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "the X server reported an implausible desktop");
+        return;
+    }
+
+    /* _NET_WORKAREA is four cardinals per desktop. A window manager that does
+     * not publish it leaves the screen itself as the answer, which is true on
+     * a bare session with no panels rather than a failure. */
+    xcb_get_property_reply_t *reply = ksd_x11_property(connection->connection,
+        connection->screen->root, atoms.work_area, XCB_ATOM_CARDINAL,
+        (desktop + 1u) * 4u);
+    int length = reply != NULL ? xcb_get_property_value_length(reply) : 0;
+    size_t needed = ((size_t)desktop + 1u) * 4u * sizeof(uint32_t);
+
+    if (reply != NULL && length > 0 && (size_t)length >= needed) {
+        const uint32_t *area = xcb_get_property_value(reply);
+        memcpy(values, area + (size_t)desktop * 4u, sizeof(values));
+    } else {
+        values[0] = 0u;
+        values[1] = 0u;
+        values[2] = connection->screen->width_in_pixels;
+        values[3] = connection->screen->height_in_pixels;
+    }
+    free(reply);
+    if (values[2] == 0u || values[3] == 0u) {
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "the X server reported an empty work area");
+        return;
+    }
+    numeric_result(result, values, 4u);
+}
