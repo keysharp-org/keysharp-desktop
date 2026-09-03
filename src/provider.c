@@ -665,9 +665,12 @@ static void execute_capture(uid_t uid, ksd_backend backend,
     GVariant *reply;
     ksd_cursor cursor;
     ksd_cursor_init(&cursor, request->payload, request->payload_length);
-    if (backend != KSD_BACKEND_GNOME
-        || (request->opcode != KSD_OP_CAPTURE_AREA
-            && request->opcode != KSD_OP_CAPTURE_WINDOW)) {
+    bool window = request->opcode == KSD_OP_CAPTURE_WINDOW;
+    bool area = request->opcode == KSD_OP_CAPTURE_AREA;
+    bool served = backend == KSD_BACKEND_GNOME
+        ? (area || window)
+        : (backend == KSD_BACKEND_CINNAMON && window);
+    if (!served) {
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
                          "capture is unavailable on this provider");
         return;
