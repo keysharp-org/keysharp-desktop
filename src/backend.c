@@ -220,10 +220,33 @@ bool ksd_backend_session_unsupported(void)
     return ksd_backend_resolve_process(getpid()) == KSD_BACKEND_NONE;
 }
 
+/* The coordinate group. These four move together or not at all: a caller that
+ * can enumerate windows but cannot ask where the pointer is, or can ask for
+ * the work area but not which window is active, falls back for the rest
+ * anyway, so shipping a subset buys nothing. */
+#define KSD_X11_COORDINATE_OPERATIONS \
+    (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
+     | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
+
+uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
+{
+    /* Off an X11 session there is no X server this worker may talk to, so no
+     * operation routes there whatever the compositor is. */
+    if (!x11_session)
+        return 0u;
+    if (backend != KSD_BACKEND_X11)
+        return 0u;
+    /* Never more than the backend advertises. Routing a bit outside the mask
+     * would serve an operation the client was told does not exist. */
+    return KSD_X11_COORDINATE_OPERATIONS & ksd_backend_operations(backend);
+}
+
 uint64_t ksd_backend_operations(ksd_backend backend)
 {
-    if (backend == KSD_BACKEND_GENERIC || backend == KSD_BACKEND_X11)
+    if (backend == KSD_BACKEND_GENERIC)
         return 0u;
+    if (backend == KSD_BACKEND_X11)
+        return KSD_X11_COORDINATE_OPERATIONS;
     if (backend == KSD_BACKEND_KWIN)
         return KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW;
     if (backend != KSD_BACKEND_GNOME && backend != KSD_BACKEND_CINNAMON)

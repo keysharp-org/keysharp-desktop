@@ -15,5 +15,10 @@ ksd_backend ksd_backend_resolve_process(pid_t pid);
 bool ksd_session_is_x11_process(pid_t pid);
 bool ksd_backend_session_unsupported(void);
 uint64_t ksd_backend_operations(ksd_backend backend);
+/* Which operations the X11 worker serves for a backend in a session type.
+ * Never more than that backend advertises, and always zero off an X11 session:
+ * "nothing changes on Wayland" is a property this function makes checkable
+ * rather than a promise made in prose. */
+uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session);
 
 #endif

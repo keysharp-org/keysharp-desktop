@@ -97,10 +97,22 @@ target_compile_definitions(keysharp-desktop-capture PUBLIC
 target_link_libraries(keysharp-desktop-capture PUBLIC
     keysharp-desktop-common PkgConfig::GIO)
 
+# Linked into the worker executable and nothing else. The whole argument that
+# root never touches X rests on this one edge, so it is a separate target
+# rather than a few files added to an existing library.
+add_library(keysharp-desktop-x11 STATIC
+    src/x11/x11_display.c)
+target_include_directories(keysharp-desktop-x11 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/x11)
+target_compile_definitions(keysharp-desktop-x11 PUBLIC
+    _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+
 add_executable(keysharp-desktop-capture-worker
     src/capture_worker_entry.c)
 target_link_libraries(keysharp-desktop-capture-worker PRIVATE
-    keysharp-desktop-capture)
+    keysharp-desktop-capture keysharp-desktop-x11)
 target_link_libraries(keysharp-desktop PRIVATE
     keysharp-desktop-common keysharp-desktop-client keysharp-desktop-capture
     PkgConfig::GIO Threads::Threads)
@@ -110,6 +122,7 @@ target_compile_definitions(keysharp-desktop PRIVATE
 
 foreach(target keysharp-desktop-wire keysharp-desktop-client
                keysharp-desktop-common keysharp-desktop-capture
+               keysharp-desktop-x11
                keysharp-desktop keysharp-desktop-capture-worker)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${target} PRIVATE
@@ -303,6 +316,10 @@ if(BUILD_TESTING)
         COMMAND capture-pipe-security-tests)
     set_tests_properties(capture-pipe-security-tests PROPERTIES
         SKIP_RETURN_CODE 77)
+
+    add_executable(x11-display-tests tests/x11_display_tests.c)
+    target_link_libraries(x11-display-tests PRIVATE keysharp-desktop-x11)
+    add_test(NAME x11-display-tests COMMAND x11-display-tests)
 
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE

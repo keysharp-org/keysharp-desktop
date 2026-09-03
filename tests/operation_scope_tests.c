@@ -164,7 +164,24 @@ int main(void)
             & KSD_OPERATION_CAPTURE_WINDOW) != 0u);
     assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
             & KSD_OPERATION_CAPTURE_AREA) == 0u);
-    for (uint32_t backend = KSD_BACKEND_GENERIC; backend <= 4096u; backend++)
+    /* X11 serves the coordinate group and nothing else yet. GENERIC and every
+     * value past the named ones stay at zero. */
+    assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
+    assert(ksd_backend_operations(KSD_BACKEND_X11) != 0u);
+    assert((ksd_backend_operations(KSD_BACKEND_X11)
+            & (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW))
+           == 0u);
+    for (uint32_t backend = KSD_BACKEND_X11 + 1u; backend <= 4096u; backend++)
         assert(ksd_backend_operations(backend) == 0u);
+
+    /* Routing never exceeds the mask, and is empty off an X11 session. This is
+     * what makes "nothing changes on Wayland" checkable rather than asserted. */
+    for (uint32_t backend = 0u; backend <= 4096u; backend++) {
+        uint64_t routed = ksd_backend_x11_route(backend, true);
+        assert((routed & ~ksd_backend_operations(backend)) == 0u);
+        assert(ksd_backend_x11_route(backend, false) == 0u);
+    }
+    assert(ksd_backend_x11_route(KSD_BACKEND_X11, true) != 0u);
+    assert(ksd_backend_x11_route(KSD_BACKEND_GNOME, true) == 0u);
     return 0;
 }
