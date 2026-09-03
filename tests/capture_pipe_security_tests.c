@@ -1,4 +1,5 @@
 #include "local_capture.h"
+#include "operation_result.h"
 #include "protocol.h"
 
 #include <assert.h>
@@ -174,6 +175,45 @@ static void verify_call_child_layout(uid_t uid, gid_t gid)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+bool ksd_capture_worker_test_round_trip(const ksd_operation_result *sent,
+                                        ksd_operation_result *received);
+bool ksd_capture_worker_test_scalar_ok_with_fd(
+    ksd_operation_result *received);
+
+/* A control verb answers OK with nothing to carry. Before this existed every
+ * OK demanded a sealed descriptor of at least twenty bytes, so no operation
+ * without a payload could be routed through the worker at all. */
+static void check_scalar_ok_round_trip(void)
+{
+    ksd_operation_result sent;
+    ksd_operation_result received;
+    ksd_result_init(&sent);
+    ksd_result_init(&received);
+    assert(ksd_result_take(&sent, NULL, 0u));
+    assert(ksd_capture_worker_test_round_trip(&sent, &received));
+    assert(received.status == KSD_STATUS_OK);
+    assert(received.tail == NULL && received.tail_length == 0u);
+    assert(received.payload_fd < 0);
+    ksd_result_clear(&sent);
+    ksd_result_clear(&received);
+
+    /* An error still round-trips its diagnostic and carries no descriptor. */
+    ksd_result_init(&sent);
+    ksd_result_init(&received);
+    ksd_result_error(&sent, KSD_STATUS_UNAVAILABLE, 0u, "no display");
+    assert(ksd_capture_worker_test_round_trip(&sent, &received));
+    assert(received.status == KSD_STATUS_UNAVAILABLE);
+    assert(strcmp(received.diagnostic, "no display") == 0);
+    assert(received.payload_fd < 0);
+    ksd_result_clear(&sent);
+    ksd_result_clear(&received);
+
+    /* An answer with no payload must not carry a descriptor. */
+    ksd_result_init(&received);
+    assert(!ksd_capture_worker_test_scalar_ok_with_fd(&received));
+    ksd_result_clear(&received);
+}
+
 int main(void)
 {
     uint8_t boundary[20] = { 0 };
@@ -183,6 +223,8 @@ int main(void)
     ksd_encode_u32(boundary + 16u, KSD_MAX_CAPTURE_BYTES);
     assert(ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL));
     assert(!ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL - 1u));
+
+    check_scalar_ok_round_trip();
 
     if (geteuid() != 0u || !yama_scope_is_one())
         return 77;

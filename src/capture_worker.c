@@ -403,6 +403,17 @@ static bool receive_worker_response(int descriptor,
             close(payload_fd);
         return false;
     }
+    if (status == KSD_STATUS_OK && tail_length == 0u) {
+        /* A control verb answers OK with nothing to carry. Accepting a
+         * descriptor here would let a worker attach one to an operation that
+         * has no payload, so it is refused rather than closed and ignored. */
+        if (diagnostic_length != 0u || payload_fd >= 0) {
+            if (payload_fd >= 0)
+                close(payload_fd);
+            return false;
+        }
+        return ksd_result_take(result, NULL, 0u);
+    }
     if (status == KSD_STATUS_OK) {
         if (diagnostic_length != 0u
             || !sealed_capture_file(payload_fd, tail_length)) {
@@ -454,8 +465,10 @@ static bool send_worker_response(int descriptor,
                    result->status == KSD_STATUS_OK ? result->tail_length : 0u);
     ksd_encode_u32(message + 20u, (uint32_t)diagnostic_length);
     memcpy(message + 24u, result->diagnostic, diagnostic_length);
-    if (result->status != KSD_STATUS_OK) {
+    if (result->status != KSD_STATUS_OK || result->tail_length == 0u) {
         ssize_t written;
+        if (result->status == KSD_STATUS_OK && result->tail != NULL)
+            return false;
         do {
             written = send(descriptor, message, sizeof(message), MSG_NOSIGNAL);
         } while (written < 0 && errno == EINTR);
@@ -474,6 +487,51 @@ static bool send_worker_response(int descriptor,
         close(payload_fd);
     return written;
 }
+
+#ifdef KSD_CAPTURE_WORKER_TESTING
+/* Both halves of the worker response are static, and the property worth
+ * pinning is that they agree, so the hook drives one through the other over a
+ * socketpair rather than exposing either on its own. */
+/* A well-behaved worker never attaches a descriptor to an answer that has no
+ * payload, so the message has to be forged to prove the receiver refuses it.
+ * Accepting it would let a worker smuggle a descriptor into any control verb. */
+bool ksd_capture_worker_test_scalar_ok_with_fd(ksd_operation_result *received)
+{
+    uint8_t message[KSD_CAPTURE_WORKER_RESPONSE_SIZE] = { 0 };
+    int pair[2];
+    int payload_fd = memfd_create("keysharp-desktop-test",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (payload_fd < 0)
+        return false;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) {
+        close(payload_fd);
+        return false;
+    }
+    memcpy(message, worker_magic, sizeof(worker_magic));
+    ksd_encode_u16(message + 4u, KSD_CAPTURE_WORKER_VERSION);
+    ksd_encode_u32(message + 8u, KSD_STATUS_OK);
+    bool sent = ksd_send_with_fd(pair[0], message, sizeof(message),
+                                 payload_fd);
+    bool accepted = sent && receive_worker_response(pair[1], received);
+    close(payload_fd);
+    close(pair[0]);
+    close(pair[1]);
+    return accepted;
+}
+
+bool ksd_capture_worker_test_round_trip(const ksd_operation_result *sent,
+                                        ksd_operation_result *received)
+{
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+        return false;
+    bool ok = send_worker_response(pair[0], sent)
+        && receive_worker_response(pair[1], received);
+    close(pair[0]);
+    close(pair[1]);
+    return ok;
+}
+#endif
 
 void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 const ksd_frame *request,

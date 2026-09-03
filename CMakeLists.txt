@@ -283,10 +283,22 @@ if(BUILD_TESTING)
             ${CMAKE_INSTALL_PREFIX}
             ${CMAKE_INSTALL_LIBDIR})
 
+    # Compiles the worker sources rather than linking the library, so the
+    # round-trip hook is reachable. The library's objects would be built
+    # without KSD_CAPTURE_WORKER_TESTING and the hook would not exist in them.
     add_executable(capture-pipe-security-tests
-        tests/capture_pipe_security_tests.c)
+        tests/capture_pipe_security_tests.c
+        src/capture_worker.c
+        src/local_capture.c)
+    target_include_directories(capture-pipe-security-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(capture-pipe-security-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L
+        KSD_CAPTURE_WORKER_TESTING
+        KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
     target_link_libraries(capture-pipe-security-tests PRIVATE
-        keysharp-desktop-capture)
+        keysharp-desktop-common PkgConfig::GIO)
     add_test(NAME capture-pipe-security-tests
         COMMAND capture-pipe-security-tests)
     set_tests_properties(capture-pipe-security-tests PROPERTIES
