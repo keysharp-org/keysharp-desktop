@@ -1,6 +1,7 @@
 #include "local_capture.h"
 #include "operation_result.h"
 #include "protocol.h"
+#include "protocol_io.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -183,6 +184,58 @@ bool ksd_capture_worker_test_scalar_ok_with_fd(
 /* A control verb answers OK with nothing to carry. Before this existed every
  * OK demanded a sealed descriptor of at least twenty bytes, so no operation
  * without a payload could be routed through the worker at all. */
+bool ksd_capture_worker_test_parse_header(const uint8_t *bootstrap,
+                                          size_t length);
+
+static void encode_bootstrap(uint8_t header[32], uint16_t version,
+                             uint32_t group_count, uint32_t frame_length,
+                             uint32_t session_pid)
+{
+    memset(header, 0, 32u);
+    memcpy(header, "KSCW", 4u);
+    ksd_encode_u16(header + 4u, version);
+    ksd_encode_u32(header + 8u, 1000u);
+    ksd_encode_u32(header + 12u, 1000u);
+    ksd_encode_u32(header + 16u, group_count);
+    ksd_encode_u32(header + 20u, frame_length);
+    ksd_encode_u32(header + 24u, session_pid);
+}
+
+/* The header carries the registered daemon pid at an offset that, under the
+ * previous 24-byte layout, is where the group array starts. A version that is
+ * tolerated rather than required would therefore read a group id as a pid. */
+static void check_bootstrap_header_parse(void)
+{
+    uint8_t header[32];
+    size_t frame_length = KSD_FRAME_HEADER_SIZE;
+    size_t total = 32u + frame_length;
+
+    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    assert(ksd_capture_worker_test_parse_header(header, total));
+
+    /* An older layout must be refused outright, not reinterpreted. */
+    encode_bootstrap(header, 1u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
+
+    /* A future one likewise. */
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
+
+    /* No pid means no authenticated party to take a display from. */
+    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 0u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
+
+    /* The declared lengths must account for the whole message exactly. */
+    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total + 1u));
+    assert(!ksd_capture_worker_test_parse_header(header, total - 1u));
+
+    /* Reserved bytes are reserved. */
+    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    ksd_encode_u32(header + 28u, 1u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
+}
+
 static void check_scalar_ok_round_trip(void)
 {
     ksd_operation_result sent;
@@ -224,6 +277,7 @@ int main(void)
     assert(ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL));
     assert(!ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL - 1u));
 
+    check_bootstrap_header_parse();
     check_scalar_ok_round_trip();
 
     if (geteuid() != 0u || !yama_scope_is_one())

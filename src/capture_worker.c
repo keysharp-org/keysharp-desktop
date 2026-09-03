@@ -26,8 +26,8 @@
 #include <unistd.h>
 
 #define KSD_CAPTURE_WORKER_FD 3
-#define KSD_CAPTURE_WORKER_VERSION 1u
-#define KSD_CAPTURE_WORKER_HEADER_SIZE 24u
+#define KSD_CAPTURE_WORKER_VERSION 2u
+#define KSD_CAPTURE_WORKER_HEADER_SIZE 32u
 #define KSD_CAPTURE_WORKER_MAX_GROUPS 256u
 #define KSD_CAPTURE_WORKER_ENV_LIMIT (64u * 1024u)
 #define KSD_CAPTURE_WORKER_TIMEOUT_MS 35000u
@@ -308,7 +308,7 @@ static int create_capture_spool(void)
 static bool send_bootstrap(int descriptor, const ksp_identity *identity,
                            gid_t gid, const gid_t *groups, size_t group_count,
                            const ksd_frame *request,
-                           const int capture_pipe[2])
+                           const int capture_pipe[2], pid_t session_pid)
 {
     ksd_buffer frame;
     ksd_buffer message;
@@ -324,7 +324,9 @@ static bool send_bootstrap(int descriptor, const ksp_identity *identity,
         && ksd_buffer_u32(&message, (uint32_t)identity->uid)
         && ksd_buffer_u32(&message, (uint32_t)gid)
         && ksd_buffer_u32(&message, (uint32_t)group_count)
-        && ksd_buffer_u32(&message, (uint32_t)frame.length);
+        && ksd_buffer_u32(&message, (uint32_t)frame.length)
+        && ksd_buffer_u32(&message, (uint32_t)session_pid)
+        && ksd_buffer_u32(&message, 0u);
     for (size_t index = 0u; ok && index < group_count; index++)
         ok = ksd_buffer_u32(&message, (uint32_t)groups[index]);
     ok = ok && ksd_buffer_bytes(&message, frame.data, frame.length);
@@ -536,7 +538,7 @@ bool ksd_capture_worker_test_round_trip(const ksd_operation_result *sent,
 void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 const ksd_frame *request,
                                 ksd_capture_worker_continue_fn keep_running,
-                                void *user_data,
+                                void *user_data, pid_t session_pid,
                                 ksd_operation_result *result)
 {
     worker_environment environment = { 0 };
@@ -596,7 +598,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
     sockets[1] = -1;
     if (worker < 0 || !send_bootstrap(sockets[0], identity, gid,
                                       groups, group_count, request,
-                                      capture_pipe)) {
+                                      capture_pipe, session_pid)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "capture worker bootstrap failed");
         goto done;
@@ -790,6 +792,54 @@ static ssize_t receive_bootstrap(int descriptor, uint8_t *buffer,
     return count;
 }
 
+typedef struct worker_bootstrap {
+    uid_t uid;
+    gid_t gid;
+    uint32_t group_count;
+    uint32_t frame_length;
+    pid_t session_pid;
+} worker_bootstrap;
+
+/* The whole header is validated before any field is used, because a version
+ * that is merely tolerated rather than required would let an older layout be
+ * read with this one's offsets: the pid field would land where the group
+ * array begins. */
+static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
+                                   worker_bootstrap *parsed)
+{
+    if (length < KSD_CAPTURE_WORKER_HEADER_SIZE
+        || memcmp(bootstrap, worker_magic, sizeof(worker_magic)) != 0
+        || ksd_decode_u16(bootstrap + 4u) != KSD_CAPTURE_WORKER_VERSION
+        || ksd_decode_u16(bootstrap + 6u) != 0u
+        || ksd_decode_u32(bootstrap + 28u) != 0u)
+        return false;
+    parsed->uid = (uid_t)ksd_decode_u32(bootstrap + 8u);
+    parsed->gid = (gid_t)ksd_decode_u32(bootstrap + 12u);
+    parsed->group_count = ksd_decode_u32(bootstrap + 16u);
+    parsed->frame_length = ksd_decode_u32(bootstrap + 20u);
+    parsed->session_pid = (pid_t)ksd_decode_u32(bootstrap + 24u);
+    size_t groups_length = (size_t)parsed->group_count * sizeof(uint32_t);
+    return (uint64_t)parsed->uid == ksd_decode_u32(bootstrap + 8u)
+        && (uint64_t)parsed->gid == ksd_decode_u32(bootstrap + 12u)
+        && parsed->session_pid > 0
+        && (uint64_t)parsed->session_pid == ksd_decode_u32(bootstrap + 24u)
+        && parsed->group_count <= KSD_CAPTURE_WORKER_MAX_GROUPS
+        && parsed->frame_length >= KSD_FRAME_HEADER_SIZE
+        && parsed->frame_length <= KSD_FRAME_HEADER_SIZE
+            + KSD_CAPTURE_WORKER_MAX_REQUEST
+        && KSD_CAPTURE_WORKER_HEADER_SIZE + groups_length
+            + parsed->frame_length == length;
+}
+
+#ifdef KSD_CAPTURE_WORKER_TESTING
+bool ksd_capture_worker_test_parse_header(const uint8_t *bootstrap,
+                                          size_t length)
+{
+    worker_bootstrap parsed;
+    return parse_bootstrap_header(bootstrap, length, &parsed);
+}
+#endif
+
 int ksd_capture_worker_main(int argc, char **argv)
 {
     uint8_t bootstrap[KSD_CAPTURE_WORKER_BOOTSTRAP_MAX];
@@ -809,26 +859,16 @@ int ksd_capture_worker_main(int argc, char **argv)
                                                   bootstrap,
                                                   sizeof(bootstrap),
                                                   capture_pipe);
-    if (bootstrap_length < (ssize_t)KSD_CAPTURE_WORKER_HEADER_SIZE
-        || memcmp(bootstrap, worker_magic, sizeof(worker_magic)) != 0
-        || ksd_decode_u16(bootstrap + 4u) != KSD_CAPTURE_WORKER_VERSION
-        || ksd_decode_u16(bootstrap + 6u) != 0u)
+    worker_bootstrap header;
+    if (bootstrap_length < 0
+        || !parse_bootstrap_header(bootstrap, (size_t)bootstrap_length,
+                                   &header))
         goto failed;
-    uid_t uid = (uid_t)ksd_decode_u32(bootstrap + 8u);
-    gid_t gid = (gid_t)ksd_decode_u32(bootstrap + 12u);
-    uint32_t group_count = ksd_decode_u32(bootstrap + 16u);
-    uint32_t frame_length = ksd_decode_u32(bootstrap + 20u);
+    uid_t uid = header.uid;
+    gid_t gid = header.gid;
+    uint32_t group_count = header.group_count;
+    uint32_t frame_length = header.frame_length;
     size_t groups_length = (size_t)group_count * sizeof(uint32_t);
-    size_t expected_length = KSD_CAPTURE_WORKER_HEADER_SIZE
-        + groups_length + frame_length;
-    if ((uint64_t)uid != ksd_decode_u32(bootstrap + 8u)
-        || (uint64_t)gid != ksd_decode_u32(bootstrap + 12u)
-        || group_count > KSD_CAPTURE_WORKER_MAX_GROUPS
-        || frame_length < KSD_FRAME_HEADER_SIZE
-        || frame_length > KSD_FRAME_HEADER_SIZE
-            + KSD_CAPTURE_WORKER_MAX_REQUEST
-        || expected_length != (size_t)bootstrap_length)
-        goto failed;
     for (uint32_t index = 0u; index < group_count; index++) {
         uint32_t value = ksd_decode_u32(bootstrap
             + KSD_CAPTURE_WORKER_HEADER_SIZE + index * sizeof(uint32_t));

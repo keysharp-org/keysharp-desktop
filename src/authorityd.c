@@ -364,6 +364,20 @@ static void unregister_backend(authority_state *state, uid_t uid,
     pthread_mutex_unlock(&state->mutex);
 }
 
+static pid_t registered_backend_pid(authority_state *state, uid_t uid)
+{
+    pid_t pid = -1;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid) {
+            pid = state->backends[index].identity.pid;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return pid;
+}
+
 static uint32_t registered_backend(authority_state *state, uid_t uid)
 {
     ksp_identity expected = { 0 };
@@ -1151,7 +1165,10 @@ static bool execute_operation(authority_session *session,
     ksd_operation_result result;
     if (session->backend == KSD_BACKEND_KWIN) {
         ksd_capture_worker_execute(&session->identity, session->gid, request,
-                                   capture_still_authorized, session, &result);
+                                   capture_still_authorized, session,
+                                   registered_backend_pid(session->state,
+                                       session->identity.uid),
+                                   &result);
     } else {
         ksd_provider_execute(session->identity.uid, session->identity.pid,
                              session->backend, request, &result);
