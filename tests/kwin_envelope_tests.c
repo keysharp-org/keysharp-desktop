@@ -140,9 +140,119 @@ static void check_report(void)
     assert(!report_ok(flood, sizeof(flood) - 1u, &report));
 }
 
+
+/* The serialiser must never be able to emit something the parsers would
+ * reject. They are the same protocol read in two directions, and a mismatch
+ * would only show up as a wedged script after a round trip. */
+static void check_poll_reply(void)
+{
+    ksd_buffer out;
+    ksd_kwin_dispatch jobs[2];
+    ksd_kwin_dispatch many[KSD_KWIN_JOBS_PER_REPLY_FAST + 1u];
+    static const char expected_idle[] =
+        "KSK1\ngen " GEN "\nlane fast\nidle 8000\nend\n";
+    static const char expected_jobs[] =
+        "KSK1\ngen " GEN "\nlane fast\nidle 0\n"
+        "job " SEQ " 2011 1500 5\n"
+        "job 00000000000000fe 2020 0 3\n"
+        "end\nhelloabc";
+
+    /* The idle reply: no jobs, and the parked invocation still answered. */
+    ksd_buffer_init(&out, 4096u);
+    assert(ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_FAST, 8000u, NULL,
+                                      0u, &out));
+    assert(out.length == sizeof(expected_idle) - 1u);
+    assert(memcmp(out.data, expected_idle, out.length) == 0);
+    ksd_buffer_clear(&out);
+
+    /* Two jobs with bodies. The opcode is fixed-width lowercase hex, the
+     * budget and the length are decimals with no leading zeros, and the bodies
+     * follow the terminator in the order their lines declared them. */
+    jobs[0].sequence = SEQ;
+    jobs[0].opcode = 0x2011u;
+    jobs[0].budget_ms = 1500u;
+    jobs[0].body = (const uint8_t *)"hello";
+    jobs[0].body_length = 5u;
+    jobs[1].sequence = "00000000000000fe";
+    jobs[1].opcode = 0x2020u;
+    jobs[1].budget_ms = 0u;
+    jobs[1].body = (const uint8_t *)"abc";
+    jobs[1].body_length = 3u;
+
+    ksd_buffer_init(&out, 4096u);
+    assert(ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_FAST, 0u, jobs, 2u,
+                                      &out));
+    assert(out.length == sizeof(expected_jobs) - 1u);
+    assert(memcmp(out.data, expected_jobs, out.length) == 0);
+    ksd_buffer_clear(&out);
+
+    /* The slow lane carries one job, never two. Two enumerations in one
+     * callback double the hole in the event stream to save a message, and a
+     * serialiser that ignored the cap would route around the lane split. */
+    ksd_buffer_init(&out, 4096u);
+    assert(ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_SLOW, 0u, jobs, 1u,
+                                      &out));
+    ksd_buffer_clear(&out);
+    ksd_buffer_init(&out, 4096u);
+    assert(!ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_SLOW, 0u, jobs, 2u,
+                                       &out));
+    ksd_buffer_clear(&out);
+
+    /* Beyond the fast lane's batch. */
+    for (size_t index = 0u; index < KSD_KWIN_JOBS_PER_REPLY_FAST + 1u; index++)
+        many[index] = jobs[0];
+    ksd_buffer_init(&out, 8192u);
+    assert(!ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_FAST, 0u, many,
+                                       KSD_KWIN_JOBS_PER_REPLY_FAST + 1u,
+                                       &out));
+    ksd_buffer_clear(&out);
+
+    /* A lane that never reaches the script has no reply to write. */
+    ksd_buffer_init(&out, 4096u);
+    assert(!ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_NONE, 0u, NULL, 0u,
+                                       &out));
+    ksd_buffer_clear(&out);
+
+    /* Malformed generations and sequences are refused rather than written. */
+    ksd_buffer_init(&out, 4096u);
+    assert(!ksd_kwin_format_poll_reply("0123", KSD_KWIN_LANE_FAST, 0u, NULL,
+                                       0u, &out));
+    assert(!ksd_kwin_format_poll_reply("0123456789ABCDEF0123456789abcdef",
+                                       KSD_KWIN_LANE_FAST, 0u, NULL, 0u,
+                                       &out));
+    jobs[0].sequence = "short";
+    assert(!ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_FAST, 0u, jobs, 1u,
+                                       &out));
+    jobs[0].sequence = SEQ;
+    /* A declared length with no bytes behind it would make the body region
+     * disagree with the lines that describe it. */
+    jobs[0].body = NULL;
+    assert(!ksd_kwin_format_poll_reply(GEN, KSD_KWIN_LANE_FAST, 0u, jobs, 1u,
+                                       &out));
+    ksd_buffer_clear(&out);
+}
+
+static void check_report_ack(void)
+{
+    ksd_buffer out;
+    static const char expected[] = "KSK1\ngen " GEN "\nack\nend\n";
+
+    ksd_buffer_init(&out, 256u);
+    assert(ksd_kwin_format_report_ack(GEN, &out));
+    assert(out.length == sizeof(expected) - 1u);
+    assert(memcmp(out.data, expected, out.length) == 0);
+    ksd_buffer_clear(&out);
+
+    ksd_buffer_init(&out, 256u);
+    assert(!ksd_kwin_format_report_ack("nope", &out));
+    ksd_buffer_clear(&out);
+}
+
 int main(void)
 {
     check_poll();
     check_report();
+    check_poll_reply();
+    check_report_ack();
     return 0;
 }
