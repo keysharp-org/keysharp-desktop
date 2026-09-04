@@ -31,6 +31,12 @@ static void registry_global(void *data, struct wl_registry *registry,
                && connection->toplevel_list == NULL) {
         connection->toplevel_list = wl_registry_bind(registry, name,
             &ext_foreign_toplevel_list_v1_interface, 1u);
+        /* Attached here, at the instant of binding, and not one step later.
+         * The compositor sends a toplevel event per existing window as soon as
+         * the global is bound, and those arrive in the same burst as this
+         * registry event: a listener added after the round trip that carried
+         * this binding would miss every window that already existed. */
+        ksd_wayland_toplevels_attach(connection);
     } else if (strcmp(interface, wl_seat_interface.name) == 0
                && connection->seat == NULL) {
         connection->seat_name = name;
@@ -237,6 +243,7 @@ void ksd_wayland_close(ksd_wayland *connection)
         return;
     if (connection->data_control != NULL)
         ext_data_control_manager_v1_destroy(connection->data_control);
+    ksd_wayland_toplevels_clear(connection);
     if (connection->toplevel_list != NULL)
         ext_foreign_toplevel_list_v1_destroy(connection->toplevel_list);
     if (connection->seat != NULL)

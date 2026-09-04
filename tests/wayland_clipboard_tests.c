@@ -1,9 +1,11 @@
 #include "ext-data-control-v1-server-protocol.h"
+#include "ext-foreign-toplevel-list-v1-server-protocol.h"
 #include "operation_result.h"
 #include "protocol.h"
 #include "protocol_io.h"
 #include "wl_clipboard.h"
 #include "wl_connect.h"
+#include "wl_windows.h"
 
 #include <assert.h>
 #include <signal.h>
@@ -212,6 +214,69 @@ static const struct wl_seat_interface seat_impl = {
     .release = seat_release,
 };
 
+/* ------------------------------------------------------- toplevel list -- */
+
+static void handle_destroy(struct wl_client *client, struct wl_resource *r)
+{
+    (void)client;
+    wl_resource_destroy(r);
+}
+
+static const struct ext_foreign_toplevel_handle_v1_interface handle_impl = {
+    .destroy = handle_destroy,
+};
+
+static void list_stop(struct wl_client *client, struct wl_resource *r)
+{
+    (void)client;
+    (void)r;
+}
+
+static void list_destroy(struct wl_client *client, struct wl_resource *r)
+{
+    (void)client;
+    wl_resource_destroy(r);
+}
+
+static const struct ext_foreign_toplevel_list_v1_interface list_impl = {
+    .stop = list_stop,
+    .destroy = list_destroy,
+};
+
+static void send_toplevel(struct wl_client *client, struct wl_resource *list,
+                          const char *title, const char *app_id,
+                          const char *identifier)
+{
+    struct wl_resource *handle = wl_resource_create(client,
+        &ext_foreign_toplevel_handle_v1_interface, 1, 0);
+
+    if (handle == NULL)
+        return;
+    wl_resource_set_implementation(handle, &handle_impl, NULL, NULL);
+    ext_foreign_toplevel_list_v1_send_toplevel(list, handle);
+    ext_foreign_toplevel_handle_v1_send_identifier(handle, identifier);
+    ext_foreign_toplevel_handle_v1_send_title(handle, title);
+    ext_foreign_toplevel_handle_v1_send_app_id(handle, app_id);
+    ext_foreign_toplevel_handle_v1_send_done(handle);
+}
+
+static void bind_list(struct wl_client *client, void *data, uint32_t version,
+                      uint32_t id)
+{
+    struct wl_resource *resource = wl_resource_create(client,
+        &ext_foreign_toplevel_list_v1_interface, (int)version, id);
+
+    (void)data;
+    if (resource == NULL)
+        return;
+    wl_resource_set_implementation(resource, &list_impl, NULL, NULL);
+    /* Every existing window is reported as soon as the global is bound, which
+     * is why the client attaches its listener before the first round trip. */
+    send_toplevel(client, resource, "first \"quoted\" window", "org.test.One",
+                  "id-one");
+    send_toplevel(client, resource, "second", "org.test.Two", "id-two");
+}
+
 static void bind_seat(struct wl_client *client, void *data, uint32_t version,
                       uint32_t id)
 {
@@ -245,6 +310,9 @@ static void run_server(const char *socket_name, int ready)
         _exit(1);
     if (wl_global_create(display, &wl_seat_interface, 1, NULL, bind_seat)
         == NULL)
+        _exit(1);
+    if (wl_global_create(display, &ext_foreign_toplevel_list_v1_interface, 1,
+                         NULL, bind_list) == NULL)
         _exit(1);
     /* The parent waits on this rather than sleeping: the socket exists only
      * once add_socket has returned, and connecting before that fails. */
@@ -363,6 +431,49 @@ static void check_normal(const char *socket_name)
     stop_server(child);
 }
 
+/* The list carries what this protocol actually reports and nothing more. */
+static void check_window_list(const char *socket_name)
+{
+    ksd_wayland *connection = NULL;
+    ksd_operation_result result;
+    pid_t child = start_server(socket_name, "normal");
+    const char *body;
+    uint32_t length;
+
+    assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+    assert(ksd_wayland_supported(connection).toplevel_list);
+
+    ksd_result_init(&result);
+    ksd_wayland_window_list(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    length = ksd_decode_u32(result.tail);
+    body = (const char *)result.tail + 4u;
+    assert(length == result.tail_length - 4u);
+
+    /* Both windows, with the fields the protocol carries. */
+    assert(memmem(body, length, "\"id\":\"id-one\"", 13u) != NULL);
+    assert(memmem(body, length, "\"id\":\"id-two\"", 13u) != NULL);
+    assert(memmem(body, length, "org.test.One", 12u) != NULL);
+    assert(memmem(body, length, "\"class\":\"org.test.Two\"", 22u) != NULL);
+
+    /* A quote inside a title is escaped. A window title is arbitrary text
+     * chosen by another application, and it is being pasted into a document
+     * the caller will parse. */
+    assert(memmem(body, length, "\\\"quoted\\\"", 10u) != NULL);
+
+    /* And what this protocol cannot report is ABSENT, not zero. A zero would
+     * be read as a fact: a window at the origin with no size, owned by process
+     * zero. The consumer already treats an absent field as unknown. */
+    assert(memmem(body, length, "\"pid\"", 5u) == NULL);
+    assert(memmem(body, length, "\"frame\"", 7u) == NULL);
+    assert(memmem(body, length, "\"client\"", 8u) == NULL);
+    assert(memmem(body, length, "\"minimized\"", 11u) == NULL);
+    ksd_result_clear(&result);
+
+    ksd_wayland_close(connection);
+    stop_server(child);
+}
+
 static void check_empty(const char *socket_name)
 {
     ksd_wayland *connection = NULL;
@@ -456,6 +567,7 @@ int main(void)
     assert(connection == NULL);
 
     check_normal(socket_name);
+    check_window_list(socket_name);
     check_empty(socket_name);
     check_silent(socket_name);
     check_wedged(socket_name);

@@ -165,6 +165,7 @@ endforeach()
 add_library(keysharp-desktop-wayland STATIC
     src/wayland/wl_connect.c
     src/wayland/wl_clipboard.c
+    src/wayland/wl_windows.c
     ${KSD_WAYLAND_GENERATED})
 target_include_directories(keysharp-desktop-wayland PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
