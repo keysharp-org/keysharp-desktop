@@ -263,6 +263,11 @@ is_component_package_installed() {
 
 refresh_invoking_user_manager() {
     restart_daemon=$1
+    # Which keysharp-desktop to ask to enable the shell extension. Passed in
+    # rather than assumed, because the compatible-install path reaches this
+    # with a binary found under /usr/bin or the Nix profile, and only the main
+    # install body is guaranteed /usr/local.
+    enable_binary=$2
     invoking_uid=${SUDO_UID:-}
     case "$invoking_uid" in
         ''|*[!0-9]*|0) return 1 ;;
@@ -293,6 +298,22 @@ refresh_invoking_user_manager() {
         && [ ! -L "$invoking_runtime/bus" ] \
         && [ "$(/usr/bin/stat -Lc '%u' -- "$invoking_runtime/bus" \
             2>/dev/null)" = "$invoking_uid" ] || return 1
+    # Before the service is refreshed, so the daemon finds the provider on its
+    # first start instead of entering its retry loop. Advisory: a KWin or X11
+    # machine has no extension to enable, and an install must not fail over it.
+    extension_status=0
+    /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
+        HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
+        LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
+        "$enable_binary" enable-extension >/dev/null 2>&1 \
+        || extension_status=$?
+    case "$extension_status" in
+        0) extension_note="Shell extension enabled, or not needed on this desktop." ;;
+        3) extension_note="Shell extension enabled. Log out and back in to load it." ;;
+        *) extension_note="Could not enable the shell extension. Run this as yourself: keysharp-desktop enable-extension" ;;
+    esac
+
     /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
@@ -318,9 +339,12 @@ refresh_invoking_user_manager() {
 
 refresh_or_handoff_user_service() {
     restart_daemon=$1
-    if refresh_invoking_user_manager "$restart_daemon"; then
+    enable_binary=$2
+    extension_note="Shell extension not enabled. On GNOME or Cinnamon, run this as yourself: keysharp-desktop enable-extension"
+    if refresh_invoking_user_manager "$restart_daemon" "$enable_binary"; then
         printf '%s\n' \
-            "Refreshed keysharp-desktop for the invoking user's active session."
+            "Refreshed keysharp-desktop for the invoking user's active session." \
+            "$extension_note"
     else
         printf '%s\n' \
             "No active invoking user manager was safely resolved." \
@@ -627,7 +651,7 @@ if [ "$skip_compatible" = true ]; then
         if installation_complete "$candidate"; then
             printf '%s\n' \
                 "A compatible keysharp-desktop is already installed; leaving it unchanged."
-            refresh_or_handoff_user_service false
+            refresh_or_handoff_user_service false "$candidate"
             exit 0
         fi
     done
@@ -714,4 +738,4 @@ fi
 printf '%s\n' \
     "Installed keysharp-desktop." \
     "Uninstall with /usr/local/share/doc/keysharp-desktop/uninstall.sh."
-refresh_or_handoff_user_service true
+refresh_or_handoff_user_service true /usr/local/bin/keysharp-desktop

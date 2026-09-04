@@ -380,6 +380,15 @@ if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
             else()
                 message(WARNING \"systemctl was not found; the keysharp-desktop services were not enabled\")
             endif()
+            # The one step that cannot be done from here. Enabling the shell
+            # extension writes the invoking user's own dconf, which needs their
+            # session bus; install.sh resolves that, and this does not. Left
+            # unsaid, the install looks complete and every client is then told
+            # the backend is None -- which names no cause and sends people
+            # looking at the daemon, the socket and the provider in turn.
+            message(STATUS
+                \"keysharp-desktop: on GNOME or Cinnamon, finish the install by running this as yourself, not with sudo:\")
+            message(STATUS \"    keysharp-desktop enable-extension\")
         endif()
     ")
 endif()

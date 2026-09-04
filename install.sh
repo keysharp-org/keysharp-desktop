@@ -7,6 +7,9 @@ unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
 prefix=${PREFIX:-/usr/local}
 build_dir=${BUILD_DIR:-build-install}
+# Set here as well as in the resolver, because the resolver returns early on
+# any of its safety checks and this is read unconditionally under `set -u`.
+extension_note="Shell extension not enabled. On GNOME or Cinnamon, run this as yourself: keysharp-desktop enable-extension"
 
 refresh_invoking_user_manager() {
     invoking_uid=${SUDO_UID:-}
@@ -39,6 +42,31 @@ refresh_invoking_user_manager() {
         && [ ! -L "$invoking_runtime/bus" ] \
         && [ "$(/usr/bin/stat -Lc '%u' -- "$invoking_runtime/bus" \
             2>/dev/null)" = "$invoking_uid" ] || return 1
+    # Before the service is refreshed, so the daemon finds the provider on its
+    # first start rather than sitting in its retry loop.
+    #
+    # Advisory in every direction: the extension is per-user and per-desktop,
+    # so a KWin or X11 machine has nothing to enable, and an install must not
+    # fail because of it. The command reports 3 when it wrote the setting but
+    # the user still has to log back in -- which is a success, not an error, and
+    # is why this is a case rather than an `if`.
+    #
+    # env -i leaves PATH as /usr/bin:/bin, which does not contain the default
+    # /usr/local prefix, so the binary is named by absolute path built from the
+    # prefix this install actually used.
+    extension_status=0
+    /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
+        HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
+        LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
+        "$prefix/bin/keysharp-desktop" enable-extension >/dev/null 2>&1 \
+        || extension_status=$?
+    case "$extension_status" in
+        0) extension_note="Shell extension enabled, or not needed on this desktop." ;;
+        3) extension_note="Shell extension enabled. Log out and back in to load it." ;;
+        *) extension_note="Could not enable the shell extension. Run this as yourself: keysharp-desktop enable-extension" ;;
+    esac
+
     /usr/sbin/runuser -u "$invoking_name" -- /usr/bin/env -i \
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
@@ -77,6 +105,7 @@ else
 fi
 printf '%s\n' \
     "Installed keysharp-desktop ${prefix}." \
+    "$extension_note" \
     "$user_handoff" \
     "Other logged-in users are not refreshed automatically; after an upgrade they should run:" \
     "  systemctl --user daemon-reload" \
