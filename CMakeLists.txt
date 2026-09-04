@@ -394,6 +394,25 @@ if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
 endif()
 
 if(BUILD_TESTING)
+    # Assertions stay live here whatever the build type.
+    #
+    # Every test in this tree is written on assert(), and most put the call
+    # under test inside the assertion -- assert(socketpair(...) == 0) and the
+    # like. CMAKE_BUILD_TYPE=Release, which CI uses, adds -DNDEBUG, and NDEBUG
+    # does not merely skip the check: it deletes the expression. The socketpair
+    # is never created, the pipe never opened, the child never forked. Two
+    # suites then crash on uninitialised descriptors and the rest pass having
+    # executed nothing, which is the worse outcome of the two because it is
+    # silent.
+    #
+    # Hoisting 68 calls out of their assertions across ten files would work
+    # equally well and is the tidier habit, but it leaves the next one written
+    # in the old style to fail the same way. This makes the build type
+    # incapable of emptying a test.
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(-UNDEBUG)
+    endif()
+
     add_executable(protocol-tests tests/protocol_tests.c)
     target_link_libraries(protocol-tests PRIVATE keysharp-desktop-wire)
     add_test(NAME protocol-tests COMMAND protocol-tests)
