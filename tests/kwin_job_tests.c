@@ -209,6 +209,52 @@ static void check_batch_fits_a_report(void)
     assert(KSD_KWIN_JOBS_PER_REPLY_FAST <= KSD_KWIN_MAX_JOBS);
 }
 
+
+/* G6 and G7. The provider connection has exactly one legitimate peer, so this
+ * is not a general authorization question: it is whether the message came from
+ * the script this daemon started, in the run it is currently talking to. */
+static void check_peer_allowed(void)
+{
+    const uid_t me = (uid_t)1000;
+    const uid_t other = (uid_t)1001;
+
+    assert(ksd_kwin_peer_allowed(":1.5", ":1.5", me, me, GEN_A, GEN_A));
+
+    /* G6. A different connection. A unique name is never reused within a bus
+     * lifetime, so a reconnecting script gets a new one and must not inherit
+     * the standing of the connection it replaced. */
+    assert(!ksd_kwin_peer_allowed(":1.99", ":1.5", me, me, GEN_A, GEN_A));
+
+    /* G7. The previous run of the script. Its sequences name jobs that no
+     * longer exist, which the queue refuses per job and this refuses for the
+     * whole peer. */
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.5", me, me, GEN_A, GEN_B));
+
+    /* Another user is not this session compositor whatever it claims. */
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.5", me, other, GEN_A, GEN_A));
+
+    /* A well-known name is refused even when both sides present it. Comparing
+     * unique names only works because a unique name cannot be handed from one
+     * connection to another, and a well-known name can. */
+    assert(!ksd_kwin_peer_allowed("org.kde.KWin", "org.kde.KWin", me, me,
+                                  GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", "org.kde.KWin", me, me,
+                                  GEN_A, GEN_A));
+
+    /* Malformed unique names. */
+    assert(!ksd_kwin_peer_allowed(":1.5", ":", me, me, GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1", me, me, GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.", me, me, GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.5x", me, me, GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", "", me, me, GEN_A, GEN_A));
+    assert(!ksd_kwin_peer_allowed(":1.5", NULL, me, me, GEN_A, GEN_A));
+
+    /* Two malformed generations that match each other still fail: the property
+     * is not that they are equal, it is that they are the one issued. */
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.5", me, me, "zz", "zz"));
+    assert(!ksd_kwin_peer_allowed(":1.5", ":1.5", me, me, NULL, NULL));
+}
+
 int main(void)
 {
     check_lane_assumptions();
@@ -219,5 +265,6 @@ int main(void)
     check_expiry_spares_dispatched_work();
     check_queue_is_bounded();
     check_batch_fits_a_report();
+    check_peer_allowed();
     return 0;
 }

@@ -3,7 +3,9 @@
 
 #include "protocol.h"
 
+#include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 /* A KWin script cannot be called. Its only outbound path is callDBus, so the
  * daemon parks a poll the script issues and holds the reply until there is
@@ -32,6 +34,35 @@ typedef enum ksd_kwin_cost {
     KSD_KWIN_COST_UNBOUNDED,
     KSD_KWIN_COST_NONE,
 } ksd_kwin_cost;
+
+/* Whether a message arriving on the provider connection came from the script
+ * this daemon started, in the run it is currently talking to.
+ *
+ * The connection is a private socket the session daemon handed over, not the
+ * session bus, so this is not a general authorization question: exactly one
+ * peer is ever legitimate. Three things must agree, and each rules out a
+ * different way of being wrong rather than being belt and braces.
+ *
+ * The unique name pins WHICH connection. A unique bus name is never reused
+ * within a bus lifetime, so a reconnecting script gets a new one and cannot
+ * inherit the standing of the connection it replaced.
+ *
+ * The uid pins WHOSE. A script runs as the session user; anything arriving
+ * under another uid is not the compositor of this session whatever it says.
+ *
+ * The generation pins WHEN. A script that was unloaded and restarted is a new
+ * run with its own numbering, and a reply from the previous run names
+ * sequences that no longer mean anything -- the case the job queue refuses
+ * per-job, refused here for the whole peer.
+ *
+ * Generations must be well formed, not merely equal: two malformed strings
+ * that happen to match would otherwise pass, and "equal" is not the property
+ * being checked, "is the generation I issued" is. */
+bool ksd_kwin_peer_allowed(const char *expected_unique,
+                           const char *sender_unique,
+                           uid_t expected_uid, uid_t sender_uid,
+                           const char *expected_generation,
+                           const char *sender_generation);
 
 ksd_kwin_lane ksd_kwin_lane_for(uint16_t opcode);
 ksd_kwin_cost ksd_kwin_script_cost(uint16_t opcode);
