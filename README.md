@@ -87,6 +87,40 @@ without touching systemd, which is what packaging does. To develop against a
 sibling `keysharp-permissions` checkout instead of the submodule, use
 `-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path/to/keysharp-permissions`.
 
+### Without root
+
+All three routes above need administrator rights, because the authority runs as
+root and serves every user on the machine. It can also be installed by one
+user, for that user alone, with no `sudo` anywhere:
+
+```bash
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build build -j"$(nproc)"
+cmake --install build
+systemctl --user enable --now keysharp-desktop-authority-user.socket
+systemctl --user enable --now keysharp-desktop.service
+```
+
+The authority then runs as you, binds its socket in your `XDG_RUNTIME_DIR`
+instead of `/run`, and keeps grants under `$XDG_STATE_HOME/keysharp-desktop`
+rather than `/var/lib`. Everything else behaves the same. Where a system
+installation is also present, its socket is used and this one is ignored --
+clients prefer the system authority, so a user installation cannot displace it.
+
+**What you give up.** In a system installation, grants are held by root, so a
+grant is a rule an application cannot rewrite: "this application may capture the
+screen" is enforced against it. In a user installation, the store belongs to
+you, and any process running as you can edit it. Grants become a record of what
+you allowed rather than a boundary against the programs you run. The daemon says
+so once at startup rather than leaving it implied.
+
+That distinction is the only one. It costs nothing on X11, where any program
+that can reach your display can already read every window and take screenshots
+whatever this service decides. It matters most on Wayland, where the compositor
+does isolate applications from each other and the grant is what keysharp-desktop
+adds on top -- so if you are on Wayland and want grants that hold against the
+applications themselves, install as root.
+
 ### Enable the compositor extension
 
 On GNOME Shell and Cinnamon, the compositor operations come from a bundled shell

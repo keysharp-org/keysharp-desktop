@@ -1,4 +1,5 @@
 #include "local_capture.h"
+#include "install_mode.h"
 
 #include "protocol.h"
 
@@ -241,8 +242,10 @@ bool ksd_capture_pipe_valid(const int descriptors[2])
         && S_ISFIFO(read_status.st_mode) && S_ISFIFO(write_status.st_mode)
         && read_status.st_dev == write_status.st_dev
         && read_status.st_ino == write_status.st_ino
-        && read_status.st_uid == 0u && write_status.st_uid == 0u
-        && read_status.st_gid == 0u && write_status.st_gid == 0u
+        && ksd_install_owner_trusted(read_status.st_uid)
+        && ksd_install_owner_trusted(write_status.st_uid)
+        && read_status.st_gid == ksd_install_group()
+        && write_status.st_gid == ksd_install_group()
         && (read_status.st_mode & 0777u) == 0u
         && (write_status.st_mode & 0777u) == 0u
         && (read_flags = fcntl(descriptors[0], F_GETFL)) >= 0
@@ -257,8 +260,10 @@ bool ksd_capture_spool_valid(int descriptor)
     struct stat status;
     int flags;
     return descriptor >= 0 && fstat(descriptor, &status) == 0
-        && S_ISREG(status.st_mode) && status.st_uid == 0u
-        && status.st_gid == 0u && (status.st_mode & 0777u) == 0u
+        && S_ISREG(status.st_mode)
+        && ksd_install_owner_trusted(status.st_uid)
+        && status.st_gid == ksd_install_group()
+        && (status.st_mode & 0777u) == 0u
         && status.st_size >= 0
         && (uint64_t)status.st_size <= KSD_MAX_CAPTURE_BYTES
         && (flags = fcntl(descriptor, F_GETFL)) >= 0

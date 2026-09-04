@@ -1,4 +1,5 @@
 #include "capture_worker.h"
+#include "install_mode.h"
 
 #include "protocol.h"
 #include "local_capture.h"
@@ -290,16 +291,20 @@ static bool trusted_self(int descriptor)
 {
     struct stat status;
     return descriptor >= 0 && fstat(descriptor, &status) == 0
-        && S_ISREG(status.st_mode) && status.st_uid == 0u
+        && S_ISREG(status.st_mode)
+        && ksd_install_owner_trusted(status.st_uid)
         && (status.st_mode & 0777u) == 0700u;
 }
 
 static bool create_capture_pipe(int descriptors[2])
 {
-    if (geteuid() != 0u || pipe2(descriptors, O_CLOEXEC) != 0)
+    /* Owned by whoever this installation belongs to and openable by nobody:
+     * the mode is what keeps another process from reaching it through /proc,
+     * and the ownership says which party created it. */
+    if (pipe2(descriptors, O_CLOEXEC) != 0)
         return false;
     int read_flags = fcntl(descriptors[0], F_GETFL);
-    if (fchown(descriptors[0], 0u, 0u) != 0
+    if (fchown(descriptors[0], ksd_install_owner(), ksd_install_group()) != 0
         || fchmod(descriptors[0], 0u) != 0 || read_flags < 0
         || fcntl(descriptors[0], F_SETFL, read_flags | O_NONBLOCK) != 0
         || !ksd_capture_pipe_valid(descriptors)) {
@@ -316,7 +321,8 @@ static int create_capture_spool(void)
 {
     int descriptor = memfd_create("keysharp-desktop-capture-spool",
                                   MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (descriptor < 0 || fchown(descriptor, 0u, 0u) != 0
+    if (descriptor < 0
+        || fchown(descriptor, ksd_install_owner(), ksd_install_group()) != 0
         || fchmod(descriptor, 0u) != 0
         || ftruncate(descriptor, 0) != 0
         || !ksd_capture_spool_valid(descriptor)) {
@@ -784,22 +790,36 @@ done:
     }
 }
 
-static bool worker_peer_is_root(int descriptor)
+/* The far end has to be the authority that forked this worker, which means the
+ * party this installation belongs to -- root for a system installation, and
+ * the one user for a user one. */
+static bool worker_peer_is_authority(int descriptor)
 {
     struct ucred peer;
     socklen_t length = sizeof(peer);
     return getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
                       &peer, &length) == 0
-        && length == sizeof(peer) && peer.uid == 0u;
+        && length == sizeof(peer)
+        && ksd_install_owner_trusted(peer.uid);
 }
 
 static bool drop_worker_privileges(uid_t uid, gid_t gid,
                                    const gid_t *groups, size_t group_count)
 {
+    /* There is nothing to drop to in a user installation: the worker was
+     * forked by an authority that is already the client's uid, and the calls
+     * below need privileges it does not have. What follows the drop still
+     * applies, and the credentials are still checked at the end -- the check
+     * is what the caller relies on, not the calls that usually cause it to
+     * pass. Refusing to become root covers both: a user installation whose
+     * owner were root would be a system one. */
+    bool already = uid == getuid() && uid == geteuid()
+        && gid == getgid() && gid == getegid();
+
     if (uid == 0u || prctl(PR_SET_KEEPCAPS, 0) != 0
-        || setgroups(group_count, groups) != 0
-        || setresgid(gid, gid, gid) != 0
-        || setresuid(uid, uid, uid) != 0
+        || (!already && setgroups(group_count, groups) != 0)
+        || (!already && setresgid(gid, gid, gid) != 0)
+        || (!already && setresuid(uid, uid, uid) != 0)
         || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
         || prctl(PR_SET_DUMPABLE, 0) != 0)
         return false;
@@ -1111,8 +1131,13 @@ int ksd_capture_worker_main(int argc, char **argv)
     int capture_spool = -1;
     if (argc != 1 || argv == NULL || argv[0] == NULL)
         return 2;
-    if (getuid() != 0u || geteuid() != 0u
-        || !worker_peer_is_root(KSD_CAPTURE_WORKER_FD))
+    /* Whole credentials, and an authority on the other end that shares
+     * them. A worker whose real and effective ids differ is partway
+     * through a setuid it did not make, and the peer check is what says
+     * this process was forked by the authority rather than started by
+     * somebody who found the binary. */
+    if (getuid() != geteuid() || getgid() != getegid()
+        || !worker_peer_is_authority(KSD_CAPTURE_WORKER_FD))
         return 1;
     if (close_range(4u, UINT_MAX, 0) != 0 || !prepare_worker_root())
         return 1;

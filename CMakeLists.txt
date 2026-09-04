@@ -79,6 +79,7 @@ add_library(keysharp-desktop-common STATIC
     src/kwin_jobs.c
     src/kwin_peer.c
     src/kwin_envelope.c
+    src/install_mode.c
     src/worker_pool.c)
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -222,6 +223,8 @@ set(KEYSHARP_DESKTOP_POLKIT_ACTION_DIR
 
 configure_file(data/keysharp-desktop.service.in keysharp-desktop.service @ONLY)
 configure_file(data/keysharp-desktop-authority.service.in keysharp-desktop-authority.service @ONLY)
+configure_file(data/keysharp-desktop-authority-user.service.in
+    keysharp-desktop-authority-user.service @ONLY)
 configure_file(data/org.keysharp.DesktopCapture.desktop.in org.keysharp.DesktopCapture.desktop @ONLY)
 configure_file(data/keysharp-desktop.pc.in keysharp-desktop.pc @ONLY)
 configure_package_config_file(
@@ -232,6 +235,21 @@ write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/KeysharpDesktopConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion)
+
+# Both executables have to find libkeysharp-desktop wherever the tree was put.
+# A system installation gets this for free, because its library lands in a
+# directory the loader already searches; a user installation does not, and
+# without an rpath the daemon cannot start at all outside /usr.
+#
+# Relative to the binary rather than absolute, so the tree can be moved or
+# installed anywhere. This is not the usual risk that carries -- neither binary
+# is setuid, and the directory it resolves to is owned by whoever the
+# installation belongs to: root for a system installation, and for a user one,
+# the same user the authority already runs as.
+set_target_properties(keysharp-desktop keysharp-desktop-capture-worker
+    PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+        INSTALL_RPATH_USE_LINK_PATH FALSE)
 
 install(TARGETS keysharp-desktop keysharp-desktop-client
     EXPORT KeysharpDesktopTargets
@@ -246,6 +264,15 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop.service
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop-authority.service
               data/keysharp-desktop-authority.socket
     DESTINATION ${KEYSHARP_DESKTOP_SYSTEMD_SYSTEM_DIR})
+# The user authority goes beside the session daemon's own user unit. Installing
+# both units always, and starting only one, is deliberate: which installation
+# this is depends on where it was installed and who runs it, and that is not
+# known at build time. The two cannot both serve, because the client prefers
+# the system socket wherever one exists.
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/keysharp-desktop-authority-user.service
+    data/keysharp-desktop-authority-user.socket
+    DESTINATION ${KEYSHARP_DESKTOP_SYSTEMD_USER_DIR})
 install(FILES data/keysharp-desktop-permissions.conf DESTINATION lib/tmpfiles.d)
 install(FILES data/org.keysharp.desktop.policy DESTINATION ${KEYSHARP_DESKTOP_POLKIT_ACTION_DIR})
 install(FILES include/keysharp_desktop/client.h
@@ -453,6 +480,10 @@ if(BUILD_TESTING)
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
         keysharp-desktop-x11 keysharp-desktop-common)
+
+    add_executable(install-mode-tests tests/install_mode_tests.c)
+    target_link_libraries(install-mode-tests PRIVATE keysharp-desktop-common)
+    add_test(NAME install-mode-tests COMMAND install-mode-tests)
 
     add_executable(worker-pool-tests tests/worker_pool_tests.c)
     target_link_libraries(worker-pool-tests PRIVATE keysharp-desktop-common)

@@ -1,0 +1,23 @@
+[Unit]
+Description=Keysharp desktop authorization authority (user installation)
+Documentation=https://github.com/keysharp-org/keysharp-desktop
+Requires=keysharp-desktop-authority-user.socket
+
+[Service]
+Type=simple
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/keysharp-desktop authority-daemon
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# No User= or Group=: a user unit already runs as the user, and this
+# installation's whole premise is that it holds no privilege to drop.
+#
+# Creates and hands over $XDG_STATE_HOME/keysharp-desktop, which is where
+# grants that outlive the session are kept -- the runtime directory would be
+# emptied at logout and every grant would be asked for again at the next login.
+StateDirectory=keysharp-desktop
+RuntimeDirectory=keysharp-desktop
+RuntimeDirectoryMode=0700
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_ALG
+LockPersonality=true

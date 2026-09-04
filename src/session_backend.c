@@ -6,6 +6,7 @@
 #include "kwin_bus.h"
 #include "wl_connect.h"
 #include "backend_protocol.h"
+#include "install_mode.h"
 #include "protocol_io.h"
 #include "roles.h"
 
@@ -28,16 +29,38 @@
 #define KSD_BACKEND_STARTUP_RETRY_SECONDS 5
 #define KSD_BACKEND_STARTUP_ATTEMPTS 24u
 
-static bool root_owned_path(const char *path, bool socket_path)
+/* An authority socket, and the directory holding it, must belong to the party
+ * whose authority it claims to be -- otherwise anyone who could create it
+ * could answer in its place.
+ *
+ * `owner` is root for the system installation and this process's own uid for a
+ * user one. Accepting our own is not a weakening: a socket this user created
+ * grants this user nothing they did not already have. Accepting somebody
+ * else's would be, which is why there is no third case.
+ */
+static bool owned_path(const char *path, uid_t owner, bool socket_path,
+                       unsigned socket_mode)
 {
     struct stat status;
-    if (lstat(path, &status) != 0 || status.st_uid != 0u)
+    if (lstat(path, &status) != 0 || status.st_uid != owner)
         return false;
     if (socket_path)
         return S_ISSOCK(status.st_mode)
-            && (status.st_mode & 0777u) == 0666u;
+            && (status.st_mode & 0777u) == socket_mode;
     return S_ISDIR(status.st_mode)
         && (status.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* A user authority's directory has to be private outright, not merely
+ * unwritable by others. The system directory is world-traversable by design --
+ * every user has to reach the socket in it -- but nobody except its owner has
+ * any reason to see inside a user one. */
+static bool private_directory(const char *path, uid_t owner)
+{
+    struct stat status;
+    return lstat(path, &status) == 0 && S_ISDIR(status.st_mode)
+        && status.st_uid == owner
+        && (status.st_mode & (S_IRWXG | S_IRWXO)) == 0u;
 }
 
 static uint64_t monotonic_milliseconds(void)
@@ -94,28 +117,35 @@ static bool transfer_fixed(int descriptor, void *data, size_t length,
     return true;
 }
 
-static int connect_backend(uint64_t deadline)
+/* Connects to one authority and checks that the far end really is the party
+ * that owns the socket. `owner` runs the whole way through: it decides which
+ * socket is acceptable and which peer is, and the two have to be the same
+ * party or the check means nothing. */
+static int connect_to(const char *directory, const char *path, uid_t owner,
+                      unsigned socket_mode, uint64_t deadline)
 {
     struct sockaddr_un address;
     struct ucred peer;
     socklen_t peer_size = sizeof(peer);
     int socket_error = 0;
     socklen_t socket_error_size = sizeof(socket_error);
-    int descriptor = socket(AF_UNIX,
-                            SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    size_t length = strlen(path);
+    int descriptor;
 
-    if (descriptor < 0 || !root_owned_path("/run/keysharp-desktop", false))
-        goto failed;
+    if (!owned_path(directory, owner, false, 0u))
+        return -1;
+    if (length >= sizeof(address.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (!owned_path(path, owner, true, socket_mode))
+        return -1;
+    descriptor = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (descriptor < 0)
+        return -1;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(KSD_SYSTEM_SOCKET) >= sizeof(address.sun_path)) {
-        errno = ENAMETOOLONG;
-        goto failed;
-    }
-    memcpy(address.sun_path, KSD_SYSTEM_SOCKET,
-           sizeof(KSD_SYSTEM_SOCKET));
-    if (!root_owned_path(KSD_SYSTEM_SOCKET, true))
-        goto failed;
+    memcpy(address.sun_path, path, length + 1u);
     if (connect(descriptor, (const struct sockaddr *)&address,
                 sizeof(address)) != 0
         && (errno != EINPROGRESS
@@ -128,16 +158,54 @@ static int connect_backend(uint64_t deadline)
             errno = socket_error;
         goto failed;
     }
+    /* The socket being owned by the right party says who created it, not who
+     * is answering on it now. */
     if (getsockopt(descriptor, SOL_SOCKET, SO_PEERCRED,
                   &peer, &peer_size) != 0
-        || peer_size != sizeof(peer) || peer.uid != 0u || peer.gid != 0u)
+        || peer_size != sizeof(peer) || peer.uid != owner)
         goto failed;
     return descriptor;
 
 failed:
-    if (descriptor >= 0)
-        close(descriptor);
+    close(descriptor);
     return -1;
+}
+
+/* The system authority first, then this user's own.
+ *
+ * The order is what keeps the fallback honest: where a root authority is
+ * running, it is the one that answers, and a user authority cannot displace it
+ * by starting first. The fallback is reached only when there is no system
+ * installation to fall back from.
+ */
+static int connect_backend(uint64_t deadline)
+{
+    char user_socket[108];
+    char user_directory[108];
+    char *slash;
+    int descriptor = connect_to("/run/keysharp-desktop", KSD_SYSTEM_SOCKET,
+                                0u, 0666u, deadline);
+
+    if (descriptor >= 0)
+        return descriptor;
+    /* Never as root: a root client asking a user-owned authority for
+     * permission would be taking the answer from a less trusted party than
+     * itself. The session daemon already refuses to run as root, and this
+     * makes the socket choice refuse it too rather than rely on that. */
+    if (geteuid() == 0u || getuid() == 0u
+        || !ksd_install_socket_path(user_socket, sizeof(user_socket)))
+        return -1;
+    if (strlen(user_socket) >= sizeof(user_directory))
+        return -1;
+    strcpy(user_directory, user_socket);
+    slash = strrchr(user_directory, '/');
+    if (slash == NULL || slash == user_directory)
+        return -1;
+    *slash = 0;
+    if (!private_directory(user_directory, ksd_install_owner()))
+        return -1;
+    return connect_to(user_directory, user_socket, ksd_install_owner(),
+                      ksd_install_socket_mode(), deadline);
 }
 
 /* What this compositor actually advertises, which is not knowable from a

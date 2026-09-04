@@ -199,6 +199,33 @@ foreach(forbidden
     endif()
 endforeach()
 
+# The authority no longer names the system socket itself: which socket an
+# installation binds depends on whether it is root, and that decision lives in
+# one place so a root daemon cannot be argued into a user path. The invariant
+# is therefore checked where it now lives -- the system path is still fixed,
+# still the one a root installation uses, and the owner it is chosen by is
+# still taken from the process credentials rather than from anything a caller
+# supplies.
+file(READ "${SOURCE_DIR}/src/install_mode.c" install_mode)
+foreach(required
+        "KSD_SYSTEM_SOCKET"
+        "return geteuid()"
+        "XDG_RUNTIME_DIR")
+    string(FIND "${install_mode}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR "install mode invariant missing: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "KSD_INSTALL_OWNER"
+        "KSD_INSTALL_MODE")
+    string(FIND "${install_mode}" "${forbidden}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "install mode reads its owner from the environment: ${forbidden}")
+    endif()
+endforeach()
+
 file(READ "${SOURCE_DIR}/src/authorityd.c" authority)
 foreach(required
         "KSD_DESKTOP_MANAGED_SCOPES"
@@ -212,7 +239,7 @@ foreach(required
         "KSD_MAX_BACKEND_REGISTRATIONS"
         "ksd_backend_registration_magic"
         "registered_backend"
-        "KSD_SYSTEM_SOCKET"
+        "ksd_install_socket_path"
         "backend <= KSD_BACKEND_X11"
         "ksd_capture_worker_execute")
     string(FIND "${authority}" "${required}" position)

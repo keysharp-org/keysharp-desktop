@@ -1,0 +1,18 @@
+[Unit]
+Description=Keysharp desktop authorization socket (user installation)
+
+[Socket]
+# %t is XDG_RUNTIME_DIR: per-user, already private, and emptied at logout --
+# the properties the system socket's directory gets from being root-owned.
+ListenStream=%t/keysharp-desktop/keysharp-desktop.sock
+FileDescriptorName=public
+Accept=no
+# Reachable by its owner and nobody else. The system socket is deliberately
+# open because it is the machine's front door and filters by peer credentials;
+# this one serves exactly one user and has no reason to be reachable further.
+SocketMode=0600
+DirectoryMode=0700
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "worker_pool.h"
 #include "backend_protocol.h"
+#include "install_mode.h"
 #include "capture_worker.h"
 #include "kwin_relay.h"
 #include "kwin_wire.h"
@@ -199,6 +200,7 @@ static int inherited_socket(bool *activation_present)
     int accepting = 0;
     socklen_t option_size = sizeof(int);
     struct stat status;
+    char expected[sizeof(address.sun_path)];
 
     *activation_present = listen_pid != NULL || listen_fds != NULL
         || listen_names != NULL;
@@ -221,7 +223,12 @@ static int inherited_socket(bool *activation_present)
         || getsockname(3, (struct sockaddr *)&address, &address_size) != 0
         || address.sun_family != AF_UNIX
         || address_size <= offsetof(struct sockaddr_un, sun_path)
-        || strncmp(address.sun_path, KSD_SYSTEM_SOCKET,
+        /* The activated socket has to be the one this installation would have
+         * bound itself. A unit that handed over some other socket would have
+         * the authority answering on a name it never chose, and in a user
+         * installation that name is where the client will look. */
+        || !ksd_install_socket_path(expected, sizeof(expected))
+        || strncmp(address.sun_path, expected,
                    sizeof(address.sun_path)) != 0
         || fcntl(3, F_SETFD, FD_CLOEXEC) != 0) {
         errno = EINVAL;
@@ -236,26 +243,52 @@ static int inherited_socket(bool *activation_present)
 static int create_socket(void)
 {
     struct sockaddr_un address;
+    char path[sizeof(address.sun_path)];
     int descriptor;
+    size_t length;
 
-    if (ksd_make_parent_directories(KSD_SYSTEM_SOCKET, 0755) != 0)
+    /* System-wide when this is root, and under the user's own runtime
+     * directory otherwise. Whether a user directory is fit to hold a socket
+     * has already been decided against the same standard root gives the system
+     * one, so that judgement is not repeated here. */
+    if (!ksd_install_socket_path(path, sizeof(path)))
         return -1;
+    /* 0755 for a system installation, whose parent every user has to traverse
+     * to reach the socket; 0700 for a user one, which nobody else has any
+     * business entering. */
+    if (ksd_make_parent_directories(path,
+                                    ksd_install_is_system() ? 0755 : 0700) != 0)
+        return -1;
+    if (!ksd_install_is_system()) {
+        char directory[sizeof(path)];
+        char *slash;
+
+        /* The mode is set rather than assumed, because this directory is
+         * usually not created here: the permission store reaches it first and
+         * makes it world-readable, which would leave the socket sitting
+         * somewhere anyone could list. */
+        memcpy(directory, path, strlen(path) + 1u);
+        slash = strrchr(directory, '/');
+        if (slash == NULL || slash == directory
+            || (*slash = 0, chmod(directory, 0700) != 0))
+            return -1;
+    }
     descriptor = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (descriptor < 0)
         return -1;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(KSD_SYSTEM_SOCKET) >= sizeof(address.sun_path)) {
+    length = strlen(path);
+    if (length >= sizeof(address.sun_path)) {
         close(descriptor);
         errno = ENAMETOOLONG;
         return -1;
     }
-    memcpy(address.sun_path, KSD_SYSTEM_SOCKET,
-           sizeof(KSD_SYSTEM_SOCKET));
-    (void)unlink(KSD_SYSTEM_SOCKET);
+    memcpy(address.sun_path, path, length + 1u);
+    (void)unlink(path);
     if (bind(descriptor, (const struct sockaddr *)&address,
              sizeof(address)) != 0
-        || chmod(KSD_SYSTEM_SOCKET, 0666) != 0
+        || chmod(path, (mode_t)ksd_install_socket_mode()) != 0
         || listen(descriptor, (int)KSD_MAX_AUTHORITY_WORKERS) != 0) {
         close(descriptor);
         return -1;
@@ -366,7 +399,7 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
         && stat("/proc/self/exe", &authority_status) == 0
         && stat(proc_path, &peer_status) == 0
         && S_ISREG(authority_status.st_mode)
-        && authority_status.st_uid == 0u
+        && ksd_install_owner_trusted(authority_status.st_uid)
         && (authority_status.st_mode & (S_IWGRP | S_IWOTH)) == 0
         && authority_status.st_dev == peer_status.st_dev
         && authority_status.st_ino == peer_status.st_ino
@@ -1997,12 +2030,41 @@ int ksd_authority_main(int argc, char **argv)
         fputs("usage: keysharp-desktop authority-daemon\n", stderr);
         return 2;
     }
-    if (getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
-        fputs("keysharp-desktop authority-daemon must run as root\n", stderr);
+    /* Either wholly root or not root at all. A process with mismatched real
+     * and effective ids is a setuid binary partway through something, and
+     * which of its two identities the ownership rule should follow has no
+     * good answer -- so it is refused rather than guessed at. */
+    if (getuid() != geteuid() || getgid() != getegid()) {
+        fputs("keysharp-desktop authority-daemon: refusing mismatched "
+              "credentials\n", stderr);
         return 1;
+    }
+    if (!ksd_install_is_system()) {
+        /* A user installation serves the one user running it, and its grant
+         * store is writable by that user -- so a grant records what this
+         * user allowed rather than bounding what they may do. Said once, at
+         * startup, because it changes what the service promises. */
+        fputs("keysharp-desktop authority-daemon: user installation. "
+              "Grants live in this user's own directory and can be edited "
+              "by any process running as this user, so they are not "
+              "enforceable against it. Install as root for that.\n",
+              stderr);
+        if (ksd_install_persistent_directory() == NULL
+            || ksd_install_runtime_directory() == NULL) {
+            fputs("keysharp-desktop authority-daemon: no private "
+                  "directory to keep grants in\n", stderr);
+            return 1;
+        }
     }
     ksp_store_config_init(&store_config, KSD_DESKTOP_MANAGED_SCOPES);
     store_config.read_scopes = KSD_DESKTOP_ACCEPTED_SCOPES;
+    /* NULL in a system installation, which leaves the library's own
+     * system-wide defaults exactly where they were. */
+    if (!ksd_install_is_system()) {
+        store_config.persistent_directory = ksd_install_persistent_directory();
+        store_config.runtime_directory = ksd_install_runtime_directory();
+        store_config.owner_uid = ksd_install_owner();
+    }
     if (ksp_store_create(&state.store, &store_config) != 0
         || ksp_store_prepare(state.store) != 0) {
         fputs("keysharp-desktop authority-daemon: permission store unavailable\n",

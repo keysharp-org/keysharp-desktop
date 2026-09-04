@@ -193,8 +193,18 @@ int ksd_make_parent_directories(const char *path, mode_t mode)
         if (*cursor != '/')
             continue;
         *cursor = '\0';
-        if (mkdir(copy, mode) != 0 && errno != EEXIST)
-            return -1;
+        if (mkdir(copy, mode) != 0) {
+            struct stat status;
+
+            /* A component that already exists is fine however the failure
+             * came back. mkdir reports EEXIST when it is allowed to look, but
+             * when the parent is not writable it refuses on the permission
+             * check first and reports EACCES instead -- which is what every
+             * absolute path's leading components do for anyone but root.
+             * Accepting only EEXIST made this function work for root alone. */
+            if (stat(copy, &status) != 0 || !S_ISDIR(status.st_mode))
+                return -1;
+        }
         *cursor = '/';
     }
     return 0;
