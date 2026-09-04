@@ -407,8 +407,15 @@ static void detach_child(void)
      * that signal will never arrive and only this check ends the child. */
     if (getppid() == 1)
         _exit(0);
-    (void)freopen("/dev/null", "w", stdout);
-    (void)freopen("/dev/null", "w", stderr);
+    /* Checked, not cast away: GCC does not let a void cast silence
+     * warn_unused_result, and ignoring it would be wrong in any case. Dropping
+     * the inherited pipe is the whole point of this function, and a child that
+     * failed to reopen the stream still holds the suite's output open. Closing
+     * the descriptor reaches the same end by a blunter route. */
+    if (freopen("/dev/null", "w", stdout) == NULL)
+        (void)close(STDOUT_FILENO);
+    if (freopen("/dev/null", "w", stderr) == NULL)
+        (void)close(STDERR_FILENO);
 }
 
 static xcb_atom_t intern_in(xcb_connection_t *c, const char *name)
