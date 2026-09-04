@@ -188,3 +188,8 @@ size_t ksd_kwin_host_expire(ksd_kwin_host *host, uint64_t now_ms)
         return 0u;
     return ksd_kwin_queue_expire(&host->queue, now_ms);
 }
+
+const char *ksd_kwin_host_generation(const ksd_kwin_host *host)
+{
+    return host == NULL ? NULL : host->generation;
+}

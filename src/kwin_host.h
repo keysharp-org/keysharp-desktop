@@ -77,6 +77,10 @@ bool ksd_kwin_host_result(ksd_kwin_host *host, const char *sequence,
                           uint32_t *body_length);
 void ksd_kwin_host_release(ksd_kwin_host *host, const char *sequence);
 
+/* The generation this host issued. The transport needs it to write an idle
+ * reply, which carries no jobs but must still name the run it belongs to. */
+const char *ksd_kwin_host_generation(const ksd_kwin_host *host);
+
 /* Drops queued work whose deadline has passed, and reports how many. */
 size_t ksd_kwin_host_expire(ksd_kwin_host *host, uint64_t now_ms);
 

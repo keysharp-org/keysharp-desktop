@@ -1,4 +1,7 @@
 #include "backend.h"
+#include <fcntl.h>
+
+#include "kwin_bus.h"
 #include "wl_connect.h"
 #include "backend_protocol.h"
 #include "protocol_io.h"
@@ -162,6 +165,38 @@ static uint64_t probe_generic_operations(void)
     return operations;
 }
 
+/* A fresh 32-hex-digit token naming this run of the script. Issued by the
+ * daemon and never chosen by the script, because a script that named its own
+ * run could name the previous one and answer for its jobs. */
+static bool issue_generation(char out[KSD_KWIN_GENERATION_HEX + 1u])
+{
+    static const char digits[] = "0123456789abcdef";
+    unsigned char bytes[KSD_KWIN_GENERATION_HEX / 2u];
+    int source = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    size_t filled = 0u;
+
+    if (source < 0)
+        return false;
+    while (filled < sizeof(bytes)) {
+        ssize_t count = read(source, bytes + filled, sizeof(bytes) - filled);
+
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0) {
+            close(source);
+            return false;
+        }
+        filled += (size_t)count;
+    }
+    close(source);
+    for (size_t index = 0u; index < sizeof(bytes); index++) {
+        out[index * 2u] = digits[bytes[index] >> 4];
+        out[index * 2u + 1u] = digits[bytes[index] & 0x0fu];
+    }
+    out[KSD_KWIN_GENERATION_HEX] = '\0';
+    return true;
+}
+
 static bool register_backend(int descriptor, ksd_backend backend,
                              uint64_t deadline, uint64_t *accepted)
 {
@@ -253,6 +288,36 @@ int ksd_daemon_main(int argc, char **argv)
                 " %llu of the operations offered, not all of them\n",
                 (unsigned long long)__builtin_popcountll(accepted));
     signal(SIGPIPE, SIG_IGN);
+    /* KWin, and only KWin, needs a bus name and a main loop: its script cannot
+     * be reached any other way. Every other backend keeps the plain poll below
+     * untouched, because a main loop none of them uses is one that can go
+     * wrong for them without buying anything.
+     *
+     * The loop watches the authority socket itself, so the rule is the same
+     * one the poll follows: traffic or hangup there ends the daemon, because
+     * the registration is its whole reason to be running. */
+    if (backend == KSD_BACKEND_KWIN) {
+        char generation[KSD_KWIN_GENERATION_HEX + 1u];
+
+        if (issue_generation(generation)) {
+            ksd_kwin_host *host = ksd_kwin_host_create(generation);
+            ksd_kwin_bus *bus = host == NULL ? NULL : ksd_kwin_bus_start(host);
+
+            if (bus != NULL) {
+                (void)ksd_kwin_bus_run(bus, descriptor);
+                ksd_kwin_bus_stop(bus);
+                ksd_kwin_host_destroy(host);
+                close(descriptor);
+                return 1;
+            }
+            ksd_kwin_host_destroy(host);
+        }
+        /* Falling through to the plain loop is deliberate. Without the bus the
+         * script has nothing to call, but the registration is still live and
+         * capture still works, which is more use than exiting. */
+        fputs("keysharp-desktop daemon: could not take the KWin provider"
+              " name; window operations will be unavailable\n", stderr);
+    }
     for (;;) {
         struct pollfd item = {
             .fd = descriptor,
