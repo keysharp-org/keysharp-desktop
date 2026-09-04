@@ -124,6 +124,59 @@ target_compile_definitions(keysharp-desktop-x11 PUBLIC
 target_link_libraries(keysharp-desktop-x11 PUBLIC
     keysharp-desktop-wire PkgConfig::XCB)
 
+# The Wayland backend for compositors with no extension of their own. Its
+# protocol bindings are generated at build time by wayland-scanner from the
+# system XML rather than vendored, so the definitions can never drift from the
+# ones the compositor on this machine was built against.
+pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client>=1.20)
+pkg_check_modules(WAYLAND_SCANNER REQUIRED wayland-scanner)
+pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols>=1.32)
+pkg_get_variable(WAYLAND_SCANNER_BIN wayland-scanner wayland_scanner)
+pkg_get_variable(WAYLAND_PROTOCOL_DIR wayland-protocols pkgdatadir)
+
+set(KSD_WAYLAND_GENERATED)
+foreach(spec
+        "staging/ext-data-control/ext-data-control-v1"
+        "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1")
+    get_filename_component(stem "${spec}" NAME)
+    set(xml "${WAYLAND_PROTOCOL_DIR}/${spec}.xml")
+    if(NOT EXISTS "${xml}")
+        message(FATAL_ERROR "wayland protocol missing: ${xml}")
+    endif()
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${stem}-client-protocol.h")
+    set(source "${CMAKE_CURRENT_BINARY_DIR}/${stem}-protocol.c")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} client-header "${xml}" "${header}"
+        DEPENDS "${xml}" VERBATIM)
+    add_custom_command(OUTPUT "${source}"
+        COMMAND ${WAYLAND_SCANNER_BIN} private-code "${xml}" "${source}"
+        DEPENDS "${xml}" VERBATIM)
+    list(APPEND KSD_WAYLAND_GENERATED "${header}" "${source}")
+    # The tests stand up a real Wayland server to talk to, so the server side
+    # of the same XML is generated too. Same file, same version, no chance of
+    # the two halves of the test disagreeing about the protocol.
+    set(server_header "${CMAKE_CURRENT_BINARY_DIR}/${stem}-server-protocol.h")
+    add_custom_command(OUTPUT "${server_header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} server-header "${xml}" "${server_header}"
+        DEPENDS "${xml}" VERBATIM)
+    list(APPEND KSD_WAYLAND_SERVER_GENERATED "${server_header}")
+endforeach()
+
+add_library(keysharp-desktop-wayland STATIC
+    src/wayland/wl_connect.c
+    src/wayland/wl_clipboard.c
+    ${KSD_WAYLAND_GENERATED})
+target_include_directories(keysharp-desktop-wayland PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/wayland
+    ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_definitions(keysharp-desktop-wayland PUBLIC
+    _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+target_link_libraries(keysharp-desktop-wayland PUBLIC
+    keysharp-desktop-wire PkgConfig::WAYLAND)
+
+
 add_executable(keysharp-desktop-capture-worker
     src/capture_worker_entry.c)
 target_link_libraries(keysharp-desktop-capture-worker PRIVATE
@@ -375,6 +428,22 @@ if(BUILD_TESTING)
     add_executable(kwin-job-tests tests/kwin_job_tests.c)
     target_link_libraries(kwin-job-tests PRIVATE keysharp-desktop-common)
     add_test(NAME kwin-job-tests COMMAND kwin-job-tests)
+
+    # Compiles the clipboard source rather than linking it, so the hook that
+    # lowers the deadline is reachable, and links wayland-server so the test
+    # can BE the compositor.
+    pkg_check_modules(WAYLAND_SERVER REQUIRED IMPORTED_TARGET wayland-server)
+    add_executable(wayland-clipboard-tests
+        tests/wayland_clipboard_tests.c
+        src/wayland/wl_clipboard.c
+        ${KSD_WAYLAND_SERVER_GENERATED})
+    target_compile_definitions(wayland-clipboard-tests PRIVATE
+        KSD_WAYLAND_TESTING _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+    target_link_libraries(wayland-clipboard-tests PRIVATE
+        keysharp-desktop-wayland keysharp-desktop-common
+        PkgConfig::WAYLAND_SERVER)
+    add_test(NAME wayland-clipboard-tests COMMAND wayland-clipboard-tests)
+    set_tests_properties(wayland-clipboard-tests PROPERTIES SKIP_RETURN_CODE 77)
 
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
