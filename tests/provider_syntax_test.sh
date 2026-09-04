@@ -29,9 +29,17 @@ fi
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT HUP INT TERM
 
+# The KWin script lives at a different path because it is a KPackage, not an
+# extension: KWin loads contents/code/main.js named by X-Plasma-MainScript. It is
+# a plain script in the QJSEngine dialect, so it is parsed in script mode like
+# the Cinnamon one.
 status=0
-for provider in gnome cinnamon; do
-    file="$source_dir/providers/$provider/extension.js"
+for provider in gnome cinnamon kwin; do
+    if [ "$provider" = kwin ]; then
+        file="$source_dir/providers/kwin/contents/code/main.js"
+    else
+        file="$source_dir/providers/$provider/extension.js"
+    fi
 
     if grep -qE '^[[:space:]]*(import|export)[[:space:]]' "$file"; then
         mode=module

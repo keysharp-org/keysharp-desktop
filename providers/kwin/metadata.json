@@ -1,0 +1,21 @@
+{
+    "KPlugin": {
+        "Id": "io.github.keysharp.desktop.kwin",
+        "Name": "keysharp-desktop",
+        "Description": "Serves window queries and control to the keysharp-desktop broker, which mediates them behind a permission grant.",
+        "Icon": "preferences-desktop-remote-desktop",
+        "Authors": [
+            {
+                "Name": "keysharp-desktop"
+            }
+        ],
+        "License": "MIT",
+        "Version": "0.1",
+        "EnabledByDefault": true,
+        "ServiceTypes": [
+            "KWin/Script"
+        ]
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}
