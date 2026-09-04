@@ -423,6 +423,33 @@ if(BUILD_TESTING)
             $<TARGET_FILE:x11-server-tests>)
     set_tests_properties(x11-server-tests PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The persistent worker's serving loop is a static function reached through
+    # the same testing hook as the bootstrap parser, so this target compiles
+    # capture_worker.c itself rather than linking the library, whose objects are
+    # built without KSD_CAPTURE_WORKER_TESTING. It runs under the same X server
+    # wrapper as x11-server-tests: the loop opens a real display, and proving it
+    # opens exactly one is the point.
+    add_executable(persistent-worker-tests
+        tests/persistent_worker_tests.c
+        src/capture_worker.c
+        src/local_capture.c)
+    target_include_directories(persistent-worker-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/x11
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/wayland)
+    target_compile_definitions(persistent-worker-tests PRIVATE
+        _GNU_SOURCE _POSIX_C_SOURCE=200809L
+        KSD_CAPTURE_WORKER_TESTING
+        KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
+    target_link_libraries(persistent-worker-tests PRIVATE
+        keysharp-desktop-common keysharp-desktop-x11 keysharp-desktop-wayland
+        PkgConfig::GIO)
+    add_test(NAME persistent-worker-tests
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
+            $<TARGET_FILE:persistent-worker-tests>)
+    set_tests_properties(persistent-worker-tests PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
         keysharp-desktop-x11 keysharp-desktop-common)

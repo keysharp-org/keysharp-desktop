@@ -205,9 +205,6 @@ static void encode_bootstrap(uint8_t header[32], uint16_t version,
 }
 
 /* The header carries the registered daemon pid at an offset that, under the
- * previous 24-byte layout, is where the group array starts. A version that is
- * tolerated rather than required would therefore read a group id as a pid. */
-/* The header carries the registered daemon pid at an offset that, under the
  * original 24-byte layout, is where the group array starts. A version that is
  * tolerated rather than required would therefore read a group id as a pid.
  *
@@ -221,47 +218,67 @@ static void check_bootstrap_header_parse(void)
     size_t frame_length = KSD_FRAME_HEADER_SIZE;
     size_t total = 32u + frame_length;
 
-    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
     assert(ksd_capture_worker_test_parse_header(header, total));
 
     /* Both older layouts must be refused outright, not reinterpreted. v2 is
      * the dangerous one now: it is the same 32 bytes with a different meaning
      * at offset 6, so tolerating it would read a reserved zero as a backend
      * and route every request as KSD_BACKEND_NONE. */
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
     encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
     encode_bootstrap(header, 1u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* A future one likewise. */
-    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 5u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* Every backend the service knows is accepted, and nothing past it. A
      * value out of range would select no route at all and the request would be
      * refused for a reason that names the wrong thing. */
     for (uint16_t backend = 0u; backend <= KSD_BACKEND_GENERIC; backend++) {
-        encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+        encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
         ksd_encode_u16(header + 6u, backend);
         assert(ksd_capture_worker_test_parse_header(header, total));
     }
-    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
     ksd_encode_u16(header + 6u, (uint16_t)(KSD_BACKEND_GENERIC + 1u));
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* No pid means no authenticated party to take a display from. */
-    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 0u);
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 0u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* The declared lengths must account for the whole message exactly. */
-    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total + 1u));
     assert(!ksd_capture_worker_test_parse_header(header, total - 1u));
 
-    /* Reserved bytes are reserved. */
-    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    /* Offset 28 is the persist flag now, so 1 is legal -- but a persistent
+     * worker carries NO initial request, because everything it will do arrives
+     * on the socket afterwards. A persist flag with a request attached is two
+     * contradictory instructions, and the header is refused rather than one of
+     * them being picked. */
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
     ksd_encode_u32(header + 28u, 1u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
+    encode_bootstrap(header, 4u, 0u, 0u, 4321u);
+    ksd_encode_u32(header + 28u, 1u);
+    assert(ksd_capture_worker_test_parse_header(header, 32u));
+    /* And a one-shot worker must carry one: a worker with neither a request
+     * nor a reason to stay has nothing to do. */
+    encode_bootstrap(header, 4u, 0u, 0u, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, 32u));
+    /* Anything but zero or one there is a flag this service does not define.
+     * The request is left empty so that the range check is the only rule that
+     * can reject this: with a request attached, the persist/request coupling
+     * above rejects it first and the range check goes untested. */
+    encode_bootstrap(header, 4u, 0u, 0u, 4321u);
+    ksd_encode_u32(header + 28u, 2u);
+    assert(!ksd_capture_worker_test_parse_header(header, 32u));
 }
 
 static void check_scalar_ok_round_trip(void)

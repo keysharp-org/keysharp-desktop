@@ -90,3 +90,9 @@ void ksd_x11_close(ksd_x11 *connection)
         xcb_disconnect(connection->connection);
     free(connection);
 }
+
+bool ksd_x11_connection_failed(const ksd_x11 *connection)
+{
+    return connection == NULL || connection->connection == NULL
+        || xcb_connection_has_error(connection->connection) != 0;
+}

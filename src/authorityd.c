@@ -4,6 +4,12 @@
 #include "capture_worker.h"
 #include "kwin_relay.h"
 #include "kwin_wire.h"
+
+/* A display query is bounded by its own deadline rather than the KWin one: a
+ * clipboard read waits on another application to answer and is given five
+ * seconds by the backends themselves, so a shorter bound here would time out
+ * an operation that was going to succeed. */
+#define KSD_DISPLAY_DEADLINE_MS 8000u
 #include "protocol.h"
 #include "operation_result.h"
 #include "operation_scope.h"
@@ -111,6 +117,19 @@ typedef struct authority_state {
         /* Wraps provider_fd once the registration is accepted, so the many
          * connection threads can share one socket without serialising on it. */
         ksd_kwin_relay *relay;
+        /* The persistent display worker for this session, and the relay that
+         * drives it. Started on the first display request and kept, so the
+         * fork, exec, privilege drop and display connect are paid once for the
+         * session rather than once per query -- measured at 1.4 ms of process
+         * creation alone against 0.38 ms for a full forty-window enumeration.
+         *
+         * Keyed by the registration, not by the client, because the worker
+         * drops to a CLIENT's uid, gid and supplementary groups. Clients of one
+         * desktop share those in practice; one whose groups differ is served by
+         * a one-shot worker rather than by somebody else's. */
+        ksd_kwin_relay *display_relay;
+        uid_t display_uid;
+        gid_t display_gid;
         ksp_identity identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
@@ -422,15 +441,23 @@ static void unregister_backend(authority_state *state, uid_t uid,
              * its copy when it handed this over, so this is the only reference
              * and leaking it would hold the socket open for the life of the
              * authority -- and leave the daemon's end never seeing a hangup. */
-            /* The relay owns the descriptor once it exists, so only one of
-             * these two closes it. */
             /* Retired, not destroyed: a caller may be inside a call on it
              * right now, holding its own reference. Retiring wakes them onto a
-             * closed channel; the memory goes when the last one leaves. */
+             * closed channel; the memory goes when the last one leaves.
+             *
+             * The relay owns the provider descriptor once it exists, so only
+             * one of those two closes it. The display worker is a separate
+             * socket to a separate process and is released on its own: chained
+             * onto the provider branch, as it once was, a session holding both
+             * would never close the provider. */
             if (state->backends[index].relay != NULL)
                 ksd_kwin_relay_retire(state->backends[index].relay);
             else if (state->backends[index].provider_fd >= 0)
                 close(state->backends[index].provider_fd);
+            /* Retiring closes the socket, which is what tells the worker to
+             * exit: it serves until end-of-file and then goes. */
+            if (state->backends[index].display_relay != NULL)
+                ksd_kwin_relay_retire(state->backends[index].display_relay);
             memset(&state->backends[index], 0,
                    sizeof(state->backends[index]));
             state->backends[index].descriptor = -1;
@@ -493,6 +520,111 @@ static ksd_kwin_relay *registered_relay(authority_state *state, uid_t uid)
             ksd_kwin_relay_acquire(relay);
             break;
         }
+    pthread_mutex_unlock(&state->mutex);
+    return relay;
+}
+
+/* The session's display worker, started if this is the first request that
+ * needs it. Returns a referenced relay, or NULL to fall back to a one-shot
+ * worker -- which is the honest answer when the credentials do not match the
+ * worker already running, since a worker holds one set. */
+/* Takes a worker that has stopped answering out of its slot, so the next
+ * request starts a fresh one.
+ *
+ * Nothing else clears the field: without this a worker that died -- the
+ * compositor restarted, the process was killed -- stays registered for the
+ * life of the registration, and every later request on that session pays a
+ * failed call before falling back to a one-shot worker. The fallback keeps the
+ * answers correct, which is exactly why the leak would go unnoticed.
+ */
+static void forget_display_relay(authority_state *state,
+                                 const ksp_identity *identity,
+                                 ksd_kwin_relay *relay)
+{
+    bool taken = false;
+
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++) {
+        if (!state->backends[index].active
+            || state->backends[index].uid != identity->uid
+            || state->backends[index].display_relay != relay)
+            continue;
+        state->backends[index].display_relay = NULL;
+        taken = true;
+        break;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    /* Only the thread that took it out of the slot retires it. Several callers
+     * can see the same worker fail at the same moment, and the slot's single
+     * reference has to be dropped once, not once per witness. */
+    if (taken)
+        ksd_kwin_relay_retire(relay);
+}
+
+static ksd_kwin_relay *display_relay_for(authority_state *state,
+                                         const ksp_identity *identity,
+                                         gid_t gid, pid_t session_pid,
+                                         uint32_t backend)
+{
+    ksd_kwin_relay *relay = NULL;
+    int socket_fd = -1;
+    size_t slot = KSD_MAX_BACKEND_REGISTRATIONS;
+
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++) {
+        if (!state->backends[index].active
+            || state->backends[index].uid != identity->uid)
+            continue;
+        slot = index;
+        if (state->backends[index].display_relay != NULL) {
+            /* Only reusable by a client with the credentials the worker
+             * already dropped to. */
+            if (state->backends[index].display_uid == identity->uid
+                && state->backends[index].display_gid == gid) {
+                relay = state->backends[index].display_relay;
+                ksd_kwin_relay_acquire(relay);
+            }
+            pthread_mutex_unlock(&state->mutex);
+            return relay;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    if (slot == KSD_MAX_BACKEND_REGISTRATIONS)
+        return NULL;
+
+    /* Started outside the lock: a fork and an exec are far too long to hold a
+     * mutex every other thread needs. Two threads racing here both spawn, and
+     * the loser's worker is closed below rather than leaked. */
+    socket_fd = ksd_capture_worker_spawn(identity, gid, session_pid, backend);
+    if (socket_fd < 0)
+        return NULL;
+    relay = ksd_kwin_relay_create(socket_fd);
+    if (relay == NULL) {
+        close(socket_fd);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&state->mutex);
+    if (!state->backends[slot].active
+        || state->backends[slot].uid != identity->uid) {
+        /* The registration went away while the worker was starting. */
+        pthread_mutex_unlock(&state->mutex);
+        ksd_kwin_relay_retire(relay);
+        return NULL;
+    }
+    if (state->backends[slot].display_relay != NULL) {
+        ksd_kwin_relay *winner = state->backends[slot].display_relay;
+
+        ksd_kwin_relay_acquire(winner);
+        pthread_mutex_unlock(&state->mutex);
+        ksd_kwin_relay_retire(relay);
+        return winner;
+    }
+    state->backends[slot].display_relay = relay;
+    state->backends[slot].display_uid = identity->uid;
+    state->backends[slot].display_gid = gid;
+    ksd_kwin_relay_acquire(relay);
     pthread_mutex_unlock(&state->mutex);
     return relay;
 }
@@ -1466,11 +1598,45 @@ static bool execute_operation(authority_session *session,
     } else if (session->backend == KSD_BACKEND_KWIN
         || session->backend == KSD_BACKEND_X11
         || session->backend == KSD_BACKEND_GENERIC) {
-        ksd_capture_worker_execute(&session->identity, session->gid, request,
-                                   capture_still_authorized, session,
-                                   registered_backend_pid(session->state,
-                                       session->identity.uid),
-                                   session->backend, &result);
+        pid_t session_pid = registered_backend_pid(session->state,
+                                                   session->identity.uid);
+        ksd_kwin_relay *display = NULL;
+
+        /* Captures keep the one-shot worker. A capture is rare and expensive
+         * enough that per-request isolation is worth more than the setup it
+         * saves, and it needs the pipe and spool a persistent worker does not
+         * hold. Everything else goes to the session's worker, which has its
+         * display already open. */
+        if (!capture && session->backend != KSD_BACKEND_KWIN)
+            display = display_relay_for(session->state, &session->identity,
+                                        session->gid, session_pid,
+                                        session->backend);
+        if (display != NULL) {
+            uint64_t now = monotonic_milliseconds();
+            bool gone;
+
+            (void)ksd_kwin_relay_call(display, request,
+                                      now + KSD_DISPLAY_DEADLINE_MS, &result);
+            /* A worker that has gone is not a failed operation. Falling back
+             * to a one-shot worker answers the request the caller actually
+             * made, and dropping the dead one here is what makes the next
+             * request start a fresh persistent worker rather than find this
+             * corpse and fall back again. */
+            gone = result.status == KSD_STATUS_UNAVAILABLE;
+            if (gone) {
+                ksd_result_clear(&result);
+                forget_display_relay(session->state, &session->identity,
+                                     display);
+            }
+            ksd_kwin_relay_release(display);
+            if (gone)
+                display = NULL;
+        }
+        if (display == NULL)
+            ksd_capture_worker_execute(&session->identity, session->gid,
+                                       request, capture_still_authorized,
+                                       session, session_pid,
+                                       session->backend, &result);
     } else {
         ksd_provider_execute(session->identity.uid, session->identity.pid,
                              session->backend, request, &result);

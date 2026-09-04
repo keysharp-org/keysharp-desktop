@@ -42,12 +42,16 @@ while [ "$display" -lt 110 ]; do
         if ! kill -0 "$server" 2>/dev/null; then
             break
         fi
-        if KSD_TEST_DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
+        if KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}"             KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
             # Deliberately not exec. Replacing the shell would drop the EXIT
             # trap with it, orphaning the server: every successful run leaked
             # one, and the next run then adopted it by the path above and
             # inherited its state.
-            KSD_TEST_DISPLAY=":${display}" "$binary"
+            # DISPLAY as well as KSD_TEST_DISPLAY: a test that exercises the
+            # session-resolution path reads the display back out of
+            # /proc/<pid>/environ, which holds the environment this process was
+            # executed with and cannot be added to afterwards.
+            KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}" "$binary"
             status=$?
             cleanup
             server=""

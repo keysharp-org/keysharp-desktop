@@ -268,3 +268,9 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
     features.toplevel_list = connection->toplevel_list != NULL;
     return features;
 }
+
+bool ksd_wayland_connection_failed(const ksd_wayland *connection)
+{
+    return connection == NULL || connection->display == NULL
+        || wl_display_get_error(connection->display) != 0;
+}

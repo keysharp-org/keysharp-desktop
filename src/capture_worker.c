@@ -2,7 +2,9 @@
 
 #include "protocol.h"
 #include "local_capture.h"
+#include "wl_connect.h"
 #include "wl_worker.h"
+#include "x11_connect.h"
 #include "x11_worker.h"
 #include "transport.h"
 
@@ -32,7 +34,10 @@
  * the payload shape instead -- which sent every KWin capture to the X11 path,
  * because an area capture looks identical either way. That path then refused
  * the XWayland server KWin runs, so KWin area capture could never succeed. */
-#define KSD_CAPTURE_WORKER_VERSION 3u
+/* v4 carries a persist flag. A worker that persists serves many requests on
+ * one display connection, which is where the fork, the exec, the privilege
+ * drop and the connect stop being per-query costs. */
+#define KSD_CAPTURE_WORKER_VERSION 4u
 #define KSD_CAPTURE_WORKER_HEADER_SIZE 32u
 #define KSD_CAPTURE_WORKER_MAX_GROUPS 256u
 #define KSD_CAPTURE_WORKER_ENV_LIMIT (64u * 1024u)
@@ -326,7 +331,7 @@ static bool send_bootstrap(int descriptor, const ksp_identity *identity,
                            gid_t gid, const gid_t *groups, size_t group_count,
                            const ksd_frame *request,
                            const int capture_pipe[2], pid_t session_pid,
-                           uint32_t backend)
+                           uint32_t backend, bool persistent)
 {
     ksd_buffer frame;
     ksd_buffer message;
@@ -334,8 +339,12 @@ static bool send_bootstrap(int descriptor, const ksp_identity *identity,
                               + KSD_CAPTURE_WORKER_MAX_REQUEST);
     ksd_buffer_init(&message, KSD_CAPTURE_WORKER_BOOTSTRAP_MAX);
     bool ok = group_count <= KSD_CAPTURE_WORKER_MAX_GROUPS
-        && request->payload_length <= KSD_CAPTURE_WORKER_MAX_REQUEST
-        && ksd_frame_pack(request, &frame) && frame.length <= UINT32_MAX
+        && (persistent
+            ? request == NULL
+            : (request != NULL
+               && request->payload_length <= KSD_CAPTURE_WORKER_MAX_REQUEST
+               && ksd_frame_pack(request, &frame)))
+        && frame.length <= UINT32_MAX
         && ksd_buffer_bytes(&message, worker_magic, sizeof(worker_magic))
         && ksd_buffer_u16(&message, KSD_CAPTURE_WORKER_VERSION)
         && ksd_buffer_u16(&message, (uint16_t)backend)
@@ -344,7 +353,7 @@ static bool send_bootstrap(int descriptor, const ksp_identity *identity,
         && ksd_buffer_u32(&message, (uint32_t)group_count)
         && ksd_buffer_u32(&message, (uint32_t)frame.length)
         && ksd_buffer_u32(&message, (uint32_t)session_pid)
-        && ksd_buffer_u32(&message, 0u);
+        && ksd_buffer_u32(&message, persistent ? 1u : 0u);
     for (size_t index = 0u; ok && index < group_count; index++)
         ok = ksd_buffer_u32(&message, (uint32_t)groups[index]);
     ok = ok && ksd_buffer_bytes(&message, frame.data, frame.length);
@@ -553,6 +562,70 @@ bool ksd_capture_worker_test_round_trip(const ksd_operation_result *sent,
 }
 #endif
 
+/* Starts a worker that stays. Returns its socket, which the caller drives with
+ * a request/response relay; the worker exits when that socket closes, which is
+ * also what makes it die with the authority without relying on PR_SET_PDEATHSIG
+ * -- that signal is per-THREAD, so a worker forked from a connection thread
+ * would be killed the moment that thread ended, which is the wrong lifetime
+ * entirely. End-of-file on the socket is thread-agnostic and exact. */
+int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
+                             pid_t session_pid, uint32_t backend)
+{
+    worker_environment environment;
+    gid_t *groups = NULL;
+    size_t group_count = 0u;
+    int executable = -1;
+    int sockets[2] = { -1, -1 };
+    int capture_pipe[2] = { -1, -1 };
+    pid_t worker = -1;
+    int kept = -1;
+
+    if (identity == NULL
+        || !capture_environment(identity, &environment)
+        || !capture_groups(identity, &groups, &group_count))
+        goto done;
+    executable = open(KSD_CAPTURE_WORKER_PATH,
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (!trusted_self(executable)
+        || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0
+        || !create_capture_pipe(capture_pipe))
+        goto done;
+    worker = fork();
+    if (worker == 0) {
+        if (dup2(sockets[1], KSD_CAPTURE_WORKER_FD) < 0
+            || dup2(executable, 4) < 0)
+            _exit(1);
+        char *spawn_argv[] = { KSD_CAPTURE_WORKER_PATH, NULL };
+
+        close_range(5, UINT_MAX, 0);
+        fexecve(4, spawn_argv, environment.values);
+        _exit(1);
+    }
+    if (worker < 0)
+        goto done;
+    close(sockets[1]);
+    sockets[1] = -1;
+    if (!send_bootstrap(sockets[0], identity, gid, groups, group_count, NULL,
+                        capture_pipe, session_pid, backend, true))
+        goto done;
+    kept = sockets[0];
+    sockets[0] = -1;
+
+done:
+    free(groups);
+    if (executable >= 0)
+        close(executable);
+    if (capture_pipe[0] >= 0)
+        close(capture_pipe[0]);
+    if (capture_pipe[1] >= 0)
+        close(capture_pipe[1]);
+    if (sockets[0] >= 0)
+        close(sockets[0]);
+    if (sockets[1] >= 0)
+        close(sockets[1]);
+    return kept;
+}
+
 void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 const ksd_frame *request,
                                 ksd_capture_worker_continue_fn keep_running,
@@ -626,7 +699,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
     if (worker < 0 || !send_bootstrap(sockets[0], identity, gid,
                                       groups, group_count, request,
                                       capture_pipe, session_pid,
-                                      backend)) {
+                                      backend, false)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "capture worker bootstrap failed");
         goto done;
@@ -829,6 +902,9 @@ typedef struct worker_bootstrap {
     /* Which backend the authority resolved. The worker cannot infer this: an
      * area capture is byte-identical whichever backend will serve it. */
     uint32_t backend;
+    /* Whether to serve until the socket closes rather than exit after one
+     * request. Never set for a capture. */
+    bool persistent;
 } worker_bootstrap;
 
 /* The whole header is validated before any field is used, because a version
@@ -842,7 +918,7 @@ static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
         || memcmp(bootstrap, worker_magic, sizeof(worker_magic)) != 0
         || ksd_decode_u16(bootstrap + 4u) != KSD_CAPTURE_WORKER_VERSION
         || ksd_decode_u16(bootstrap + 6u) > KSD_BACKEND_GENERIC
-        || ksd_decode_u32(bootstrap + 28u) != 0u)
+        || ksd_decode_u32(bootstrap + 28u) > 1u)
         return false;
     parsed->uid = (uid_t)ksd_decode_u32(bootstrap + 8u);
     parsed->gid = (gid_t)ksd_decode_u32(bootstrap + 12u);
@@ -850,13 +926,18 @@ static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
     parsed->frame_length = ksd_decode_u32(bootstrap + 20u);
     parsed->session_pid = (pid_t)ksd_decode_u32(bootstrap + 24u);
     parsed->backend = ksd_decode_u16(bootstrap + 6u);
+    parsed->persistent = ksd_decode_u32(bootstrap + 28u) != 0u;
     size_t groups_length = (size_t)parsed->group_count * sizeof(uint32_t);
     return (uint64_t)parsed->uid == ksd_decode_u32(bootstrap + 8u)
         && (uint64_t)parsed->gid == ksd_decode_u32(bootstrap + 12u)
         && parsed->session_pid > 0
         && (uint64_t)parsed->session_pid == ksd_decode_u32(bootstrap + 24u)
         && parsed->group_count <= KSD_CAPTURE_WORKER_MAX_GROUPS
-        && parsed->frame_length >= KSD_FRAME_HEADER_SIZE
+        /* A persistent worker is started with no request: it exists to serve
+         * the ones that follow. A one-shot worker must carry exactly one. */
+        && (parsed->persistent
+            ? parsed->frame_length == 0u
+            : parsed->frame_length >= KSD_FRAME_HEADER_SIZE)
         && parsed->frame_length <= KSD_FRAME_HEADER_SIZE
             + KSD_CAPTURE_WORKER_MAX_REQUEST
         && KSD_CAPTURE_WORKER_HEADER_SIZE + groups_length
@@ -869,6 +950,154 @@ bool ksd_capture_worker_test_parse_header(const uint8_t *bootstrap,
 {
     worker_bootstrap parsed;
     return parse_bootstrap_header(bootstrap, length, &parsed);
+}
+#endif
+
+/* One request in, one answer out, until the far end closes.
+ *
+ * The connection is opened lazily and reopened when it fails, rather than at
+ * start: a worker that could not connect at start would be useless for the
+ * whole session, while one that reconnects survives a compositor restart. A
+ * failed connection is told apart from a failed operation by the execute_on
+ * return value, which is why that distinction exists.
+ */
+#ifdef KSD_CAPTURE_WORKER_TESTING
+/* Counts the display connections the persistent server opens. The whole point
+ * of a persistent worker is that this stays at one however many requests
+ * arrive, and that property is invisible from outside the process: the answers
+ * are identical whether the connection was reused or reopened per request, so
+ * only a count can tell the two apart. */
+unsigned ksd_capture_worker_test_opens;
+#define KSD_NOTE_DISPLAY_OPEN() (ksd_capture_worker_test_opens++)
+#else
+#define KSD_NOTE_DISPLAY_OPEN() ((void)0)
+#endif
+
+static bool serve_persistently(uint32_t backend, pid_t session_pid)
+{
+    struct ksd_x11 *x11_connection = NULL;
+    struct ksd_wayland *wayland_connection = NULL;
+    bool ok = true;
+
+    for (;;) {
+        uint8_t header[KSD_FRAME_HEADER_SIZE];
+        uint8_t *body = NULL;
+        uint32_t payload_length;
+        ksd_frame request;
+        ksd_operation_result result;
+        ksd_buffer packed;
+        ksd_frame answer;
+        ksd_buffer payload;
+        bool alive = true;
+
+        if (!ksd_read_all(KSD_CAPTURE_WORKER_FD, header, sizeof(header)))
+            break;
+        payload_length =
+            ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
+        if (payload_length > KSD_CAPTURE_WORKER_MAX_REQUEST) {
+            ok = false;
+            break;
+        }
+        if (payload_length != 0u) {
+            body = malloc(payload_length);
+            if (body == NULL
+                || !ksd_read_all(KSD_CAPTURE_WORKER_FD, body,
+                                 payload_length)) {
+                free(body);
+                ok = false;
+                break;
+            }
+        }
+        memset(&request, 0, sizeof(request));
+        request.opcode = ksd_decode_u16(header + KSD_FRAME_OPCODE_OFFSET);
+        request.request_id =
+            ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET);
+        request.payload = body;
+        request.payload_length = payload_length;
+
+        ksd_result_init(&result);
+        if (backend == KSD_BACKEND_X11) {
+            if (x11_connection == NULL) {
+                ksd_status status = ksd_x11_open_for_session(session_pid,
+                                                             &x11_connection);
+                if (status == KSD_STATUS_OK)
+                    KSD_NOTE_DISPLAY_OPEN();
+                else
+                    ksd_result_error(&result, status, 0u,
+                                     "could not open the X display for this "
+                                     "session");
+            }
+            if (x11_connection != NULL)
+                alive = ksd_x11_execute_on(x11_connection, &request, &result);
+        } else {
+            if (wayland_connection == NULL) {
+                ksd_status status =
+                    ksd_wayland_open_for_session(session_pid,
+                                                 &wayland_connection);
+                if (status == KSD_STATUS_OK)
+                    KSD_NOTE_DISPLAY_OPEN();
+                else
+                    ksd_result_error(&result, status, 0u,
+                                     "could not reach the compositor for this "
+                                     "session");
+            }
+            if (wayland_connection != NULL)
+                alive = ksd_wayland_execute_on(wayland_connection, &request,
+                                               &result);
+        }
+        /* A dead connection is dropped so the NEXT request reopens. The
+         * current answer still goes back: the caller asked one question and
+         * gets one answer, rather than silence because the display chose that
+         * moment to go. */
+        if (!alive) {
+            if (x11_connection != NULL) {
+                ksd_x11_close(x11_connection);
+                x11_connection = NULL;
+            }
+            if (wayland_connection != NULL) {
+                ksd_wayland_close(wayland_connection);
+                wayland_connection = NULL;
+            }
+        }
+
+        ksd_buffer_init(&payload, result.tail_length + 8u);
+        ok = ksd_buffer_u32(&payload, result.status)
+            && ksd_buffer_u32(&payload, result.detail)
+            && (result.tail_length == 0u
+                || ksd_buffer_bytes(&payload, result.tail,
+                                    result.tail_length));
+        memset(&answer, 0, sizeof(answer));
+        answer.magic[0] = KSD_FRAME_MAGIC_0;
+        answer.magic[1] = KSD_FRAME_MAGIC_1;
+        answer.magic[2] = KSD_FRAME_MAGIC_2;
+        answer.magic[3] = KSD_FRAME_MAGIC_3;
+        answer.major = KSD_PROTOCOL_MAJOR;
+        answer.minor = KSD_PROTOCOL_MINOR;
+        answer.request_id = request.request_id;
+        answer.payload = payload.data;
+        answer.payload_length = (uint32_t)payload.length;
+        ksd_buffer_init(&packed, payload.length + KSD_FRAME_HEADER_SIZE + 16u);
+        ok = ok && ksd_frame_pack(&answer, &packed)
+            && ksd_write_all(KSD_CAPTURE_WORKER_FD, packed.data,
+                             packed.length);
+        ksd_buffer_clear(&packed);
+        ksd_buffer_clear(&payload);
+        ksd_result_clear(&result);
+        free(body);
+        if (!ok)
+            break;
+    }
+    if (x11_connection != NULL)
+        ksd_x11_close(x11_connection);
+    if (wayland_connection != NULL)
+        ksd_wayland_close(wayland_connection);
+    return ok;
+}
+
+#ifdef KSD_CAPTURE_WORKER_TESTING
+bool ksd_capture_worker_test_serve(uint32_t backend, pid_t session_pid)
+{
+    return serve_persistently(backend, session_pid);
 }
 #endif
 
@@ -912,6 +1141,20 @@ int ksd_capture_worker_main(int argc, char **argv)
     if (capture_spool < 0
         || !drop_worker_privileges(uid, gid, groups, group_count))
         goto failed;
+    if (header.persistent) {
+        /* No initial request to unpack. Everything this worker will ever do
+         * arrives on the socket, and the pipe and spool a capture needs are
+         * deliberately not held open across a session. */
+        close(capture_pipe[0]);
+        close(capture_pipe[1]);
+        close(capture_spool);
+        capture_pipe[0] = -1;
+        capture_pipe[1] = -1;
+        capture_spool = -1;
+        bool served = serve_persistently(header.backend, header.session_pid);
+        close(KSD_CAPTURE_WORKER_FD);
+        return served ? 0 : 1;
+    }
     const uint8_t *packed = bootstrap + KSD_CAPTURE_WORKER_HEADER_SIZE
         + groups_length;
     bool unpacked = ksd_frame_unpack(packed, frame_length, public_magic,

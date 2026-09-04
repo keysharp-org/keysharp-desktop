@@ -34,4 +34,9 @@ ksd_status ksd_wayland_open(const char *display, ksd_wayland **connection);
 void ksd_wayland_close(ksd_wayland *connection);
 ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection);
 
+/* Whether the compositor connection has failed. A worker that keeps one must
+ * notice and reopen rather than answering every later request from a dead
+ * connection. */
+bool ksd_wayland_connection_failed(const ksd_wayland *connection);
+
 #endif

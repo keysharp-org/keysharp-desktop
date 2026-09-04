@@ -20,6 +20,12 @@ ksd_status ksd_x11_open(const char *display, const char *authority,
                         ksd_x11 **connection);
 void ksd_x11_close(ksd_x11 *connection);
 
+/* Whether the connection has failed. xcb latches an I/O error permanently, so
+ * once this is true every later request on it fails too -- a worker that keeps
+ * a connection must notice and reopen rather than answering every request from
+ * a dead one. */
+bool ksd_x11_connection_failed(const ksd_x11 *connection);
+
 /* True when the server reports the XWAYLAND extension. Exposed so the refusal
  * can be told apart from a connection failure in a diagnostic. */
 bool ksd_x11_server_is_xwayland(ksd_x11 *connection);

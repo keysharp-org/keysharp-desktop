@@ -71,37 +71,32 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
     }
 }
 
-void ksd_wayland_execute(const ksd_frame *request, pid_t session_pid,
-                         ksd_operation_result *result)
+ksd_status ksd_wayland_open_for_session(pid_t session_pid,
+                                        struct ksd_wayland **connection)
 {
     char display[KSD_WL_DISPLAY_CAPACITY];
-    ksd_wayland *connection = NULL;
-    ksd_status status;
 
-    if (!ksd_wayland_request_valid(request)) {
-        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
-                         "invalid Wayland request");
-        return;
-    }
+    if (connection == NULL)
+        return KSD_STATUS_INVALID_REQUEST;
+    *connection = NULL;
     /* From the registered daemon's environment, never the caller's: a client
      * that could name the compositor could point this at one it started. */
     if (!ksd_session_environ_value(session_pid, "WAYLAND_DISPLAY", display,
-                                   sizeof(display))) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "the session names no Wayland display");
-        return;
-    }
-    if (!display_name_valid(display)) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "the session names a display this service will not "
-                         "open");
-        return;
-    }
-    status = ksd_wayland_open(display, &connection);
-    if (status != KSD_STATUS_OK) {
-        ksd_result_error(result, status, 0u,
-                         "could not reach the compositor for this session");
-        return;
+                                   sizeof(display)))
+        return KSD_STATUS_UNAVAILABLE;
+    if (!display_name_valid(display))
+        return KSD_STATUS_UNAVAILABLE;
+    return ksd_wayland_open(display, connection);
+}
+
+bool ksd_wayland_execute_on(struct ksd_wayland *connection,
+                            const ksd_frame *request,
+                            ksd_operation_result *result)
+{
+    if (connection == NULL || !ksd_wayland_request_valid(request)) {
+        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
+                         "invalid Wayland request");
+        return true;
     }
     switch (request->opcode) {
         case KSD_OP_CLIPBOARD_MIMETYPES:
@@ -132,5 +127,26 @@ void ksd_wayland_execute(const ksd_frame *request, pid_t session_pid,
                              "invalid Wayland request");
             break;
     }
+    return !ksd_wayland_connection_failed(connection);
+}
+
+void ksd_wayland_execute(const ksd_frame *request, pid_t session_pid,
+                         ksd_operation_result *result)
+{
+    ksd_wayland *connection = NULL;
+    ksd_status status;
+
+    if (!ksd_wayland_request_valid(request)) {
+        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
+                         "invalid Wayland request");
+        return;
+    }
+    status = ksd_wayland_open_for_session(session_pid, &connection);
+    if (status != KSD_STATUS_OK) {
+        ksd_result_error(result, status, 0u,
+                         "could not reach the compositor for this session");
+        return;
+    }
+    (void)ksd_wayland_execute_on(connection, request, result);
     ksd_wayland_close(connection);
 }

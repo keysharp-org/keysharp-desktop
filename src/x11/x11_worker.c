@@ -159,13 +159,39 @@ bool ksd_x11_request_valid(const ksd_frame *request)
     }
 }
 
-void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
-                     ksd_operation_result *result)
+ksd_status ksd_x11_open_for_session(pid_t session_pid,
+                                    struct ksd_x11 **connection)
 {
     char display[256];
     char canonical[KSD_X11_DISPLAY_CAPACITY];
     char authority[KSD_X11_AUTHORITY_CAPACITY];
     const char *authority_value = NULL;
+    /* Both variables out of one read. Two reads could see two different
+     * processes if the daemon exited and its pid were reused between them,
+     * and the display would then come from one and its authority from
+     * another. */
+    static const char *const wanted[] = { "DISPLAY", "XAUTHORITY" };
+    char *slots[] = { display, authority };
+
+    if (connection == NULL)
+        return KSD_STATUS_INVALID_REQUEST;
+    *connection = NULL;
+    if (!ksd_session_environ_values(session_pid, wanted, slots,
+                                    sizeof(display), 2u)
+        || display[0] == 0)
+        return KSD_STATUS_UNAVAILABLE;
+    if (!ksd_x11_display_parse(display, canonical, sizeof(canonical)))
+        return KSD_STATUS_UNAVAILABLE;
+    /* Optional. An absolute path only: a relative one would resolve against
+     * whatever directory the worker happens to be in. */
+    if (authority[0] == '/')
+        authority_value = authority;
+    return ksd_x11_open(canonical, authority_value, connection);
+}
+
+void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
+                     ksd_operation_result *result)
+{
     ksd_x11 *connection = NULL;
     ksd_status status;
 
@@ -174,30 +200,28 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
                          "invalid X11 request");
         return;
     }
-    if (!ksd_session_environ_value(session_pid, "DISPLAY", display, sizeof(display))) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "the session names no X display");
-        return;
-    }
-    if (!ksd_x11_display_parse(display, canonical, sizeof(canonical))) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "the session names a display this service will not "
-                         "open");
-        return;
-    }
-    /* Optional. An absolute path only: a relative one would resolve against
-     * whatever directory the worker happens to be in. */
-    if (ksd_session_environ_value(session_pid, "XAUTHORITY", authority, sizeof(authority))
-        && authority[0] == '/')
-        authority_value = authority;
-
-    status = ksd_x11_open(canonical, authority_value, &connection);
+    status = ksd_x11_open_for_session(session_pid, &connection);
     if (status != KSD_STATUS_OK) {
         ksd_result_error(result, status, 0u,
                          "could not open the X display for this session");
         return;
     }
+    (void)ksd_x11_execute_on(connection, request, result);
+    ksd_x11_close(connection);
+}
 
+/* Serves one request on a connection the caller keeps. Returns false only when
+ * the connection itself is gone, which is the caller's cue to reopen rather
+ * than to answer -- a display that went away is not the same as an operation
+ * that failed, and a persistent worker must be able to tell them apart. */
+bool ksd_x11_execute_on(struct ksd_x11 *connection, const ksd_frame *request,
+                        ksd_operation_result *result)
+{
+    if (connection == NULL || !ksd_x11_request_valid(request)) {
+        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
+                         "invalid X11 request");
+        return true;
+    }
     switch (request->opcode) {
         case KSD_OP_WINDOW_LIST: {
             ksd_cursor cursor;
@@ -337,5 +361,8 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
                              "invalid X11 request");
             break;
     }
-    ksd_x11_close(connection);
+    /* The connection is the caller's. A request that failed because the server
+     * went away is reported through the return value, so the caller reopens
+     * instead of answering every later request on a dead connection. */
+    return !ksd_x11_connection_failed(connection);
 }

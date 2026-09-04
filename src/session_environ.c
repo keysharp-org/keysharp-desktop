@@ -62,3 +62,67 @@ bool ksd_session_environ_value(pid_t pid, const char *name,
     }
     return false;
 }
+
+bool ksd_session_environ_values(pid_t pid, const char *const *names,
+                                char **destinations, size_t capacity,
+                                size_t count)
+{
+    char path[64];
+    char environment[KSD_ENVIRON_LIMIT + 1u];
+    size_t offset = 0u;
+    int length = snprintf(path, sizeof(path), "/proc/%ld/environ", (long)pid);
+
+    if (pid <= 0 || names == NULL || destinations == NULL || count == 0u
+        || length <= 0 || (size_t)length >= sizeof(path))
+        return false;
+    for (size_t index = 0u; index < count; index++) {
+        if (destinations[index] == NULL || capacity == 0u)
+            return false;
+        destinations[index][0] = 0;
+    }
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0)
+        return false;
+    while (offset < sizeof(environment) - 1u) {
+        ssize_t got = read(descriptor, environment + offset,
+                           sizeof(environment) - 1u - offset);
+
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0)
+            break;
+        offset += (size_t)got;
+    }
+    close(descriptor);
+    environment[offset] = 0;
+
+    for (size_t index = 0u; index < offset;) {
+        const char *entry = environment + index;
+        size_t remaining = offset - index;
+        size_t entry_length = strnlen(entry, remaining);
+
+        /* A final entry with no terminator means the file was truncated under
+         * us, and a truncated environment could be missing exactly the
+         * variable being looked for. Refuse the lot rather than answer from
+         * half a file. */
+        if (entry_length == remaining)
+            return false;
+        for (size_t which = 0u; which < count; which++) {
+            size_t name_length = strlen(names[which]);
+
+            if (entry_length > name_length && entry[name_length] == '='
+                && memcmp(entry, names[which], name_length) == 0) {
+                size_t value_length = entry_length - name_length - 1u;
+
+                if (value_length != 0u && value_length < capacity) {
+                    memcpy(destinations[which], entry + name_length + 1u,
+                           value_length);
+                    destinations[which][value_length] = 0;
+                }
+                break;
+            }
+        }
+        index += entry_length + 1u;
+    }
+    return true;
+}

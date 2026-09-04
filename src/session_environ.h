@@ -19,4 +19,20 @@
 bool ksd_session_environ_value(pid_t pid, const char *name, char *destination,
                                size_t capacity);
 
+/* Several variables out of ONE read of the same file.
+ *
+ * The single-value form opens and reads /proc/<pid>/environ per variable, and
+ * X11 needs two of them, so it read a 64 KiB file twice per request. Worse
+ * than the cost, the two reads can see different processes: nothing stops the
+ * daemon exiting and its pid being reused between them, and the display would
+ * then come from one process and its authority file from another.
+ *
+ * names and destinations are parallel arrays of count entries. Each
+ * destination holds at most capacity bytes. A name that is absent leaves its
+ * destination an empty string; the return value is whether the file could be
+ * read at all, not whether every name was found. */
+bool ksd_session_environ_values(pid_t pid, const char *const *names,
+                                char **destinations, size_t capacity,
+                                size_t count);
+
 #endif
