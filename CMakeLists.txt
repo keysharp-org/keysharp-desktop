@@ -447,6 +447,11 @@ if(BUILD_TESTING)
     target_link_libraries(kwin-host-tests PRIVATE keysharp-desktop-common)
     add_test(NAME kwin-host-tests COMMAND kwin-host-tests)
 
+    add_executable(kwin-relay-tests tests/kwin_relay_tests.c)
+    target_link_libraries(kwin-relay-tests PRIVATE
+        keysharp-desktop-common Threads::Threads)
+    add_test(NAME kwin-relay-tests COMMAND kwin-relay-tests)
+
     # Compiles the clipboard source rather than linking it, so the hook that
     # lowers the deadline is reachable, and links wayland-server so the test
     # can BE the compositor.

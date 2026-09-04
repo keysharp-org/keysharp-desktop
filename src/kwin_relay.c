@@ -4,6 +4,7 @@
 #include "transport.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,15 +86,42 @@ void ksd_kwin_relay_destroy(ksd_kwin_relay *relay)
     free(relay);
 }
 
+/* Waits for the socket to become readable, or gives up at the deadline.
+ * Without this the reader blocks in a read that has no timeout, and a daemon
+ * that stops answering parks that thread for ever -- it never returns to check
+ * its own deadline, and every other caller waits on it. */
+static int wait_readable(int descriptor, uint64_t deadline_ms)
+{
+    for (;;) {
+        struct pollfd item = { .fd = descriptor, .events = POLLIN };
+        uint64_t now = relay_monotonic_ms();
+        int ready;
+
+        if (now == 0u || now >= deadline_ms)
+            return 0;
+        ready = poll(&item, 1u, (int)(deadline_ms - now));
+        if (ready < 0 && errno == EINTR)
+            continue;
+        return ready;
+    }
+}
+
 /* Reads one response frame and hands it to whoever was waiting for it. Called
- * with the lock NOT held, by whichever caller took the reader role. */
-static bool read_one(ksd_kwin_relay *relay)
+ * with the lock NOT held, by whichever caller took the reader role. Returns
+ * false only on a broken channel; a deadline that passes with nothing to read
+ * is reported by leaving nothing matched, so the caller re-checks its own. */
+static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
 {
     uint8_t header[KSD_FRAME_HEADER_SIZE];
     uint8_t *body = NULL;
     ksd_frame frame;
     bool matched = false;
+    int ready = wait_readable(relay->descriptor, deadline_ms);
 
+    if (ready == 0)
+        return true;
+    if (ready < 0)
+        return false;
     if (!ksd_read_all(relay->descriptor, header, sizeof(header)))
         return false;
     uint32_t payload_length =
@@ -216,7 +244,9 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
              * had arrived. */
             relay->reading = true;
             pthread_mutex_unlock(&relay->mutex);
-            bool ok = read_one(relay);
+            /* Bounded by this caller's own deadline. A reader that outlived
+             * it would hold the role while its owner had already given up. */
+            bool ok = read_one(relay, deadline_ms);
             pthread_mutex_lock(&relay->mutex);
             relay->reading = false;
             if (!ok)
