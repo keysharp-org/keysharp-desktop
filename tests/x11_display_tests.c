@@ -63,15 +63,41 @@ static void check_request_validity(void)
     empty = verb(KSD_OP_WORK_AREA, list_ok, 8u);
     assert(!ksd_x11_request_valid(&empty));
 
-    /* Every opcode the X11 worker does not serve, including the captures it
-     * deliberately does not advertise yet. */
+    /* The two clipboard reads that take no argument. */
+    empty = verb(KSD_OP_CLIPBOARD_TEXT, NULL, 0u);
+    assert(ksd_x11_request_valid(&empty));
+    empty = verb(KSD_OP_CLIPBOARD_MIMETYPES, NULL, 0u);
+    assert(ksd_x11_request_valid(&empty));
+
+    /* A capture carries a rectangle or a handle, so the bare opcode is not a
+     * request: the shape is checked, not just the opcode. */
     ksd_frame other = verb(KSD_OP_CAPTURE_AREA, NULL, 0u);
     assert(!ksd_x11_request_valid(&other));
     other = verb(KSD_OP_CAPTURE_WINDOW, NULL, 0u);
     assert(!ksd_x11_request_valid(&other));
+
+    /* Reading one format needs the name of the format. */
+    static const uint8_t mimetype[] = {
+        7u, 0u, 0u, 0u, 't', 'e', 'x', 't', '/', 'c', 's'
+    };
+    other = verb(KSD_OP_CLIPBOARD_CONTENT, mimetype, sizeof(mimetype));
+    assert(ksd_x11_request_valid(&other));
+    other = verb(KSD_OP_CLIPBOARD_CONTENT, NULL, 0u);
+    assert(!ksd_x11_request_valid(&other));
+    /* A length that does not match the bytes that follow it. */
+    static const uint8_t truncated[] = { 9u, 0u, 0u, 0u, 't', 'e', 'x', 't' };
+    other = verb(KSD_OP_CLIPBOARD_CONTENT, truncated, sizeof(truncated));
+    assert(!ksd_x11_request_valid(&other));
+
+    /* Writing the clipboard is refused: this worker cannot hold a selection,
+     * and accepting the request would drop the content when it exited. */
+    other = verb(KSD_OP_CLIPBOARD_SET_CONTENT, NULL, 0u);
+    assert(!ksd_x11_request_valid(&other));
+
+    /* Window control needs a window manager, and input is not this project. */
     other = verb(KSD_OP_WINDOW_CLOSE, NULL, 0u);
     assert(!ksd_x11_request_valid(&other));
-    other = verb(KSD_OP_CLIPBOARD_TEXT, NULL, 0u);
+    other = verb(KSD_OP_MOUSE_BUTTON, NULL, 0u);
     assert(!ksd_x11_request_valid(&other));
     assert(!ksd_x11_request_valid(NULL));
 }

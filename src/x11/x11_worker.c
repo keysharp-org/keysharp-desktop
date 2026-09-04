@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "protocol_io.h"
 #include "x11_capture.h"
+#include "x11_clipboard.h"
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
@@ -82,6 +83,20 @@ bool ksd_x11_request_valid(const ksd_frame *request)
                 && ksd_cursor_bytes(&cursor, length, &bytes)
                 && ksd_cursor_finished(&cursor)
                 && parse_xid(bytes, length, &xid);
+        }
+        case KSD_OP_CLIPBOARD_MIMETYPES:
+        case KSD_OP_CLIPBOARD_TEXT:
+            return request->payload_length == 0u;
+        case KSD_OP_CLIPBOARD_CONTENT: {
+            uint32_t length;
+            const uint8_t *bytes;
+            /* Validated the same way the providers validate it, so a request
+             * this backend refuses is one they would refuse too. */
+            return ksd_cursor_u32(&cursor, &length)
+                && length != 0u && length <= KSD_MAX_MIMETYPE_BYTES
+                && ksd_cursor_bytes(&cursor, length, &bytes)
+                && ksd_cursor_finished(&cursor)
+                && ksd_utf8_valid(bytes, length, false);
         }
         default:
             return false;
@@ -230,6 +245,23 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
             (void)parse_xid(bytes, length, &xid);
             ksd_x11_capture_window(connection, xid,
                 (flags & KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u, result);
+            break;
+        }
+        case KSD_OP_CLIPBOARD_MIMETYPES:
+            ksd_x11_clipboard_mimetypes(connection, result);
+            break;
+        case KSD_OP_CLIPBOARD_TEXT:
+            ksd_x11_clipboard_text(connection, result);
+            break;
+        case KSD_OP_CLIPBOARD_CONTENT: {
+            ksd_cursor cursor;
+            uint32_t length = 0u;
+            const uint8_t *bytes = NULL;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u32(&cursor, &length);
+            (void)ksd_cursor_bytes(&cursor, length, &bytes);
+            ksd_x11_clipboard_content(connection, bytes, length, result);
             break;
         }
         default:

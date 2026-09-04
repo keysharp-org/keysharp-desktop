@@ -34,11 +34,24 @@ while [ "$display" -lt 110 ]; do
     server=$!
     attempt=0
     while [ "$attempt" -lt 40 ]; do
-        if KSD_TEST_DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
-            KSD_TEST_DISPLAY=":${display}" exec "$binary"
-        fi
+        # Our own server has to be alive BEFORE the display is probed. If it
+        # exited, this display belongs to someone else -- a leftover server, or
+        # another job on the same machine -- and the probe would succeed
+        # against theirs, running the whole suite on a display this script
+        # neither started nor controls, against whatever state it carries.
         if ! kill -0 "$server" 2>/dev/null; then
             break
+        fi
+        if KSD_TEST_DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
+            # Deliberately not exec. Replacing the shell would drop the EXIT
+            # trap with it, orphaning the server: every successful run leaked
+            # one, and the next run then adopted it by the path above and
+            # inherited its state.
+            KSD_TEST_DISPLAY=":${display}" "$binary"
+            status=$?
+            cleanup
+            server=""
+            exit "$status"
         fi
         sleep 0.1
         attempt=$((attempt + 1))

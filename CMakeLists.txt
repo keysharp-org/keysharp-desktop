@@ -110,6 +110,7 @@ add_library(keysharp-desktop-x11 STATIC
     src/x11/x11_query.c
     src/x11/x11_windows.c
     src/x11/x11_capture.c
+    src/x11/x11_clipboard.c
     src/x11/x11_worker.c)
 target_include_directories(keysharp-desktop-x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -341,7 +342,8 @@ if(BUILD_TESTING)
     # offers MIT-SHM would otherwise never run the fallback at all.
     add_executable(x11-server-tests
         tests/x11_server_tests.c
-        src/x11/x11_capture.c)
+        src/x11/x11_capture.c
+        src/x11/x11_clipboard.c)
     target_compile_definitions(x11-server-tests PRIVATE
         KSD_X11_TESTING _GNU_SOURCE _POSIX_C_SOURCE=200809L)
     target_link_libraries(x11-server-tests PRIVATE

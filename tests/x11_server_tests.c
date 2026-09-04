@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "protocol_io.h"
 #include "x11_capture.h"
+#include "x11_clipboard.h"
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
@@ -11,7 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <xcb/xcb.h>
 
@@ -156,6 +160,8 @@ static uint32_t pixel_at(const uint8_t *capture, uint32_t x, uint32_t y)
  * compiles that source rather than taking it from the library. */
 extern bool ksd_x11_capture_disable_shm;
 extern unsigned ksd_x11_capture_shm_count;
+/* Defined in x11_clipboard.c under the same define. */
+extern int ksd_x11_clipboard_timeout_ms;
 
 #define PATCH 64u
 /* Blue 0x40, green 0x80, red 0xff. Three different bytes, so a channel swap
@@ -310,6 +316,288 @@ static void check_capture(ksd_x11 *connection, xcb_connection_t *owner,
     xcb_flush(owner);
 }
 
+#define CLIP_TEXT "clipboard \xc3\xa4\xc3\xb6 text"
+#define CLIP_CSV "a,b,c"
+
+/* A forked helper must not outlive the test that started it. When an assertion
+ * aborts the parent the child keeps running, and because it inherited the
+ * stdout pipe, ctest blocks waiting for EOF on that pipe rather than reaping
+ * the failure -- so a failing assertion costs the suite's entire timeout
+ * instead of failing at once. Asking the kernel to kill the child with its
+ * parent, and dropping the inherited pipes, removes both halves of that. */
+static void detach_child(void)
+{
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    /* The parent can die between the fork and the line above, in which case
+     * that signal will never arrive and only this check ends the child. */
+    if (getppid() == 1)
+        _exit(0);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/dev/null", "w", stderr);
+}
+
+static xcb_atom_t intern_in(xcb_connection_t *c, const char *name)
+{
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c,
+        xcb_intern_atom(c, 0, (uint16_t)strlen(name), name), NULL);
+    xcb_atom_t atom = reply == NULL ? XCB_ATOM_NONE : reply->atom;
+
+    free(reply);
+    return atom;
+}
+
+/* Becomes the clipboard owner and answers conversion requests, which is the
+ * only way to read a selection: there is no clipboard on an X server, only
+ * whichever client currently claims to hold one. Runs in a child process
+ * because the read under test blocks waiting for exactly these replies. */
+static void own_clipboard(const char *canonical)
+{
+    xcb_connection_t *c;
+
+    detach_child();
+    c = xcb_connect(canonical, NULL);
+    xcb_screen_t *screen;
+    xcb_window_t window;
+    xcb_atom_t clipboard;
+    xcb_atom_t targets;
+    xcb_atom_t utf8;
+    xcb_atom_t csv;
+    xcb_generic_event_t *event;
+
+    if (c == NULL || xcb_connection_has_error(c) != 0)
+        _exit(1);
+    screen = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+    clipboard = intern_in(c, "CLIPBOARD");
+    targets = intern_in(c, "TARGETS");
+    utf8 = intern_in(c, "UTF8_STRING");
+    csv = intern_in(c, "text/csv");
+    window = xcb_generate_id(c);
+    xcb_create_window(c, XCB_COPY_FROM_PARENT, window, screen->root, 0, 0, 1u,
+                      1u, 0, XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT,
+                      0, NULL);
+    xcb_set_selection_owner(c, window, clipboard, XCB_CURRENT_TIME);
+    xcb_flush(c);
+
+    while ((event = xcb_wait_for_event(c)) != NULL) {
+        xcb_selection_request_event_t *request;
+        xcb_selection_notify_event_t notify;
+
+        if ((event->response_type & 0x7fu) != XCB_SELECTION_REQUEST) {
+            free(event);
+            continue;
+        }
+        request = (xcb_selection_request_event_t *)event;
+        memset(&notify, 0, sizeof(notify));
+        notify.response_type = XCB_SELECTION_NOTIFY;
+        notify.requestor = request->requestor;
+        notify.selection = request->selection;
+        notify.target = request->target;
+        notify.time = request->time;
+        notify.property = request->property;
+
+        if (request->target == targets) {
+            xcb_atom_t offered[] = { targets, utf8, csv };
+            xcb_change_property(c, XCB_PROP_MODE_REPLACE, request->requestor,
+                                request->property, XCB_ATOM_ATOM, 32, 3u,
+                                offered);
+        } else if (request->target == utf8) {
+            xcb_change_property(c, XCB_PROP_MODE_REPLACE, request->requestor,
+                                request->property, utf8, 8,
+                                (uint32_t)strlen(CLIP_TEXT), CLIP_TEXT);
+        } else if (request->target == csv) {
+            xcb_change_property(c, XCB_PROP_MODE_REPLACE, request->requestor,
+                                request->property, csv, 8,
+                                (uint32_t)strlen(CLIP_CSV), CLIP_CSV);
+        } else {
+            /* A target the owner will not convert to. None is how ICCCM says
+             * so, and the service must report that rather than hanging. */
+            notify.property = XCB_ATOM_NONE;
+        }
+        xcb_send_event(c, 0, request->requestor, 0, (const char *)&notify);
+        xcb_flush(c);
+        free(event);
+    }
+    _exit(0);
+}
+
+/* The reply the providers frame as a count and then the strings. */
+static bool mimetypes_contain(const ksd_operation_result *result,
+                              const char *wanted)
+{
+    const uint8_t *tail = result->tail;
+    uint32_t count;
+    size_t offset = 8u;
+
+    assert(result->tail_length >= 8u);
+    count = ksd_decode_u32(tail);
+    assert(ksd_decode_u32(tail + 4u) == 0u);
+    for (uint32_t index = 0u; index < count; index++) {
+        uint32_t length;
+
+        assert(offset + 4u <= result->tail_length);
+        length = ksd_decode_u32(tail + offset);
+        offset += 4u;
+        assert(offset + length <= result->tail_length);
+        if (strlen(wanted) == length
+            && memcmp(tail + offset, wanted, length) == 0)
+            return true;
+        offset += length;
+    }
+    assert(offset == result->tail_length);
+    return false;
+}
+
+static void check_clipboard(ksd_x11 *connection, xcb_connection_t *owner,
+                            const char *canonical)
+{
+    ksd_operation_result result;
+    xcb_atom_t clipboard = intern_in(owner, "CLIPBOARD");
+    pid_t child;
+    uint32_t length;
+
+    /* Nothing owns the clipboard yet, so every read is an empty answer rather
+     * than a failure: an unowned selection is a legitimate state. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_text(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(result.tail_length == 4u);
+    assert(ksd_decode_u32(result.tail) == 0u);
+    ksd_result_clear(&result);
+
+    ksd_result_init(&result);
+    ksd_x11_clipboard_mimetypes(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(ksd_decode_u32(result.tail) == 0u);
+    ksd_result_clear(&result);
+
+    child = fork();
+    assert(child >= 0);
+    if (child == 0)
+        own_clipboard(canonical);
+
+    /* Wait for the child to actually hold the selection. Reading before it
+     * does would test the unowned path again and pass for the wrong reason. */
+    for (int attempt = 0; attempt < 500; attempt++) {
+        xcb_get_selection_owner_reply_t *reply =
+            xcb_get_selection_owner_reply(owner,
+                xcb_get_selection_owner(owner, clipboard), NULL);
+        bool owned = reply != NULL && reply->owner != XCB_WINDOW_NONE;
+
+        free(reply);
+        if (owned)
+            break;
+        assert(attempt < 499);
+        usleep(10000);
+    }
+
+    /* Text comes back byte for byte, including the non-ASCII in it: a
+     * transport that mangled encoding would show here and not on plain ASCII. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_text(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    length = ksd_decode_u32(result.tail);
+    assert(length == strlen(CLIP_TEXT));
+    assert(memcmp(result.tail + 4u, CLIP_TEXT, length) == 0);
+    ksd_result_clear(&result);
+
+    /* The format list reports mimetypes. UTF8_STRING is an X11 target name,
+     * not a mimetype, so it is reported as the mimetype every other backend
+     * uses for text; TARGETS is not a format at all and must not appear. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_mimetypes(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(mimetypes_contain(&result, KSD_CLIPBOARD_TEXT_MIMETYPE));
+    assert(mimetypes_contain(&result, "text/csv"));
+    assert(!mimetypes_contain(&result, "TARGETS"));
+    assert(!mimetypes_contain(&result, "UTF8_STRING"));
+    ksd_result_clear(&result);
+
+    /* One named format, fetched by its mimetype. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_content(connection, (const uint8_t *)"text/csv", 8u,
+                              &result);
+    assert(result.status == KSD_STATUS_OK);
+    length = ksd_decode_u32(result.tail);
+    assert(length == strlen(CLIP_CSV));
+    assert(memcmp(result.tail + 4u, CLIP_CSV, length) == 0);
+    ksd_result_clear(&result);
+
+    /* The canonical text mimetype is spelled UTF8_STRING on the wire, so
+     * asking for it by mimetype has to reach the same bytes as the text verb. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_content(connection,
+                              (const uint8_t *)KSD_CLIPBOARD_TEXT_MIMETYPE,
+                              (uint32_t)strlen(KSD_CLIPBOARD_TEXT_MIMETYPE),
+                              &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(ksd_decode_u32(result.tail) == strlen(CLIP_TEXT));
+    ksd_result_clear(&result);
+
+    /* A format the owner will not convert to is refused, not waited on. The
+     * owner answers with None, and reporting that promptly is what keeps a
+     * hostile or merely unhelpful owner from parking the worker. */
+    ksd_result_init(&result);
+    ksd_x11_clipboard_content(connection, (const uint8_t *)"application/x-no",
+                              16u, &result);
+    assert(result.status == KSD_STATUS_UNSUPPORTED);
+    assert(result.tail == NULL);
+    ksd_result_clear(&result);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+
+    /* An owner that takes the selection and then never answers. Nothing in the
+     * protocol obliges it to reply, so without a deadline any client could
+     * park this worker for as long as it liked simply by claiming the
+     * clipboard and going quiet -- and the worker holds a slot while it waits.
+     * The budget is lowered here so proving that costs a fraction of a second
+     * rather than the whole production timeout. */
+    ksd_x11_clipboard_timeout_ms = 250;
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        xcb_connection_t *mute;
+
+        detach_child();
+        mute = xcb_connect(canonical, NULL);
+        xcb_screen_t *mute_screen =
+            xcb_setup_roots_iterator(xcb_get_setup(mute)).data;
+        xcb_window_t window = xcb_generate_id(mute);
+
+        xcb_create_window(mute, XCB_COPY_FROM_PARENT, window,
+                          mute_screen->root, 0, 0, 1u, 1u, 0,
+                          XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT,
+                          0, NULL);
+        xcb_set_selection_owner(mute, window, intern_in(mute, "CLIPBOARD"),
+                                XCB_CURRENT_TIME);
+        xcb_flush(mute);
+        for (;;)
+            pause();
+    }
+    for (int attempt = 0; attempt < 500; attempt++) {
+        xcb_get_selection_owner_reply_t *reply =
+            xcb_get_selection_owner_reply(owner,
+                xcb_get_selection_owner(owner, clipboard), NULL);
+        bool owned = reply != NULL && reply->owner != XCB_WINDOW_NONE;
+
+        free(reply);
+        if (owned)
+            break;
+        assert(attempt < 499);
+        usleep(10000);
+    }
+
+    ksd_result_init(&result);
+    ksd_x11_clipboard_text(connection, &result);
+    assert(result.status == KSD_STATUS_TIMEOUT);
+    assert(result.tail == NULL);
+    ksd_result_clear(&result);
+
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    ksd_x11_clipboard_timeout_ms = 5000;
+}
+
 int main(void)
 {
     const char *display = getenv("KSD_TEST_DISPLAY");
@@ -357,6 +645,7 @@ int main(void)
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(owner)).data;
     assert(screen != NULL);
     check_capture(connection, owner, screen);
+    check_clipboard(connection, owner, canonical);
     xcb_disconnect(owner);
 
     ksd_x11_close(connection);

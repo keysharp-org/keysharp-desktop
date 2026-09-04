@@ -175,7 +175,18 @@ int main(void)
            == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
                | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA
                | KSD_OPERATION_CAPTURE_AREA
-               | KSD_OPERATION_CAPTURE_WINDOW));
+               | KSD_OPERATION_CAPTURE_WINDOW
+               | KSD_OPERATION_CLIPBOARD_MIMETYPES
+               | KSD_OPERATION_CLIPBOARD_CONTENT
+               | KSD_OPERATION_CLIPBOARD_TEXT));
+    /* Reading the clipboard is served; writing it is not, and must not be
+     * advertised while no process outlives the request to hold the selection.
+     * A client told it can set the clipboard here would watch the content
+     * disappear as the worker exited. */
+    assert((ksd_backend_operations(KSD_BACKEND_X11)
+            & KSD_OPERATION_CLIPBOARD_SET_CONTENT) == 0u);
+    assert((ksd_backend_operations(KSD_BACKEND_X11)
+            & KSD_OPERATION_CLIPBOARD_WATCH) == 0u);
     for (uint32_t backend = KSD_BACKEND_X11 + 1u; backend <= 4096u; backend++)
         assert(ksd_backend_operations(backend) == 0u);
 

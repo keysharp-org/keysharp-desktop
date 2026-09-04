@@ -236,8 +236,16 @@ bool ksd_backend_session_unsupported(void)
 #define KSD_X11_CAPTURE_OPERATIONS \
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW)
 
+/* Reads only. Owning a selection means staying alive to answer requests for
+ * it, which a worker that exits with its one operation cannot do, so the write
+ * bit stays off until a process that outlives the request holds it. */
+#define KSD_X11_CLIPBOARD_OPERATIONS \
+    (KSD_OPERATION_CLIPBOARD_MIMETYPES | KSD_OPERATION_CLIPBOARD_CONTENT \
+     | KSD_OPERATION_CLIPBOARD_TEXT)
+
 #define KSD_X11_OPERATIONS \
-    (KSD_X11_COORDINATE_OPERATIONS | KSD_X11_CAPTURE_OPERATIONS)
+    (KSD_X11_COORDINATE_OPERATIONS | KSD_X11_CAPTURE_OPERATIONS \
+     | KSD_X11_CLIPBOARD_OPERATIONS)
 
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
 {
