@@ -129,11 +129,16 @@ static void check_registration_mask(void)
     assert(mask == (KSD_OPERATION_WINDOW_LIST
                     & ksd_backend_operations(KSD_BACKEND_GNOME)));
 
-    /* Asking for something the backend does not have yields nothing extra. */
+    /* Asking for something the backend does not have yields nothing extra.
+     * Input synthesis is the example because it is the one group this backend
+     * will not grow: it belongs to keysharp-input, not here. Capture used to
+     * stand here and stopped being absent, which is the hazard of naming a bit
+     * that is merely unimplemented rather than out of scope. */
     assert(ksd_backend_registration_mask(KSD_BACKEND_X11, version, 0u,
                                          ~UINT64_C(0), &mask));
     assert(mask == ksd_backend_operations(KSD_BACKEND_X11));
-    assert((mask & KSD_OPERATION_CAPTURE_AREA) == 0u);
+    assert((mask & (KSD_OPERATION_MOUSE_BUTTON
+                    | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE)) == 0u);
 
     /* A backend that serves nothing cannot be talked into serving something. */
     assert(ksd_backend_registration_mask(KSD_BACKEND_GENERIC, version, 0u,

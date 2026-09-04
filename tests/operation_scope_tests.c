@@ -164,13 +164,18 @@ int main(void)
             & KSD_OPERATION_CAPTURE_WINDOW) != 0u);
     assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
             & KSD_OPERATION_CAPTURE_AREA) == 0u);
-    /* X11 serves the coordinate group, and nothing that needs a compositor. */
+    /* X11 serves the coordinate group and both captures, and nothing that
+     * needs a compositor: no clipboard, no window control, no input. Pinned as
+     * an exact mask rather than a list of present bits, so a verb added to the
+     * backend without an implementation behind it fails here. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
     assert(ksd_backend_operations(KSD_BACKEND_X11)
            == ksd_backend_x11_route(KSD_BACKEND_X11, true));
-    assert((ksd_backend_operations(KSD_BACKEND_X11)
-            & (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW))
-           == 0u);
+    assert(ksd_backend_operations(KSD_BACKEND_X11)
+           == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
+               | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA
+               | KSD_OPERATION_CAPTURE_AREA
+               | KSD_OPERATION_CAPTURE_WINDOW));
     for (uint32_t backend = KSD_BACKEND_X11 + 1u; backend <= 4096u; backend++)
         assert(ksd_backend_operations(backend) == 0u);
 

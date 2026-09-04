@@ -68,10 +68,12 @@ static void check_capture_mask_matches_dispatch(void)
         for (size_t index = 0u; index < 2u; index++) {
             bool advertised = (mask & bits[index]) != 0u;
             /* Two routes serve a capture. GNOME and Cinnamon go through the
-             * provider; KWin never does, and is dispatched to the root capture
-             * worker instead. Either route counts as served, but something
+             * provider; KWin and X11 never do, and are dispatched to the
+             * forked capture worker instead -- X11 answers there from the X
+             * server itself. Either route counts as served, but something
              * must. */
             bool served = backend == KSD_BACKEND_KWIN
+                || backend == KSD_BACKEND_X11
                 || ksd_provider_capture_supported((ksd_backend)backend,
                                                   opcodes[index]);
 

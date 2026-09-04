@@ -2,6 +2,7 @@
 
 #include "protocol.h"
 #include "protocol_io.h"
+#include "x11_capture.h"
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
@@ -14,6 +15,32 @@
 
 #define KSD_X11_ENVIRON_LIMIT (64u * 1024u)
 #define KSD_X11_AUTHORITY_CAPACITY 4096u
+#define KSD_X11_HANDLE_DIGITS 10u
+
+/* A window handle on this backend is an XID, which is 32 bits. The provider
+ * backends parse the same field as a 64-bit value because a compositor id is
+ * one; accepting that range here and truncating it would let two different
+ * handles name one window. Rejecting the excess is the point of a separate
+ * parser rather than a shared one. */
+static bool parse_xid(const uint8_t *bytes, uint32_t length, uint32_t *xid)
+{
+    uint64_t value = 0u;
+
+    if (length == 0u || length > KSD_X11_HANDLE_DIGITS)
+        return false;
+    if (length > 1u && bytes[0] == '0')
+        return false;
+    for (uint32_t index = 0u; index < length; index++) {
+        if (bytes[index] < '0' || bytes[index] > '9')
+            return false;
+        value = value * 10u + (uint64_t)(bytes[index] - '0');
+    }
+    /* Zero is XCB_WINDOW_NONE, which names no window. */
+    if (value == 0u || value > UINT32_MAX)
+        return false;
+    *xid = (uint32_t)value;
+    return true;
+}
 
 bool ksd_x11_request_valid(const ksd_frame *request)
 {
@@ -34,6 +61,28 @@ bool ksd_x11_request_valid(const ksd_frame *request)
         case KSD_OP_CURSOR_POSITION:
         case KSD_OP_WORK_AREA:
             return request->payload_length == 0u;
+        case KSD_OP_CAPTURE_AREA: {
+            int32_t x;
+            int32_t y;
+            uint32_t width;
+            uint32_t height;
+            return ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && ksd_cursor_u32(&cursor, &width)
+                && ksd_cursor_u32(&cursor, &height)
+                && ksd_cursor_finished(&cursor);
+        }
+        case KSD_OP_CAPTURE_WINDOW: {
+            uint32_t flags;
+            uint32_t length;
+            const uint8_t *bytes;
+            uint32_t xid;
+            return ksd_cursor_u32(&cursor, &flags)
+                && ksd_cursor_u32(&cursor, &length)
+                && (flags & ~KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) == 0u
+                && ksd_cursor_bytes(&cursor, length, &bytes)
+                && ksd_cursor_finished(&cursor)
+                && parse_xid(bytes, length, &xid);
+        }
         default:
             return false;
     }
@@ -152,6 +201,37 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
         case KSD_OP_WORK_AREA:
             ksd_x11_work_area(connection, result);
             break;
+        case KSD_OP_CAPTURE_AREA: {
+            ksd_cursor cursor;
+            int32_t x = 0;
+            int32_t y = 0;
+            uint32_t width = 0u;
+            uint32_t height = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_i32(&cursor, &x);
+            (void)ksd_cursor_i32(&cursor, &y);
+            (void)ksd_cursor_u32(&cursor, &width);
+            (void)ksd_cursor_u32(&cursor, &height);
+            ksd_x11_capture_area(connection, x, y, width, height, result);
+            break;
+        }
+        case KSD_OP_CAPTURE_WINDOW: {
+            ksd_cursor cursor;
+            uint32_t flags = 0u;
+            uint32_t length = 0u;
+            const uint8_t *bytes = NULL;
+            uint32_t xid = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u32(&cursor, &flags);
+            (void)ksd_cursor_u32(&cursor, &length);
+            (void)ksd_cursor_bytes(&cursor, length, &bytes);
+            (void)parse_xid(bytes, length, &xid);
+            ksd_x11_capture_window(connection, xid,
+                (flags & KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u, result);
+            break;
+        }
         default:
             ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
                              "invalid X11 request");

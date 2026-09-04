@@ -230,6 +230,15 @@ bool ksd_backend_session_unsupported(void)
     (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
      | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
 
+/* Served by the same forked worker as the coordinate group, but named apart
+ * from it: the stage that routes the coordinate group off a compositor session
+ * must be able to move that group alone, without carrying capture with it. */
+#define KSD_X11_CAPTURE_OPERATIONS \
+    (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW)
+
+#define KSD_X11_OPERATIONS \
+    (KSD_X11_COORDINATE_OPERATIONS | KSD_X11_CAPTURE_OPERATIONS)
+
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
 {
     /* Off an X11 session there is no X server this worker may talk to, so no
@@ -240,7 +249,7 @@ uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
         return 0u;
     /* Never more than the backend advertises. Routing a bit outside the mask
      * would serve an operation the client was told does not exist. */
-    return KSD_X11_COORDINATE_OPERATIONS & ksd_backend_operations(backend);
+    return KSD_X11_OPERATIONS & ksd_backend_operations(backend);
 }
 
 uint64_t ksd_backend_reported_operations(ksd_backend backend, bool registered,
@@ -274,7 +283,7 @@ uint64_t ksd_backend_operations(ksd_backend backend)
     if (backend == KSD_BACKEND_GENERIC)
         return 0u;
     if (backend == KSD_BACKEND_X11)
-        return KSD_X11_COORDINATE_OPERATIONS;
+        return KSD_X11_OPERATIONS;
     if (backend == KSD_BACKEND_KWIN)
         return KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW;
     if (backend != KSD_BACKEND_GNOME && backend != KSD_BACKEND_CINNAMON)
