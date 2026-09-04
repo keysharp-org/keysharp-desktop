@@ -1,6 +1,8 @@
 #include "transport.h"
 
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -133,6 +135,50 @@ int ksd_receive_optional_fd(int descriptor, void *data, size_t length,
     }
     *received_fd = fd_count == 1u ? first_fd : -1;
     return 0;
+}
+
+static uint64_t transport_monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0u;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+int ksd_receive_fd_until(int descriptor, void *data, size_t length,
+                         uint64_t deadline_ms, int *received_fd)
+{
+    if (descriptor < 0 || received_fd == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *received_fd = -1;
+    for (;;) {
+        struct pollfd item = { .fd = descriptor, .events = POLLIN };
+        uint64_t now = transport_monotonic_ms();
+        int remaining;
+        int ready;
+
+        if (now == 0u || now >= deadline_ms) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        remaining = (int)(deadline_ms - now);
+        ready = poll(&item, 1u, remaining);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (ready < 0)
+            return -1;
+        /* Readable. The receive below uses MSG_WAITALL, so a peer that sends a
+         * partial record still blocks -- but it has already proved it is
+         * talking, and the record is a fixed size the peer knows. */
+        return ksd_receive_optional_fd(descriptor, data, length, received_fd);
+    }
 }
 
 int ksd_make_parent_directories(const char *path, mode_t mode)

@@ -20,4 +20,9 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 ksd_operation_result *result);
 int ksd_capture_worker_main(int argc, char **argv);
 
+/* What the forked worker will run. Exposed so the parent-side admission and
+ * the child-side dispatch cannot drift apart, and so a gate can assert they
+ * are the same set. */
+bool ksd_capture_worker_request_valid(const ksd_frame *request);
+
 #endif

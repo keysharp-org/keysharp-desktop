@@ -102,6 +102,10 @@ typedef struct authority_state {
          * backend statically supports. Read in place of the static table, so a
          * daemon whose compositor lacks a capability can say so. */
         uint64_t advertised;
+        /* The socket this daemon handed over for the authority to call back
+         * on. Only KWin sends one, because only a KWin script cannot be
+         * reached on the session bus. -1 for every other backend. */
+        int provider_fd;
         ksp_identity identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
@@ -367,7 +371,7 @@ static uint64_t registered_operations(authority_state *state, uid_t uid,
 static bool register_backend(authority_state *state, int descriptor,
                              const struct ucred *peer, uint32_t backend,
                              const ksp_identity *identity,
-                             uint64_t advertised)
+                             uint64_t advertised, int provider_fd)
 {
     size_t free_slot = KSD_MAX_BACKEND_REGISTRATIONS;
     bool registered = false;
@@ -386,6 +390,11 @@ static bool register_backend(authority_state *state, int descriptor,
         state->backends[free_slot].descriptor = descriptor;
         state->backends[free_slot].backend = backend;
         state->backends[free_slot].advertised = advertised;
+        /* Owned by the slot from here, and closed when the registration ends.
+         * The daemon has already dropped its copy, so this is the only
+         * reference and a leak here would hold the socket open past the
+         * registration it belongs to. */
+        state->backends[free_slot].provider_fd = provider_fd;
         state->backends[free_slot].identity = *identity;
         registered = true;
     }
@@ -402,9 +411,16 @@ static void unregister_backend(authority_state *state, uid_t uid,
         if (state->backends[index].active
             && state->backends[index].uid == uid
             && state->backends[index].descriptor == descriptor) {
+            /* Closed with the registration it belongs to. The daemon dropped
+             * its copy when it handed this over, so this is the only reference
+             * and leaking it would hold the socket open for the life of the
+             * authority -- and leave the daemon's end never seeing a hangup. */
+            if (state->backends[index].provider_fd >= 0)
+                close(state->backends[index].provider_fd);
             memset(&state->backends[index], 0,
                    sizeof(state->backends[index]));
             state->backends[index].descriptor = -1;
+            state->backends[index].provider_fd = -1;
             break;
         }
     pthread_mutex_unlock(&state->mutex);
@@ -490,6 +506,52 @@ static bool send_backend_ack(int descriptor, uint16_t status,
     return fixed_io_until(descriptor, reply, sizeof(reply), true, deadline);
 }
 
+/* Six checks on a descriptor a daemon handed over. Each rules out a different
+ * way of being handed something other than what was promised, and none of them
+ * is paranoia about a hostile daemon so much as about a confused one: a
+ * registration that succeeds with the wrong descriptor fails later, somewhere
+ * else, as a channel that never answers.
+ *
+ * It must be a socket, a connected UNIX stream, not a listener, and its peer
+ * must be the process that sent it. A listening socket is the interesting one:
+ * accepting on it would let anything on the system connect and be taken for
+ * the session daemon. */
+static bool provider_fd_valid(int provider_fd, const struct ucred *peer)
+{
+    struct stat info;
+    struct ucred credentials;
+    socklen_t size;
+    int value;
+
+    if (provider_fd < 0 || peer == NULL)
+        return false;
+    if (fstat(provider_fd, &info) != 0 || !S_ISSOCK(info.st_mode))
+        return false;
+
+    size = sizeof(value);
+    if (getsockopt(provider_fd, SOL_SOCKET, SO_DOMAIN, &value, &size) != 0
+        || value != AF_UNIX)
+        return false;
+    size = sizeof(value);
+    if (getsockopt(provider_fd, SOL_SOCKET, SO_TYPE, &value, &size) != 0
+        || value != SOCK_STREAM)
+        return false;
+    size = sizeof(value);
+    if (getsockopt(provider_fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &size) != 0
+        || value != 0)
+        return false;
+
+    size = sizeof(credentials);
+    if (getsockopt(provider_fd, SOL_SOCKET, SO_PEERCRED, &credentials,
+                   &size) != 0)
+        return false;
+    /* The far end must be the daemon that sent it. A socketpair the daemon
+     * made has itself on both ends; anything else is a socket it obtained
+     * elsewhere, and the authority would then be calling back a process it
+     * never authenticated. */
+    return credentials.pid == peer->pid && credentials.uid == peer->uid;
+}
+
 static void handle_backend_connection(authority_state *state, int descriptor,
                                       const struct ucred *peer)
 {
@@ -500,8 +562,12 @@ static void handle_backend_connection(authority_state *state, int descriptor,
     if (now == 0u)
         return;
     uint64_t deadline = now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
-    bool valid = fixed_io_until(descriptor, registration,
-                                sizeof(registration), false, deadline)
+    int provider_fd = -1;
+    /* Received with the record rather than after it, so there is never a
+     * moment when a backend is registered and its callback socket is not. */
+    bool valid = ksd_receive_fd_until(descriptor, registration,
+                                      sizeof(registration), deadline,
+                                      &provider_fd) == 0
         && memcmp(registration, ksd_backend_registration_magic,
                   sizeof(ksd_backend_registration_magic)) == 0
         && ksd_decode_u16(registration + 4u)
@@ -516,10 +582,23 @@ static void handle_backend_connection(authority_state *state, int descriptor,
             ksd_decode_u16(registration + 6u),
             ksd_decode_u64(registration + 16u), &advertised);
     }
+    /* The flag and the descriptor must agree in both directions. A daemon that
+     * set the flag and sent nothing would leave the authority believing it can
+     * call back; one that sent a descriptor without the flag is sending
+     * something this service did not ask for and will not use. */
+    bool wants_fd = valid
+        && (ksd_decode_u16(registration + 6u) & KSD_BACKEND_FLAG_PROVIDER_FD)
+            != 0u;
+    if (valid && wants_fd != (provider_fd >= 0))
+        valid = false;
+    if (valid && provider_fd >= 0 && !provider_fd_valid(provider_fd, peer))
+        valid = false;
     valid = valid && trusted_backend_peer(peer, backend, &identity)
         && register_backend(state, descriptor, peer, backend, &identity,
-                            advertised);
+                            advertised, provider_fd);
     if (!valid) {
+        if (provider_fd >= 0)
+            close(provider_fd);
         (void)send_backend_ack(descriptor, KSD_BACKEND_ACK_REJECTED,
                                KSD_BACKEND_NONE, 0u, deadline);
         return;

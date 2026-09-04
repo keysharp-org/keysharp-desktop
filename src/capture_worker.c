@@ -266,6 +266,17 @@ done:
     return true;
 }
 
+/* What the worker will run, for both the parent that decides whether to fork
+ * and the child that decides what to dispatch. One definition, because two
+ * that were meant to agree did not, and the disagreement was invisible: the
+ * parent simply refused, with a diagnostic about something else. */
+bool ksd_capture_worker_request_valid(const ksd_frame *request)
+{
+    return ksd_local_capture_request_valid(request)
+        || ksd_x11_request_valid(request)
+        || ksd_wayland_request_valid(request);
+}
+
 static bool trusted_self(int descriptor)
 {
     struct stat status;
@@ -555,8 +566,16 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
     if (result == NULL)
         return;
     ksd_result_init(result);
+    /* The parent must admit exactly what the child will run. It used to admit
+     * only captures, while the child accepts captures, X11 verbs and Wayland
+     * verbs -- so every non-capture verb was refused here, before the fork,
+     * with a message about the capture worker. The X11 coordinate group had
+     * been unreachable that way since it landed, and no test saw it because
+     * every test calls the backend functions directly rather than through this
+     * path. The two admission sets are now one expression, and a gate pins
+     * them equal. */
     if (identity == NULL || request == NULL || keep_running == NULL
-        || !ksd_local_capture_request_valid(request)
+        || !ksd_capture_worker_request_valid(request)
         || !capture_environment(identity, &environment)
         || !capture_groups(identity, &groups, &group_count)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,

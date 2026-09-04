@@ -286,7 +286,7 @@ foreach(required
         "connect_backend(deadline)"
         "ksd_backend_session_unsupported()"
         "backend = KSD_BACKEND_GENERIC;"
-        "register_backend(descriptor, backend, deadline, &accepted)")
+        "register_backend(descriptor, backend, deadline, provider_pair[1],")
     string(FIND "${session_backend}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
@@ -375,4 +375,31 @@ math(EXPR assembly_end_count
 if(NOT assembly_end_count EQUAL 2)
     message(FATAL_ERROR
         "authorityd.c must end a request assembly on both exit paths")
+endif()
+
+# The parent side of the capture worker decides whether to fork; the child
+# decides what to dispatch. Those must admit the same set, and for a long time
+# they did not: the parent tested ksd_local_capture_request_valid, which accepts
+# only the two capture opcodes, so every X11 and Wayland verb was refused before
+# the fork with a diagnostic about the capture worker. The X11 coordinate group
+# was unreachable that way from the day it landed.
+#
+# Gated here, on the source, rather than on the predicate. A test that compares
+# the two predicates passes whatever the caller does -- which is exactly the
+# mistake that let this survive: the predicate was never wrong, the call site
+# used a different one.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../src/capture_worker.c" capture_worker)
+string(FIND "${capture_worker}"
+    "|| !ksd_capture_worker_request_valid(request)" admits)
+if(admits EQUAL -1)
+    message(FATAL_ERROR
+        "capture worker parent admission missing: ksd_capture_worker_execute "
+        "must admit what the child runs, not only captures")
+endif()
+string(FIND "${capture_worker}"
+    "|| !ksd_local_capture_request_valid(request)" narrow)
+if(NOT narrow EQUAL -1)
+    message(FATAL_ERROR
+        "capture worker parent admission narrowed back to captures only: "
+        "every X11 and Wayland verb would be refused before the fork")
 endif()

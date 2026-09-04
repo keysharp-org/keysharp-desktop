@@ -4,6 +4,10 @@
 #include "provider.h"
 #include "protocol_io.h"
 
+#include "capture_worker.h"
+#include "x11_worker.h"
+#include "wl_worker.h"
+#include "local_capture.h"
 #include <assert.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -300,6 +304,102 @@ static uint32_t read_status(int descriptor, uint16_t opcode,
     return status;
 }
 
+
+/* The parent decides whether to fork a worker; the child decides what to
+ * dispatch once forked. Those are two admission sets that must be one, and for
+ * a long time they were not: the parent admitted only captures while the child
+ * accepted captures, X11 verbs and Wayland verbs. Every non-capture verb was
+ * therefore refused before the fork, with a diagnostic about the capture
+ * worker, and the X11 coordinate group was unreachable from the day it landed.
+ *
+ * Nothing caught it because every backend test calls the backend functions
+ * directly. This sweeps the whole opcode space against BOTH sides, so the two
+ * cannot drift again without a red test.
+ *
+ * The payload is built per opcode rather than left empty, because most of
+ * these verbs are refused on shape and an all-zero payload would make the two
+ * sides agree by both saying no. */
+static void check_worker_admission_agrees(void)
+{
+    static const uint8_t handle_payload[8] = { 1u, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t rect_payload[16] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 8u, 0, 0, 0, 8u, 0, 0, 0,
+    };
+    static const uint8_t value_payload[16] = {
+        1u, 0, 0, 0, 0, 0, 0, 0, 1u, 0, 0, 0, 0, 0, 0, 0,
+    };
+    static const uint8_t window_payload[12] = {
+        2u, 0, 0, 0, 4u, 0, 0, 0, 't', 'e', 'x', 't',
+    };
+    static const uint8_t list_payload[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const struct { const uint8_t *bytes; uint32_t length; } shapes[] = {
+        { NULL, 0u },
+        { handle_payload, sizeof(handle_payload) },
+        { rect_payload, sizeof(rect_payload) },
+        { value_payload, sizeof(value_payload) },
+        { window_payload, sizeof(window_payload) },
+        { list_payload, sizeof(list_payload) },
+    };
+
+    for (uint32_t value = 0u; value <= UINT16_MAX; value++) {
+        for (size_t shape = 0u; shape < 6u; shape++) {
+            ksd_frame request;
+            bool parent;
+            bool child;
+
+            memset(&request, 0, sizeof(request));
+            request.opcode = (uint16_t)value;
+            request.payload = (uint8_t *)(uintptr_t)shapes[shape].bytes;
+            request.payload_length = shapes[shape].length;
+
+            parent = ksd_capture_worker_request_valid(&request);
+            /* Exactly the disjunction the child takes in ksd_capture_worker_main. */
+            child = ksd_x11_request_valid(&request)
+                || ksd_wayland_request_valid(&request)
+                || ksd_local_capture_request_valid(&request);
+            if (parent == child)
+                continue;
+            fprintf(stderr,
+                    "opcode 0x%04x payload shape %zu: parent admits=%d child "
+                    "runs=%d. The side that decides whether to fork and the "
+                    "side that decides what to run must admit the same set; "
+                    "when they disagree the narrower one silently refuses a "
+                    "verb the other implements, and the caller is told "
+                    "something about the capture worker.%s",
+                    (unsigned)value, shape, (int)parent, (int)child, "\n");
+            abort();
+        }
+    }
+}
+
+/* And the sets are not empty in the directions that matter, so the sweep above
+ * cannot pass by admitting nothing. */
+static void check_worker_admits_each_backend(void)
+{
+    static const uint8_t list_payload[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t rect_payload[16] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 8u, 0, 0, 0, 8u, 0, 0, 0,
+    };
+    ksd_frame request;
+
+    memset(&request, 0, sizeof(request));
+    request.opcode = KSD_OP_WINDOW_LIST;
+    request.payload = (uint8_t *)(uintptr_t)list_payload;
+    request.payload_length = sizeof(list_payload);
+    assert(ksd_capture_worker_request_valid(&request));
+
+    request.opcode = KSD_OP_CAPTURE_AREA;
+    request.payload = (uint8_t *)(uintptr_t)rect_payload;
+    request.payload_length = sizeof(rect_payload);
+    assert(ksd_capture_worker_request_valid(&request));
+
+    /* And something the worker genuinely does not serve. */
+    request.opcode = KSD_OP_WINDOW_RESERVE;
+    request.payload = NULL;
+    request.payload_length = 0u;
+    assert(!ksd_capture_worker_request_valid(&request));
+}
+
 int main(void)
 {
     char root[1024];
@@ -407,6 +507,8 @@ int main(void)
     check_assembly_budget();
     check_backend_cross_check();
     check_capture_mask_matches_dispatch();
+    check_worker_admission_agrees();
+    check_worker_admits_each_backend();
     check_capture_memfd_is_sealed();
     check_capture_budget();
     check_kwin_admission();

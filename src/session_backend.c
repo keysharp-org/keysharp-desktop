@@ -1,6 +1,8 @@
 #include "backend.h"
 #include <fcntl.h>
 
+#include "transport.h"
+
 #include "kwin_bus.h"
 #include "wl_connect.h"
 #include "backend_protocol.h"
@@ -198,7 +200,8 @@ static bool issue_generation(char out[KSD_KWIN_GENERATION_HEX + 1u])
 }
 
 static bool register_backend(int descriptor, ksd_backend backend,
-                             uint64_t deadline, uint64_t *accepted)
+                             uint64_t deadline, int provider_fd,
+                             uint64_t *accepted)
 {
     uint64_t requested = backend == KSD_BACKEND_GENERIC
         ? probe_generic_operations() : ksd_backend_operations(backend);
@@ -207,6 +210,8 @@ static bool register_backend(int descriptor, ksd_backend backend,
     memcpy(message, ksd_backend_registration_magic,
            sizeof(ksd_backend_registration_magic));
     ksd_encode_u16(message + 4u, KSD_BACKEND_REGISTRATION_VERSION);
+    ksd_encode_u16(message + 6u, provider_fd >= 0
+        ? KSD_BACKEND_FLAG_PROVIDER_FD : 0u);
     ksd_encode_u32(message + 8u, backend);
     /* What this daemon believes it can serve. Today that is everything the
      * backend statically supports; a daemon that probes its compositor and
@@ -216,8 +221,20 @@ static bool register_backend(int descriptor, ksd_backend backend,
     /* The acknowledgement is parsed by the shared codec rather than checked
      * field by field here, so the two ends cannot drift on the layout, and so
      * the withhold-only rule is enforced from this side too. */
-    return transfer_fixed(descriptor, message, sizeof(message), true, deadline)
-        && transfer_fixed(descriptor, reply, sizeof(reply), false, deadline)
+    /* The callback socket rides the registration itself rather than following
+     * it. A second message would leave a window in which the authority has
+     * accepted a backend it cannot call back, and every request arriving in
+     * that window would be refused for a reason that is about to stop being
+     * true. */
+    if (provider_fd >= 0) {
+        if (!ksd_send_with_fd(descriptor, message, sizeof(message),
+                              provider_fd))
+            return false;
+    } else if (!transfer_fixed(descriptor, message, sizeof(message), true,
+                               deadline)) {
+        return false;
+    }
+    return transfer_fixed(descriptor, reply, sizeof(reply), false, deadline)
         && ksd_backend_ack_parse(reply, backend, requested, accepted);
 }
 
@@ -268,9 +285,25 @@ int ksd_daemon_main(int argc, char **argv)
     uint64_t deadline = now == 0u
         ? 0u : now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
     uint64_t accepted = 0u;
+    int provider_pair[2] = { -1, -1 };
+    /* Only KWin needs one, because only a KWin script cannot be reached on the
+     * session bus the way a shell extension can. The authority refuses the
+     * flag from any other backend, so offering one would be a rejected
+     * registration rather than a harmless extra. */
+    if (backend == KSD_BACKEND_KWIN
+        && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                      provider_pair) != 0) {
+        provider_pair[0] = -1;
+        provider_pair[1] = -1;
+    }
     int descriptor = deadline == 0u ? -1 : connect_backend(deadline);
     if (descriptor < 0
-        || !register_backend(descriptor, backend, deadline, &accepted)) {
+        || !register_backend(descriptor, backend, deadline, provider_pair[1],
+                             &accepted)) {
+        if (provider_pair[0] >= 0)
+            close(provider_pair[0]);
+        if (provider_pair[1] >= 0)
+            close(provider_pair[1]);
         if (descriptor >= 0)
             close(descriptor);
         fputs("keysharp-desktop daemon: authority unavailable. The root"
@@ -279,6 +312,11 @@ int ksd_daemon_main(int argc, char **argv)
               stderr);
         return 1;
     }
+    /* The authority owns its end now. Holding a copy here would keep the
+     * socket alive after the authority closed it, and this end would then
+     * never see the hangup that says the registration is over. */
+    if (provider_pair[1] >= 0)
+        close(provider_pair[1]);
     /* Said out loud when it happens. The authority may narrow what this daemon
      * asked to advertise, and a narrowing that goes unreported is the kind of
      * thing that gets diagnosed as "the compositor is broken" from the far end
