@@ -69,8 +69,9 @@ if(nix_user_start EQUAL -1)
 endif()
 string(SUBSTRING "${nix_module}" ${nix_user_start} -1 nix_user_service)
 foreach(required
-        "ProtectSystem = \"strict\""
-        "ProtectHome = \"read-only\"")
+        "PrivateTmp = false;"
+        "ProtectSystem = false;"
+        "ProtectHome = false;")
     string(FIND "${nix_user_service}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "Nix user service is missing ${required}")
@@ -132,9 +133,9 @@ foreach(required
         "WantedBy=graphical-session.target"
         "Restart=on-failure"
         "NoNewPrivileges=true"
-        "PrivateTmp=true"
-        "ProtectSystem=strict"
-        "ProtectHome=read-only"
+        "PrivateTmp=false"
+        "ProtectSystem=false"
+        "ProtectHome=false"
         "RestrictAddressFamilies=AF_UNIX"
         "LockPersonality=true")
     string(FIND "${broker_unit}" "${required}" found)
@@ -163,6 +164,22 @@ foreach(required
     string(FIND "${authority_socket}" "${required}" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "authority socket is missing ${required}")
+    endif()
+endforeach()
+foreach(required
+        "NoNewPrivileges=true"
+        "AmbientCapabilities=CAP_SETUID")
+    string(FIND "${authority_unit}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "authority service is missing ${required}")
+    endif()
+endforeach()
+foreach(required
+        "NoNewPrivileges = true;"
+        "AmbientCapabilities = [ \"CAP_SETUID\" ];")
+    string(FIND "${nix_module}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "Nix authority service is missing ${required}")
     endif()
 endforeach()
 foreach(forbidden

@@ -8,6 +8,9 @@
 
 ksd_backend ksd_backend_resolve(void);
 ksd_backend ksd_backend_resolve_process(pid_t pid);
+/* The process owning this compositor's canonical session-bus name. The caller
+ * must already have the session user's credentials; the bus rejects root. */
+pid_t ksd_backend_provider_pid(ksd_backend backend);
 /* Whether the process sits in a real X11 session. DISPLAY is deliberately not
  * consulted: a Wayland session almost always has one, because XWayland sets
  * it, so a rule that looked at DISPLAY would call nearly every Wayland session

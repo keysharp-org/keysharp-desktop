@@ -36,6 +36,9 @@ The installed CMake target is `KeysharpDesktop::client`; the pkg-config name is
 
 The system socket is `/run/keysharp-desktop/keysharp-desktop.sock`, owned by
 root and mode 0666. It activates `keysharp-desktop authority-daemon`.
+The authority retains `CAP_SETUID` explicitly so its short-lived session-bus
+query can drop irrevocably to the registering user's credentials before it
+connects. `NoNewPrivileges=` remains in force for the authority and the helper.
 
 `keysharp-desktop.service` runs `keysharp-desktop daemon` inside each graphical
 user session. It connects outbound and registers the session backend; it is
@@ -56,8 +59,11 @@ path itself, so the per-user daemon only names it and never materializes,
 copies, or rewrites it. The user unit therefore declares no `ReadWritePaths=`,
 `RuntimeDirectory=`, `StateDirectory=`, or `BindPaths=`; `release-layout-test`
 fails if one appears in `data/keysharp-desktop.service.in` or in
-`nix/module.nix`, and `provider-gate-test` fails if the unit stops declaring
-`ProtectSystem=strict` and `ProtectHome=read-only`.
+`nix/module.nix`. The unit cannot use user-manager filesystem namespacing:
+systemd then exposes host root as the overflow UID, hiding the ownership the
+daemon must authenticate on `/run/keysharp-desktop/keysharp-desktop.sock`.
+`NoNewPrivileges=`, address-family restriction, and personality locking remain
+in force without changing that view of the system authority.
 
 `/run/user/<uid>/keysharp-desktop` belongs to the GNOME and Cinnamon
 extensions, which create it at mode 0700 and bind their provider sockets

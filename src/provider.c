@@ -27,6 +27,7 @@
 typedef struct provider_connection {
     struct provider_connection *next;
     uid_t uid;
+    pid_t provider_pid;
     ksd_backend backend;
     GDBusConnection *connection;
 } provider_connection;
@@ -117,19 +118,6 @@ static bool deadline_start(provider_deadline *deadline, uint32_t timeout_ms,
     return true;
 }
 
-static int deadline_remaining_ms(const provider_deadline *deadline)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0;
-    int64_t nanoseconds = (int64_t)(deadline->expires.tv_sec - now.tv_sec)
-        * 1000000000LL + deadline->expires.tv_nsec - now.tv_nsec;
-    if (nanoseconds <= 0)
-        return 0;
-    int64_t milliseconds = (nanoseconds + 999999LL) / 1000000LL;
-    return milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
-}
-
 static void deadline_finish(provider_deadline *deadline)
 {
     if (!deadline->started)
@@ -163,80 +151,41 @@ static const char *provider_executable_name(ksd_backend backend)
     return NULL;
 }
 
-static const char *provider_bus_name(ksd_backend backend)
-{
-    if (backend == KSD_BACKEND_GNOME)
-        return "org.gnome.Shell";
-    if (backend == KSD_BACKEND_CINNAMON)
-        return "org.Cinnamon";
-    return NULL;
-}
-
-static bool provider_owns_session_name(uid_t uid, ksd_backend backend,
-                                       pid_t provider_pid,
-                                       provider_deadline *deadline,
-                                       GError **error)
-{
-    char address[128];
-    const char *name = provider_bus_name(backend);
-    GDBusConnection *bus = NULL;
-    GVariant *owner_reply = NULL;
-    GVariant *pid_reply = NULL;
-    const char *owner = NULL;
-    guint32 owner_pid = 0u;
-    bool valid = false;
-
-    int length = snprintf(address, sizeof(address),
-        "unix:path=/run/user/%lu/bus", (unsigned long)uid);
-    if (name == NULL || provider_pid <= 0 || length <= 0
-        || (size_t)length >= sizeof(address))
-        return false;
-    bus = g_dbus_connection_new_for_address_sync(address,
-        G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT
-            | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
-        NULL, deadline->cancellable, error);
-    if (bus == NULL)
-        goto done;
-    owner_reply = g_dbus_connection_call_sync(bus,
-        "org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus", "GetNameOwner", g_variant_new("(s)", name),
-        G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE,
-        deadline_remaining_ms(deadline), deadline->cancellable, error);
-    if (owner_reply == NULL)
-        goto done;
-    g_variant_get(owner_reply, "(&s)", &owner);
-    pid_reply = g_dbus_connection_call_sync(bus,
-        "org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus", "GetConnectionUnixProcessID",
-        g_variant_new("(s)", owner), G_VARIANT_TYPE("(u)"),
-        G_DBUS_CALL_FLAGS_NONE, deadline_remaining_ms(deadline),
-        deadline->cancellable, error);
-    if (pid_reply == NULL)
-        goto done;
-    g_variant_get(pid_reply, "(u)", &owner_pid);
-    valid = (uint64_t)owner_pid == (uint64_t)provider_pid;
-
-done:
-    if (pid_reply != NULL)
-        g_variant_unref(pid_reply);
-    if (owner_reply != NULL)
-        g_variant_unref(owner_reply);
-    if (bus != NULL)
-        g_object_unref(bus);
-    return valid;
-}
-
-static bool provider_peer_valid(GDBusConnection *connection, uid_t uid,
-                                ksd_backend backend,
-                                provider_deadline *deadline, GError **error)
+static GCredentials *provider_peer_credentials(GDBusConnection *connection,
+                                                GError **error)
 {
     GCredentials *credentials =
         g_dbus_connection_get_peer_credentials(connection);
+    if (credentials != NULL)
+        return g_object_ref(credentials);
+
+    /* Client-side peer connections do not always retain credentials on the
+       GDBusConnection. The Unix socket still has the kernel-authenticated
+       identity. */
+    GIOStream *stream = g_dbus_connection_get_stream(connection);
+    if (!G_IS_SOCKET_CONNECTION(stream)) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                            "desktop provider peer credentials are unavailable");
+        return NULL;
+    }
+    GSocket *socket = g_socket_connection_get_socket(
+        G_SOCKET_CONNECTION(stream));
+    return g_socket_get_credentials(socket, error);
+}
+
+static bool provider_peer_valid(GDBusConnection *connection, uid_t uid,
+                                pid_t provider_pid, ksd_backend backend,
+                                GError **error)
+{
     GError *credential_error = NULL;
+    GCredentials *credentials = provider_peer_credentials(connection,
+        &credential_error);
     gint64 peer_uid = credentials == NULL ? -1
         : (gint64)g_credentials_get_unix_user(credentials, &credential_error);
     gint64 peer_pid = credential_error == NULL && credentials != NULL
         ? g_credentials_get_unix_pid(credentials, &credential_error) : -1;
+    if (credentials != NULL)
+        g_object_unref(credentials);
     const char *expected = provider_executable_name(backend);
     char proc_path[64];
     char executable[PATH_MAX + 1u];
@@ -250,7 +199,8 @@ static bool provider_peer_valid(GDBusConnection *connection, uid_t uid,
                           (long long)peer_pid);
     ssize_t executable_length = length > 0 && (size_t)length < sizeof(proc_path)
         ? readlink(proc_path, executable, sizeof(executable) - 1u) : -1;
-    if (peer_uid != (gint64)uid || peer_pid <= 0 || expected == NULL
+    if (peer_uid != (gint64)uid || peer_pid <= 0
+        || peer_pid != (gint64)provider_pid || expected == NULL
         || executable_length <= 0
         || (size_t)executable_length >= sizeof(executable)
         || stat(proc_path, &executable_status) != 0
@@ -264,19 +214,15 @@ static bool provider_peer_valid(GDBusConnection *connection, uid_t uid,
     executable[executable_length] = '\0';
     const char *basename = strrchr(executable, '/');
     basename = basename == NULL ? executable : basename + 1u;
-    if (strcmp(basename, expected) != 0
-        || !provider_owns_session_name(uid, backend, (pid_t)peer_pid,
-                                       deadline, error)) {
-        if (error != NULL && *error == NULL)
-            g_set_error_literal(error, G_IO_ERROR,
-                G_IO_ERROR_PERMISSION_DENIED,
-                "desktop provider executable is invalid");
+    if (strcmp(basename, expected) != 0) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
+                            "desktop provider executable is invalid");
         return false;
     }
     return true;
 }
 
-static GDBusConnection *provider_connection_open(uid_t uid,
+static GDBusConnection *provider_connection_open(uid_t uid, pid_t provider_pid,
                                                   ksd_backend backend,
                                                   GError **error)
 {
@@ -288,9 +234,9 @@ static GDBusConnection *provider_connection_open(uid_t uid,
     GDBusConnection *connection = NULL;
     provider_deadline deadline;
 
-    if (name == NULL) {
+    if (name == NULL || provider_pid <= 0) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                            "desktop provider is unavailable for this backend");
+                            "desktop provider registration is unavailable");
         return NULL;
     }
     if (!deadline_start(&deadline, KSD_PROVIDER_TIMEOUT_MS, error))
@@ -319,7 +265,8 @@ static GDBusConnection *provider_connection_open(uid_t uid,
         NULL, G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,
         NULL, deadline.cancellable, error);
     if (connection != NULL
-        && !provider_peer_valid(connection, uid, backend, &deadline, error)) {
+        && !provider_peer_valid(connection, uid, provider_pid, backend,
+                                error)) {
         g_object_unref(connection);
         connection = NULL;
     }
@@ -335,7 +282,8 @@ done:
     return connection;
 }
 
-static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
+static GDBusConnection *provider_connection_get(uid_t uid, pid_t provider_pid,
+                                                 ksd_backend backend,
                                                  GError **error)
 {
     provider_connection *entry;
@@ -344,6 +292,12 @@ static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
     for (entry = connections; entry != NULL; entry = entry->next)
         if (entry->uid == uid && entry->backend == backend)
             break;
+    if (entry != NULL && entry->provider_pid != provider_pid) {
+        if (entry->connection != NULL)
+            g_object_unref(entry->connection);
+        entry->connection = NULL;
+        entry->provider_pid = provider_pid;
+    }
     if (entry != NULL && entry->connection != NULL
         && g_dbus_connection_is_closed(entry->connection)) {
         g_object_unref(entry->connection);
@@ -353,14 +307,8 @@ static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
         GDBusConnection *result = g_object_ref(entry->connection);
         pthread_mutex_unlock(&connection_mutex);
         GError *validation_error = NULL;
-        provider_deadline deadline;
-        bool deadline_ready = deadline_start(&deadline,
-            KSD_PROVIDER_TIMEOUT_MS, &validation_error);
-        bool valid = deadline_ready
-            && provider_peer_valid(result, uid, backend, &deadline,
-                                   &validation_error);
-        if (deadline_ready)
-            deadline_finish(&deadline);
+        bool valid = provider_peer_valid(result, uid, provider_pid, backend,
+                                         &validation_error);
         if (valid)
             return result;
         if (validation_error != NULL)
@@ -371,7 +319,8 @@ static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
     }
     pthread_mutex_unlock(&connection_mutex);
 
-    GDBusConnection *opened = provider_connection_open(uid, backend, error);
+    GDBusConnection *opened = provider_connection_open(uid, provider_pid,
+                                                       backend, error);
     if (opened == NULL)
         return NULL;
 
@@ -379,6 +328,13 @@ static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
     for (entry = connections; entry != NULL; entry = entry->next)
         if (entry->uid == uid && entry->backend == backend)
             break;
+    if (entry != NULL && entry->provider_pid != provider_pid) {
+        pthread_mutex_unlock(&connection_mutex);
+        g_object_unref(opened);
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                            "desktop provider registration changed");
+        return NULL;
+    }
     if (entry == NULL) {
         entry = calloc(1u, sizeof(*entry));
         if (entry == NULL) {
@@ -389,6 +345,7 @@ static GDBusConnection *provider_connection_get(uid_t uid, ksd_backend backend,
             return NULL;
         }
         entry->uid = uid;
+        entry->provider_pid = provider_pid;
         entry->backend = backend;
         entry->next = connections;
         connections = entry;
@@ -419,13 +376,14 @@ static void provider_connection_invalidate(uid_t uid, ksd_backend backend,
     pthread_mutex_unlock(&connection_mutex);
 }
 
-static GVariant *provider_call(uid_t uid, ksd_backend backend,
+static GVariant *provider_call(uid_t uid, pid_t provider_pid,
+                               ksd_backend backend,
                                const char *method, GVariant *parameters,
                                const GVariantType *reply_type,
                                int timeout_ms, GError **error)
 {
     GDBusConnection *connection =
-        provider_connection_get(uid, backend, error);
+        provider_connection_get(uid, provider_pid, backend, error);
     if (connection == NULL)
         return NULL;
     GVariant *reply = g_dbus_connection_call_sync(connection, NULL,
@@ -688,7 +646,8 @@ bool ksd_provider_capture_supported(ksd_backend backend, uint16_t opcode)
     return backend == KSD_BACKEND_CINNAMON && window;
 }
 
-static void execute_capture(uid_t uid, ksd_backend backend,
+static void execute_capture(uid_t uid, pid_t provider_pid,
+                            ksd_backend backend,
                             const ksd_frame *request,
                             ksd_operation_result *result)
 {
@@ -716,7 +675,7 @@ static void execute_capture(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "CaptureWindow",
+        reply = provider_call(uid, provider_pid, backend, "CaptureWindow",
             g_variant_new("(tb)", (guint64)handle,
                 (flags & KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u),
             G_VARIANT_TYPE("(ay)"), KSD_PROVIDER_CAPTURE_TIMEOUT_MS, &error);
@@ -735,13 +694,13 @@ static void execute_capture(uid_t uid, ksd_backend backend,
         invalid_request(result);
         return;
     }
-    reply = provider_call(uid, backend, "CaptureArea",
+    reply = provider_call(uid, provider_pid, backend, "CaptureArea",
         g_variant_new("(iiii)", x, y, (gint32)width, (gint32)height),
         G_VARIANT_TYPE("(ay)"), KSD_PROVIDER_CAPTURE_TIMEOUT_MS, &error);
     capture_result(reply, error, result);
 }
 
-static void execute_query(uid_t uid, ksd_backend backend,
+static void execute_query(uid_t uid, pid_t provider_pid, ksd_backend backend,
                           const ksd_frame *request,
                           ksd_operation_result *result)
 {
@@ -755,7 +714,8 @@ static void execute_query(uid_t uid, ksd_backend backend,
     if (request->opcode == KSD_OP_CURSOR_POSITION) {
         gint32 x;
         gint32 y;
-        reply = provider_call(uid, backend, "GetCursorPosition", NULL,
+        reply = provider_call(uid, provider_pid, backend,
+            "GetCursorPosition", NULL,
             G_VARIANT_TYPE("(ii)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         if (reply == NULL) {
             provider_error(result, error);
@@ -774,7 +734,7 @@ static void execute_query(uid_t uid, ksd_backend backend,
         gint32 y;
         gint32 width;
         gint32 height;
-        reply = provider_call(uid, backend, "GetWorkArea", NULL,
+        reply = provider_call(uid, provider_pid, backend, "GetWorkArea", NULL,
             G_VARIANT_TYPE("(iiii)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         if (reply == NULL) {
             provider_error(result, error);
@@ -813,7 +773,8 @@ static const char *handle_method(uint16_t opcode)
     }
 }
 
-static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
+static void execute_window(uid_t uid, pid_t pid, pid_t provider_pid,
+                           ksd_backend backend,
                            const ksd_frame *request,
                            ksd_operation_result *result)
 {
@@ -834,7 +795,7 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "GetWindowList",
+        reply = provider_call(uid, provider_pid, backend, "GetWindowList",
             g_variant_new("(b)", include_hidden != 0u),
             G_VARIANT_TYPE("(s)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         string_result(reply, error, result);
@@ -845,7 +806,8 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "GetActiveWindow", NULL,
+        reply = provider_call(uid, provider_pid, backend,
+            "GetActiveWindow", NULL,
             G_VARIANT_TYPE("(s)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         string_result(reply, error, result);
         return;
@@ -855,7 +817,7 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, method,
+        reply = provider_call(uid, provider_pid, backend, method,
             g_variant_new("(t)", (guint64)handle), G_VARIANT_TYPE("(b)"),
             KSD_PROVIDER_TIMEOUT_MS, &error);
         boolean_result(reply, error, result);
@@ -878,7 +840,7 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend,
+        reply = provider_call(uid, provider_pid, backend,
             request->opcode == KSD_OP_WINDOW_MOVE_RESIZE
                 ? "MoveResizeWindow" : "MoveResizeWindowByXid",
             g_variant_new("(tiiii)", (guint64)handle, x, y,
@@ -903,7 +865,7 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "ReserveWindow",
+        reply = provider_call(uid, provider_pid, backend, "ReserveWindow",
             g_variant_new("(itiii)", (gint32)pid, (guint64)cookie,
                           x, y, (gint32)ttl),
             G_VARIANT_TYPE("(b)"), KSD_PROVIDER_TIMEOUT_MS, &error);
@@ -917,7 +879,8 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "GetReservedWindow",
+        reply = provider_call(uid, provider_pid, backend,
+            "GetReservedWindow",
             g_variant_new("(it)", (gint32)pid, (guint64)cookie),
             G_VARIANT_TYPE("(s)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         if (reply == NULL) {
@@ -980,7 +943,7 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
         invalid_request(result);
         return;
     }
-    reply = provider_call(uid, backend, method,
+    reply = provider_call(uid, provider_pid, backend, method,
         request->opcode == KSD_OP_WINDOW_SET_ABOVE
             || request->opcode == KSD_OP_WINDOW_SET_DECORATED
             ? g_variant_new("(tb)", (guint64)handle, value != 0u)
@@ -989,7 +952,8 @@ static void execute_window(uid_t uid, pid_t pid, ksd_backend backend,
     boolean_result(reply, error, result);
 }
 
-static void execute_clipboard(uid_t uid, ksd_backend backend,
+static void execute_clipboard(uid_t uid, pid_t provider_pid,
+                              ksd_backend backend,
                               const ksd_frame *request,
                               ksd_operation_result *result)
 {
@@ -1001,7 +965,8 @@ static void execute_clipboard(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "GetClipboardMimetypes", NULL,
+        reply = provider_call(uid, provider_pid, backend,
+            "GetClipboardMimetypes", NULL,
             G_VARIANT_TYPE("(as)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         if (reply == NULL) {
             provider_error(result, error);
@@ -1038,7 +1003,8 @@ static void execute_clipboard(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "GetClipboardText", NULL,
+        reply = provider_call(uid, provider_pid, backend,
+            "GetClipboardText", NULL,
             G_VARIANT_TYPE("(s)"), KSD_PROVIDER_TIMEOUT_MS, &error);
         string_result(reply, error, result);
         return;
@@ -1059,7 +1025,8 @@ static void execute_clipboard(uid_t uid, ksd_backend backend,
         char mimetype[KSD_MAX_MIMETYPE_BYTES + 1u];
         memcpy(mimetype, bytes, length);
         mimetype[length] = '\0';
-        reply = provider_call(uid, backend, "GetClipboardContent",
+        reply = provider_call(uid, provider_pid, backend,
+            "GetClipboardContent",
             g_variant_new("(s)", mimetype), G_VARIANT_TYPE("(ay)"),
             KSD_PROVIDER_TIMEOUT_MS, &error);
         if (reply == NULL) {
@@ -1114,7 +1081,8 @@ static void execute_clipboard(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "SetClipboardContent",
+        reply = provider_call(uid, provider_pid, backend,
+            "SetClipboardContent",
             g_variant_new("(s@ay)", mimetype,
                 g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
                     content_length == 0u ? &empty : content,
@@ -1132,7 +1100,8 @@ static bool supported_pointer_button(uint32_t button)
         || button == 8u || button == 9u;
 }
 
-static void execute_pointer(uid_t uid, ksd_backend backend,
+static void execute_pointer(uid_t uid, pid_t provider_pid,
+                            ksd_backend backend,
                             const ksd_frame *request,
                             ksd_operation_result *result)
 {
@@ -1150,7 +1119,7 @@ static void execute_pointer(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend,
+        reply = provider_call(uid, provider_pid, backend,
             request->opcode == KSD_OP_MOUSE_MOVE_ABSOLUTE
                 ? "SendMouseMoveAbsolute" : "SendMouseMoveRelative",
             g_variant_new("(ii)", x, y), G_VARIANT_TYPE("(b)"),
@@ -1165,7 +1134,7 @@ static void execute_pointer(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "SendMouseButton",
+        reply = provider_call(uid, provider_pid, backend, "SendMouseButton",
             g_variant_new("(ub)", button, pressed != 0u),
             G_VARIANT_TYPE("(b)"), KSD_PROVIDER_TIMEOUT_MS, &error);
     } else if (request->opcode == KSD_OP_MOUSE_SCROLL) {
@@ -1179,7 +1148,7 @@ static void execute_pointer(uid_t uid, ksd_backend backend,
             invalid_request(result);
             return;
         }
-        reply = provider_call(uid, backend, "SendMouseScroll",
+        reply = provider_call(uid, provider_pid, backend, "SendMouseScroll",
             g_variant_new("(ib)", delta, vertical != 0u),
             G_VARIANT_TYPE("(b)"), KSD_PROVIDER_TIMEOUT_MS, &error);
     } else {
@@ -1197,7 +1166,8 @@ int ksd_provider_test_capture_memfd(uint32_t width, uint32_t height,
 }
 #endif
 
-void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
+void ksd_provider_execute(uid_t uid, pid_t pid, pid_t provider_pid,
+                          ksd_backend backend,
                           const ksd_frame *request,
                           ksd_operation_result *result)
 {
@@ -1213,30 +1183,30 @@ void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
     }
     if (request->opcode == KSD_OP_CAPTURE_AREA
         || request->opcode == KSD_OP_CAPTURE_WINDOW) {
-        execute_capture(uid, backend, request, result);
+        execute_capture(uid, provider_pid, backend, request, result);
         return;
     }
     if ((request->opcode >= KSD_OP_WINDOW_LIST
          && request->opcode <= KSD_OP_WINDOW_WATCH)
         || (request->opcode >= KSD_OP_WINDOW_FOCUS
             && request->opcode <= KSD_OP_WINDOW_GET_RESERVED)) {
-        execute_window(uid, pid, backend, request, result);
+        execute_window(uid, pid, provider_pid, backend, request, result);
         return;
     }
     if ((request->opcode >= KSD_OP_CLIPBOARD_MIMETYPES
          && request->opcode <= KSD_OP_CLIPBOARD_TEXT)
         || request->opcode == KSD_OP_CLIPBOARD_SET_CONTENT) {
-        execute_clipboard(uid, backend, request, result);
+        execute_clipboard(uid, provider_pid, backend, request, result);
         return;
     }
     if (request->opcode >= KSD_OP_MOUSE_MOVE_ABSOLUTE
         && request->opcode <= KSD_OP_MOUSE_SCROLL) {
-        execute_pointer(uid, backend, request, result);
+        execute_pointer(uid, provider_pid, backend, request, result);
         return;
     }
     if (request->opcode == KSD_OP_CURSOR_POSITION
         || request->opcode == KSD_OP_WORK_AREA) {
-        execute_query(uid, backend, request, result);
+        execute_query(uid, provider_pid, backend, request, result);
         return;
     }
     invalid_request(result);
@@ -1337,7 +1307,8 @@ static gboolean watch_wakeup(gpointer user_data)
     return G_SOURCE_CONTINUE;
 }
 
-int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
+int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
+                       bool clipboard,
                        ksd_provider_event_fn emit,
                        ksd_provider_cancel_fn cancelled,
                        void *user_data, char *diagnostic,
@@ -1358,7 +1329,7 @@ int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
         || diagnostic_capacity == 0u)
         return -1;
     diagnostic[0] = '\0';
-    connection = provider_connection_get(uid, backend, &error);
+    connection = provider_connection_get(uid, provider_pid, backend, &error);
     if (connection == NULL)
         goto done;
     context = g_main_context_new();

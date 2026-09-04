@@ -13,9 +13,11 @@ StandardInput=null
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
+# User-manager filesystem namespaces expose host root as the overflow UID,
+# which makes the daemon unable to authenticate the root-owned system socket.
+PrivateTmp=false
+ProtectSystem=false
+ProtectHome=false
 RestrictAddressFamilies=AF_UNIX
 LockPersonality=true
 Restart=on-failure

@@ -253,6 +253,11 @@ static void check_registration_ack(void)
     ksd_encode_u16(reply + 4u, KSD_BACKEND_REGISTRATION_VERSION + 1u);
     assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
                                   &accepted));
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, requested);
+    ksd_encode_u64(reply + 24u, 1u);
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                  &accepted));
 
     /* The accepted mask sits at the offset the request carries its own, so the
      * offset itself means mask and the two ends cannot drift on it. */

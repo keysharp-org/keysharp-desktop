@@ -463,7 +463,6 @@ export default class KeysharpExtension {
         this._busNameId    = 0;
         this._providerServer = null;
         this._providerServerSignalId = 0;
-        this._providerAuthObserver = null;
         this._providerSocketPath = null;
         this._providerConnections = new Map();
         this._vPointer = null;
@@ -674,6 +673,22 @@ export default class KeysharpExtension {
         }
     }
 
+    _connectionCredentialUid(connection) {
+        let uid = this._credentialUid(connection.get_peer_credentials());
+        if (uid >= 0)
+            return uid;
+
+        try {
+            const stream = connection.get_stream();
+            if (stream === null || typeof stream.get_socket !== 'function')
+                return -1;
+            uid = this._credentialUid(stream.get_socket().get_credentials());
+        } catch (_e) {
+            return -1;
+        }
+        return uid;
+    }
+
     _startProvider() {
         try {
             const runtimeDirectory = GLib.build_filenamev([
@@ -686,21 +701,18 @@ export default class KeysharpExtension {
             if (GLib.file_test(this._providerSocketPath, GLib.FileTest.EXISTS))
                 GLib.unlink(this._providerSocketPath);
 
-            this._providerAuthObserver = new Gio.DBusAuthObserver();
-            this._providerAuthObserver.connect('allow-mechanism',
-                (_observer, mechanism) => mechanism === 'EXTERNAL');
-            this._providerAuthObserver.connect('authorize-authenticated-peer',
-                (_observer, _stream, credentials) => this._credentialUid(credentials) === 0);
-
+            // Authentication runs on a GDBus worker thread, which cannot call
+            // into GJS safely. Check the kernel credentials on the main-context
+            // new-connection signal before exporting any object instead.
             this._providerServer = Gio.DBusServer.new_sync(
                 `unix:path=${this._providerSocketPath}`,
                 Gio.DBusServerFlags.NONE,
                 Gio.dbus_generate_guid(),
-                this._providerAuthObserver,
+                null,
                 null);
             this._providerServerSignalId = this._providerServer.connect(
                 'new-connection', (_server, connection) => {
-                    if (this._credentialUid(connection.get_peer_credentials()) !== 0)
+                    if (this._connectionCredentialUid(connection) !== 0)
                         return false;
                     try {
                         const implementation = Gio.DBusExportedObject.wrapJSObject(
@@ -744,7 +756,6 @@ export default class KeysharpExtension {
             try { connection.close_sync(null); } catch (_e) {}
         }
         this._providerConnections.clear();
-        this._providerAuthObserver = null;
         if (this._providerSocketPath !== null) {
             try { GLib.unlink(this._providerSocketPath); } catch (_e) {}
             this._providerSocketPath = null;
@@ -1763,7 +1774,7 @@ export default class KeysharpExtension {
         try {
             const connection = invocation.get_connection();
             return this._providerConnections.has(connection)
-                && this._credentialUid(connection.get_peer_credentials()) === 0;
+                && this._connectionCredentialUid(connection) === 0;
         } catch (_e) {
             return false;
         }

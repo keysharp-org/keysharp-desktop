@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gio/gio.h>
+#include <grp.h>
 #include <keysharp_permissions/permissions.h>
 #include <limits.h>
 #include <poll.h>
@@ -40,6 +41,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -132,6 +134,11 @@ typedef struct authority_state {
         uid_t display_uid;
         gid_t display_gid;
         ksp_identity identity;
+        /* Captured from the compositor bus owner returned by the authority's
+         * credential-dropped query. The private provider socket is pinned to
+         * this process without attempting a root connection to a user bus that
+         * will reject it. Empty for backends without a shell provider. */
+        ksp_identity provider_identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
 } authority_state;
@@ -408,6 +415,125 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
             || ksd_backend_resolve_process(peer->pid) == backend);
 }
 
+static bool pipe_read_until(int descriptor, void *data, size_t length,
+                            uint64_t deadline)
+{
+    uint8_t *bytes = data;
+    size_t offset = 0u;
+
+    while (offset < length) {
+        if (!wait_until(descriptor, POLLIN, deadline))
+            return false;
+        ssize_t count = read(descriptor, bytes + offset, length - offset);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        if (count <= 0)
+            return false;
+        offset += (size_t)count;
+    }
+    return true;
+}
+
+/* Executes the bus query with the user's credentials. The session bus closes
+ * an authority connection authenticated as root, so the authority cannot
+ * perform this lookup in-process. Only async-signal-safe setup occurs between
+ * fork and fexecve. */
+static pid_t query_provider_pid(uid_t uid, gid_t gid, uint32_t backend,
+                                uint64_t deadline)
+{
+    int executable = -1;
+    int child_executable = -1;
+    int pipe_descriptors[2] = { -1, -1 };
+    int child_output = -1;
+    pid_t child = -1;
+    pid_t result = -1;
+    char backend_text[16];
+    char bus_address[160];
+    char runtime_directory[96];
+    uint8_t encoded[8];
+    int status = 0;
+    bool already = uid == getuid() && uid == geteuid()
+        && gid == getgid() && gid == getegid();
+
+    if ((backend != KSD_BACKEND_GNOME
+         && backend != KSD_BACKEND_CINNAMON)
+        || uid == 0u
+        || snprintf(backend_text, sizeof(backend_text), "%u", backend) <= 0
+        || snprintf(bus_address, sizeof(bus_address),
+                    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%lu/bus",
+                    (unsigned long)uid) <= 0
+        || snprintf(runtime_directory, sizeof(runtime_directory),
+                    "XDG_RUNTIME_DIR=/run/user/%lu", (unsigned long)uid) <= 0)
+        goto done;
+    executable = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (executable < 0 || pipe2(pipe_descriptors, O_CLOEXEC) != 0)
+        goto done;
+    child_executable = fcntl(executable, F_DUPFD_CLOEXEC, 10);
+    child_output = fcntl(pipe_descriptors[1], F_DUPFD_CLOEXEC, 10);
+    if (child_executable < 0 || child_output < 0)
+        goto done;
+    child = fork();
+    if (child == 0) {
+        if (dup2(child_output, 3) < 0 || dup2(child_executable, 4) < 0
+            || (!already && setgroups(0u, NULL) != 0)
+            || (!already && setresgid(gid, gid, gid) != 0)
+            || (!already && setresuid(uid, uid, uid) != 0))
+            _exit(1);
+        char *arguments[] = {
+            (char *)"keysharp-desktop", (char *)"session-query",
+            backend_text, NULL,
+        };
+        char *environment[] = {
+            bus_address, runtime_directory, (char *)"GIO_USE_VFS=local", NULL,
+        };
+        close_range(5u, UINT_MAX, 0u);
+        fexecve(4, arguments, environment);
+        _exit(1);
+    }
+    if (child < 0)
+        goto done;
+    close(pipe_descriptors[1]);
+    pipe_descriptors[1] = -1;
+    close(child_output);
+    child_output = -1;
+    close(child_executable);
+    child_executable = -1;
+    bool received = pipe_read_until(pipe_descriptors[0], encoded,
+                                    sizeof(encoded), deadline);
+    pid_t waited = -1;
+    if (received) {
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+    }
+    if (received && waited == child && WIFEXITED(status)
+        && WEXITSTATUS(status) == 0) {
+        uint64_t value = ksd_decode_u64(encoded);
+        if (value > 0u && value <= (uint64_t)INT_MAX)
+            result = (pid_t)value;
+    }
+    if (waited == child)
+        child = -1;
+
+done:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
+        }
+    }
+    if (child_output >= 0)
+        close(child_output);
+    if (child_executable >= 0)
+        close(child_executable);
+    if (pipe_descriptors[0] >= 0)
+        close(pipe_descriptors[0]);
+    if (pipe_descriptors[1] >= 0)
+        close(pipe_descriptors[1]);
+    if (executable >= 0)
+        close(executable);
+    return result;
+}
+
 static uint64_t registered_operations(authority_state *state, uid_t uid,
                                       uint32_t backend)
 {
@@ -428,6 +554,7 @@ static uint64_t registered_operations(authority_state *state, uid_t uid,
 static bool register_backend(authority_state *state, int descriptor,
                              const struct ucred *peer, uint32_t backend,
                              const ksp_identity *identity,
+                             const ksp_identity *provider_identity,
                              uint64_t advertised, int provider_fd)
 {
     size_t free_slot = KSD_MAX_BACKEND_REGISTRATIONS;
@@ -455,6 +582,8 @@ static bool register_backend(authority_state *state, int descriptor,
         state->backends[free_slot].relay = provider_fd >= 0
             ? ksd_kwin_relay_create(provider_fd) : NULL;
         state->backends[free_slot].identity = *identity;
+        if (provider_identity != NULL)
+            state->backends[free_slot].provider_identity = *provider_identity;
         registered = true;
     }
 done:
@@ -532,6 +661,46 @@ static pid_t registered_backend_pid(authority_state *state, uid_t uid)
         }
     pthread_mutex_unlock(&state->mutex);
     return pid;
+}
+
+static pid_t registered_provider_pid(authority_state *state, uid_t uid,
+                                     uint32_t backend)
+{
+    ksp_identity expected = { 0 };
+    int descriptor = -1;
+
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid
+            && state->backends[index].backend == backend) {
+            expected = state->backends[index].provider_identity;
+            descriptor = state->backends[index].descriptor;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    if (descriptor < 0 || expected.pid <= 0)
+        return -1;
+
+    ksp_identity verified;
+    if (ksp_identity_revalidate(&expected, &verified) != 0
+        || !same_identity(&expected, &verified))
+        return -1;
+
+    pid_t result = -1;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid
+            && state->backends[index].descriptor == descriptor
+            && state->backends[index].backend == backend
+            && same_identity(&state->backends[index].provider_identity,
+                             &expected)) {
+            result = expected.pid;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return result;
 }
 
 /* The relay for a uid's registered daemon, or NULL. Returned under the lock
@@ -759,7 +928,9 @@ static void handle_backend_connection(authority_state *state, int descriptor,
 {
     uint8_t registration[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     ksp_identity identity;
+    ksp_identity provider_identity = { 0 };
     uint32_t backend = KSD_BACKEND_NONE;
+    pid_t provider_pid = -1;
     uint64_t now = monotonic_milliseconds();
     if (now == 0u)
         return;
@@ -776,13 +947,17 @@ static void handle_backend_connection(authority_state *state, int descriptor,
             == KSD_BACKEND_REGISTRATION_VERSION
         && ksd_decode_u32(registration + 12u) == 0u
         && ksd_decode_u64(registration + 24u) == 0u;
+    const char *rejection = valid ? NULL : "malformed registration";
     uint64_t advertised = 0u;
     if (valid) {
         backend = ksd_decode_u32(registration + 8u);
-        valid = ksd_backend_registration_mask(backend,
-            ksd_decode_u16(registration + 4u),
-            ksd_decode_u16(registration + 6u),
-            ksd_decode_u64(registration + 16u), &advertised);
+        if (!ksd_backend_registration_mask(backend,
+                ksd_decode_u16(registration + 4u),
+                ksd_decode_u16(registration + 6u),
+                ksd_decode_u64(registration + 16u), &advertised)) {
+            valid = false;
+            rejection = "invalid backend fields";
+        }
     }
     /* The flag and the descriptor must agree in both directions. A daemon that
      * set the flag and sent nothing would leave the authority believing it can
@@ -791,14 +966,38 @@ static void handle_backend_connection(authority_state *state, int descriptor,
     bool wants_fd = valid
         && (ksd_decode_u16(registration + 6u) & KSD_BACKEND_FLAG_PROVIDER_FD)
             != 0u;
-    if (valid && wants_fd != (provider_fd >= 0))
+    if (valid && wants_fd != (provider_fd >= 0)) {
         valid = false;
-    if (valid && provider_fd >= 0 && !provider_fd_valid(provider_fd, peer))
+        rejection = "provider descriptor mismatch";
+    }
+    if (valid && provider_fd >= 0 && !provider_fd_valid(provider_fd, peer)) {
         valid = false;
-    valid = valid && trusted_backend_peer(peer, backend, &identity)
-        && register_backend(state, descriptor, peer, backend, &identity,
-                            advertised, provider_fd);
+        rejection = "invalid provider descriptor";
+    }
+    if (valid && !trusted_backend_peer(peer, backend, &identity)) {
+        valid = false;
+        rejection = "untrusted session daemon";
+    }
+    if (valid && (backend == KSD_BACKEND_GNOME
+                  || backend == KSD_BACKEND_CINNAMON)) {
+        provider_pid = query_provider_pid(peer->uid, peer->gid, backend,
+                                          deadline);
+        if (provider_pid <= 0
+            || ksp_identity_capture(provider_pid, peer->uid,
+                                    &provider_identity) != 0) {
+            valid = false;
+            rejection = "untrusted provider process";
+        }
+    }
+    if (valid && !register_backend(state, descriptor, peer, backend, &identity,
+                                   provider_pid > 0 ? &provider_identity : NULL,
+                                   advertised, provider_fd)) {
+        valid = false;
+        rejection = "session already registered";
+    }
     if (!valid) {
+        fprintf(stderr, "keysharp-desktop authority-daemon: rejected backend"
+                " registration: %s\n", rejection);
         if (provider_fd >= 0)
             close(provider_fd);
         (void)send_backend_ack(descriptor, KSD_BACKEND_ACK_REJECTED,
@@ -1371,7 +1570,10 @@ static bool start_watch(authority_session *session,
         .backend = session->backend,
     };
     char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
-    (void)ksd_provider_watch(session->identity.uid, session->backend,
+    pid_t provider_pid = registered_provider_pid(session->state,
+        session->identity.uid, session->backend);
+    (void)ksd_provider_watch(session->identity.uid, provider_pid,
+        session->backend,
         request->opcode == KSD_OP_CLIPBOARD_WATCH,
         watch_emit, watch_cancelled, &context,
         diagnostic, sizeof(diagnostic));
@@ -1671,8 +1873,10 @@ static bool execute_operation(authority_session *session,
                                        session, session_pid,
                                        session->backend, &result);
     } else {
+        pid_t provider_pid = registered_provider_pid(session->state,
+            session->identity.uid, session->backend);
         ksd_provider_execute(session->identity.uid, session->identity.pid,
-                             session->backend, request, &result);
+                             provider_pid, session->backend, request, &result);
     }
     bool valid = scope == 0u
         ? session_identity_refresh(session)

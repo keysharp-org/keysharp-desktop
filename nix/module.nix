@@ -59,6 +59,7 @@ in
         Group = "root";
         UMask = "0077";
         NoNewPrivileges = true;
+        AmbientCapabilities = [ "CAP_SETUID" ];
         PrivateTmp = true;
         ProtectSystem = "strict";
         ProtectHome = "read-only";
@@ -88,9 +89,11 @@ in
         StandardOutput = "journal";
         StandardError = "journal";
         NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = "read-only";
+        # User-manager filesystem namespaces hide the root ownership that the
+        # daemon authenticates on the system authority socket.
+        PrivateTmp = false;
+        ProtectSystem = false;
+        ProtectHome = false;
         RestrictAddressFamilies = [ "AF_UNIX" ];
         LockPersonality = true;
         Restart = "on-failure";

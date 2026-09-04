@@ -6,13 +6,13 @@ foreach(provider gnome cinnamon)
             "org.keysharp.Desktop.Provider1"
             "PUBLIC_IFACE_XML"
             "Gio.DBusServer.new_sync"
-            "allow-mechanism"
-            "mechanism === 'EXTERNAL'"
-            "authorize-authenticated-peer"
-            "_credentialUid(credentials) === 0"
-            "_credentialUid(connection.get_peer_credentials()) !== 0"
+            "Gio.DBusServerFlags.NONE"
+            "_connectionCredentialUid(connection) !== 0"
+            "connection.get_stream()"
+            "stream.get_socket().get_credentials()"
             "_requireProviderPeer(invocation)"
             "_callerIsProviderPeer(invocation)"
+            "_connectionCredentialUid(connection) === 0"
             "this._providerConnections.has(connection)"
             "SendMouseMoveAbsoluteAsync"
             "SendMouseMoveRelativeAsync"
@@ -22,6 +22,16 @@ foreach(provider gnome cinnamon)
         if(position EQUAL -1)
             message(FATAL_ERROR
                 "${provider} provider security invariant missing: ${required}")
+        endif()
+    endforeach()
+
+    foreach(forbidden
+            "Gio.DBusAuthObserver"
+            "AUTHENTICATION_ALLOW_ANONYMOUS")
+        string(FIND "${source}" "${forbidden}" position)
+        if(NOT position EQUAL -1)
+            message(FATAL_ERROR
+                "${provider} provider authentication must not use ${forbidden}")
         endif()
     endforeach()
 
@@ -136,6 +146,28 @@ foreach(provider gnome cinnamon)
     endforeach()
 endforeach()
 
+file(READ "${SOURCE_DIR}/src/provider.c" provider_client)
+foreach(required
+        "g_dbus_connection_get_peer_credentials(connection)"
+        "g_dbus_connection_get_stream(connection)"
+        "g_socket_get_credentials(socket, error)"
+        "peer_pid != (gint64)provider_pid")
+    string(FIND "${provider_client}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "provider client peer-credential fallback is missing: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "provider_owns_session_name"
+        "unix:path=/run/user/%lu/bus")
+    string(FIND "${provider_client}" "${forbidden}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "provider client still connects to the user bus as root: ${forbidden}")
+    endif()
+endforeach()
+
 file(READ "${SOURCE_DIR}/providers/gnome/extension.js" gnome_provider)
 foreach(required
         "CaptureAreaAsync"
@@ -239,6 +271,9 @@ foreach(required
         "KSD_MAX_BACKEND_REGISTRATIONS"
         "ksd_backend_registration_magic"
         "registered_backend"
+        "query_provider_pid(peer->uid, peer->gid, backend,"
+        "setresuid(uid, uid, uid)"
+        "fexecve(4, arguments, environment)"
         "ksd_install_socket_path"
         "backend <= KSD_BACKEND_X11"
         "ksd_capture_worker_execute")
@@ -325,6 +360,9 @@ file(READ "${SOURCE_DIR}/src/backend.c" backend_selection)
 foreach(required
         "kwin_wayland_owner()"
         "ksd_backend_session_unsupported"
+        "ksd_backend_provider_pid"
+        "org.gnome.Shell"
+        "org.Cinnamon"
         "backend == KSD_BACKEND_GENERIC"
         "strcmp(basename, \"kwin_wayland\") == 0")
     string(FIND "${backend_selection}" "${required}" position)
@@ -371,12 +409,13 @@ endforeach()
 
 file(READ "${SOURCE_DIR}/data/keysharp-desktop.service.in" broker)
 foreach(required
-        "ProtectSystem=strict"
-        "ProtectHome=read-only")
+        "PrivateTmp=false"
+        "ProtectSystem=false"
+        "ProtectHome=false")
     string(FIND "${broker}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
-            "compositor resources must stay read-only to the daemon: ${required}")
+            "session daemon namespace policy is missing: ${required}")
     endif()
 endforeach()
 

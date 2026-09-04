@@ -84,8 +84,12 @@ compositor paints anything, and the returned PNG's own IHDR is re-checked
 against the same limits. Text, mimetypes, event data, window reservations,
 provider actors, and I/O all have explicit bounds or absolute deadlines.
 
-GNOME and Cinnamon providers use private root-authenticated GDBus peers. Both
-GNOME capture calls answer on that peer with PNG bytes from an in-memory
-stream. KWin capture uses an isolated worker, a root-owned directional pipe, and a
-write-only D-Bus call child. The non-dumpable worker drains pixels while that
-child returns only fixed-size metadata. These transports are private.
+GNOME and Cinnamon providers use private GDBus servers and export their objects
+only after the peer's kernel credentials identify root. At backend registration,
+the authority looks up the process owning the compositor's canonical session-bus
+name in a credential-dropped helper, then pins the private socket to the
+captured process identity; it never attempts a root connection to the user bus.
+Both GNOME capture calls answer on that peer with PNG bytes from an in-memory
+stream. KWin capture uses an isolated worker, a root-owned directional pipe,
+and a write-only D-Bus call child. The non-dumpable worker drains pixels while
+that child returns only fixed-size metadata. These transports are private.

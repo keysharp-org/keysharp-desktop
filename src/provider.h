@@ -20,10 +20,12 @@ typedef bool (*ksd_provider_cancel_fn)(void *user_data);
  * two drifted apart once, and Cinnamon window capture was advertised,
  * implemented and refused for as long as they disagreed. */
 bool ksd_provider_capture_supported(ksd_backend backend, uint16_t opcode);
-void ksd_provider_execute(uid_t uid, pid_t pid, ksd_backend backend,
+void ksd_provider_execute(uid_t uid, pid_t pid, pid_t provider_pid,
+                          ksd_backend backend,
                           const ksd_frame *request,
                           ksd_operation_result *result);
-int ksd_provider_watch(uid_t uid, ksd_backend backend, bool clipboard,
+int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
+                       bool clipboard,
                        ksd_provider_event_fn emit,
                        ksd_provider_cancel_fn cancelled,
                        void *user_data, char *diagnostic,

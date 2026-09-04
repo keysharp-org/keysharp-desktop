@@ -4,6 +4,7 @@
 
 #include "protocol.h"
 #include "protocol_io.h"
+#include "transport.h"
 
 #include <gio/gio.h>
 #include <stdbool.h>
@@ -47,6 +48,73 @@ static bool name_has_owner(const char *name)
         g_error_free(error);
     g_object_unref(connection);
     return owned == TRUE;
+}
+
+static pid_t name_owner_pid(const char *name)
+{
+    GDBusConnection *connection = get_session_bus();
+    GError *error = NULL;
+    GVariant *owner_reply = NULL;
+    GVariant *pid_reply = NULL;
+    const char *owner = NULL;
+    guint32 pid = 0u;
+
+    if (connection == NULL || name == NULL)
+        return -1;
+    owner_reply = g_dbus_connection_call_sync(connection,
+        "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "GetNameOwner", g_variant_new("(s)", name),
+        G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
+    if (owner_reply == NULL)
+        goto done;
+    g_variant_get(owner_reply, "(&s)", &owner);
+    pid_reply = g_dbus_connection_call_sync(connection,
+        "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+        g_variant_new("(s)", owner), G_VARIANT_TYPE("(u)"),
+        G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
+    if (pid_reply != NULL)
+        g_variant_get(pid_reply, "(u)", &pid);
+
+done:
+    if (pid_reply != NULL)
+        g_variant_unref(pid_reply);
+    if (owner_reply != NULL)
+        g_variant_unref(owner_reply);
+    if (error != NULL)
+        g_error_free(error);
+    g_object_unref(connection);
+    return pid > 0u && pid <= (guint32)INT_MAX ? (pid_t)pid : -1;
+}
+
+pid_t ksd_backend_provider_pid(ksd_backend backend)
+{
+    if (backend == KSD_BACKEND_GNOME)
+        return name_owner_pid("org.gnome.Shell");
+    if (backend == KSD_BACKEND_CINNAMON)
+        return name_owner_pid("org.Cinnamon");
+    return -1;
+}
+
+int ksd_session_query_main(int argc, char **argv)
+{
+    if (argc != 2 || argv == NULL || argv[1] == NULL)
+        return 1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0'
+        || (value != KSD_BACKEND_GNOME
+            && value != KSD_BACKEND_CINNAMON)
+        || getuid() == 0u || getuid() != geteuid()
+        || getgid() != getegid())
+        return 1;
+    pid_t pid = ksd_backend_provider_pid((ksd_backend)value);
+    if (pid <= 0)
+        return 1;
+    uint8_t encoded[8];
+    ksd_encode_u64(encoded, (uint64_t)pid);
+    return ksd_write_all(3, encoded, sizeof(encoded)) ? 0 : 1;
 }
 
 static bool kwin_wayland_owner(void)
@@ -403,7 +471,8 @@ bool ksd_backend_ack_parse(const uint8_t *reply, uint32_t expected_backend,
         || ksd_decode_u16(reply + 4u) != KSD_BACKEND_REGISTRATION_VERSION
         || ksd_decode_u16(reply + 6u) != KSD_BACKEND_ACK_ACCEPTED
         || ksd_decode_u32(reply + 8u) != expected_backend
-        || ksd_decode_u32(reply + 12u) != 0u)
+        || ksd_decode_u32(reply + 12u) != 0u
+        || ksd_decode_u64(reply + 24u) != 0u)
         return false;
     stored = ksd_decode_u64(reply + 16u);
     /* Withhold-only, checked from this side as well. A widened mask is not a

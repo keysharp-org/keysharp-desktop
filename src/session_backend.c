@@ -365,19 +365,27 @@ int ksd_daemon_main(int argc, char **argv)
         provider_pair[1] = -1;
     }
     int descriptor = deadline == 0u ? -1 : connect_backend(deadline);
-    if (descriptor < 0
-        || !register_backend(descriptor, backend, deadline, provider_pair[1],
-                             &accepted)) {
+    if (descriptor < 0) {
         if (provider_pair[0] >= 0)
             close(provider_pair[0]);
         if (provider_pair[1] >= 0)
             close(provider_pair[1]);
-        if (descriptor >= 0)
-            close(descriptor);
-        fputs("keysharp-desktop daemon: authority unavailable. The root"
-              " authority socket is not running: enable it with"
-              " systemctl enable --now keysharp-desktop-authority.socket\n",
+        fputs("keysharp-desktop daemon: could not connect to or authenticate"
+              " the authority socket. Check that the authority socket is"
+              " running and owned by the installation's authority user\n",
               stderr);
+        return 1;
+    }
+    if (!register_backend(descriptor, backend, deadline, provider_pair[1],
+                          &accepted)) {
+        if (provider_pair[0] >= 0)
+            close(provider_pair[0]);
+        if (provider_pair[1] >= 0)
+            close(provider_pair[1]);
+        close(descriptor);
+        fputs("keysharp-desktop daemon: the authority rejected this session"
+              " backend registration. Check the authority journal and make"
+              " sure both services use the same installation\n", stderr);
         return 1;
     }
     /* The authority owns its end now. Holding a copy here would keep the

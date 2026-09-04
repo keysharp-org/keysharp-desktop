@@ -192,7 +192,8 @@ store.
   messages.
 - `keysharp-desktop-capture-worker` is a root-only KWin capture worker.
 - The GNOME Shell and Cinnamon extensions perform compositor operations over a
-  private, root-authenticated peer connection.
+  private peer connection and export their objects only to a peer whose kernel
+  credentials identify root.
 
 ## Client API
 
