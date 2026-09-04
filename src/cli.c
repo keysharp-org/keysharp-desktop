@@ -1,3 +1,4 @@
+#include "enable_extension.h"
 #include "keysharp_desktop/client.h"
 #include "protocol.h"
 #include "permission_domain.h"
@@ -24,8 +25,9 @@ static void usage(FILE *stream, const char *program)
         "       %s probe [--socket PATH]\n"
         "       %s daemon\n"
         "       %s permissions list [--socket PATH]\n"
-        "       %s permissions revoke (--hash HASH|--pid PID|--all) [SCOPE ...] [--socket PATH]\n",
-        program, program, program, program, program, program);
+        "       %s permissions revoke (--hash HASH|--pid PID|--all) [SCOPE ...] [--socket PATH]\n"
+        "       %s enable-extension\n",
+        program, program, program, program, program, program, program);
 }
 
 static int report_error(const char *operation, ksd_status status,
@@ -307,6 +309,8 @@ int ksd_cli_main(int argc, char **argv)
     }
     if (strcmp(argv[1], "probe") == 0)
         return probe_command(argc, argv);
+    if (strcmp(argv[1], "enable-extension") == 0)
+        return ksd_enable_extension_main(argc - 1, argv + 1);
     if (argc >= 3 && strcmp(argv[1], "permissions") == 0) {
         if (strcmp(argv[2], "list") == 0)
             return permissions_list_command(argc, argv);

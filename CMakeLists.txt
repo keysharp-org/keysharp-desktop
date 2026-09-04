@@ -93,7 +93,13 @@ add_executable(keysharp-desktop
     src/session_backend.c
     src/provider.c
     src/authorityd.c
+    src/enable_extension.c
     src/cli.c)
+# Where this build put the extension, so the command can tell the user whether
+# the running shell searches there. Taken from the same variable the install
+# rule uses rather than assumed to be /usr/local.
+target_compile_definitions(keysharp-desktop PRIVATE
+    KSD_EXTENSION_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}")
 
 add_library(keysharp-desktop-capture STATIC
     src/capture_worker.c
@@ -228,6 +234,7 @@ foreach(target keysharp-desktop-wire keysharp-desktop-client
                keysharp-desktop-common keysharp-desktop-capture
                keysharp-desktop-x11
                keysharp-desktop keysharp-desktop-capture-worker)
+    # keysharp-desktop carries src/enable_extension.c, so it is covered here.
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2)
@@ -507,6 +514,22 @@ if(BUILD_TESTING)
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
         keysharp-desktop-x11 keysharp-desktop-common)
+
+    # The command needs a bus, a shell and an installed schema; its decisions
+    # do not. Compiling the source in directly gives real assertions in a
+    # container that has none of the three, where a source-invariant grep would
+    # only prove the text is present.
+    add_executable(enable-extension-tests
+        tests/enable_extension_tests.c
+        src/enable_extension.c)
+    target_include_directories(enable-extension-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(enable-extension-tests PRIVATE
+        KSD_EXTENSION_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}")
+    target_link_libraries(enable-extension-tests PRIVATE
+        keysharp-desktop-common PkgConfig::GIO)
+    add_test(NAME enable-extension-tests COMMAND enable-extension-tests)
 
     add_executable(install-mode-tests tests/install_mode_tests.c)
     target_link_libraries(install-mode-tests PRIVATE keysharp-desktop-common)
