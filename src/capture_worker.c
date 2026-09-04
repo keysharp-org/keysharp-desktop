@@ -2,6 +2,7 @@
 
 #include "protocol.h"
 #include "local_capture.h"
+#include "wl_worker.h"
 #include "x11_worker.h"
 #include "transport.h"
 
@@ -887,20 +888,27 @@ int ksd_capture_worker_main(int argc, char **argv)
         KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
         KSD_CAPTURE_WORKER_MAX_REQUEST, true, &request);
     bool x11 = unpacked && ksd_x11_request_valid(&request);
+    /* X11 is asked first, so a display session that is both -- an X11 session
+     * with a compositor reachable, or the reverse -- resolves the same way the
+     * backend resolver does rather than by which check ran first. */
+    bool wayland = unpacked && !x11 && ksd_wayland_request_valid(&request);
     if (!unpacked || request.flags != 0u || request.request_id == 0u
-        || !(x11 || ksd_local_capture_request_valid(&request))) {
+        || !(x11 || wayland || ksd_local_capture_request_valid(&request))) {
         if (unpacked)
             ksd_frame_clear(&request);
         goto failed;
     }
-    if (x11) {
-        /* The X11 verbs need no capture pipe or spool, and holding them open
-         * across an X round trip would keep descriptors the operation cannot
-         * use. */
+    if (x11 || wayland) {
+        /* Neither display backend needs the capture pipe or the spool, and
+         * holding them open across a round trip would keep descriptors the
+         * operation cannot use. */
         close(capture_pipe[0]);
         close(capture_pipe[1]);
         close(capture_spool);
-        ksd_x11_execute(&request, header.session_pid, &result);
+        if (x11)
+            ksd_x11_execute(&request, header.session_pid, &result);
+        else
+            ksd_wayland_execute(&request, header.session_pid, &result);
     } else {
         ksd_local_capture_execute(&request, capture_pipe[0], capture_pipe[1],
                                   capture_spool, &result);

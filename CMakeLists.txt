@@ -38,6 +38,7 @@ add_subdirectory("${KEYSHARP_PERMISSIONS_SOURCE_DIR}"
 
 add_library(keysharp-desktop-wire STATIC
     src/protocol_io.c
+    src/session_environ.c
     src/transport.c)
 set_target_properties(keysharp-desktop-wire PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -100,7 +101,8 @@ target_compile_definitions(keysharp-desktop-capture PUBLIC
     _GNU_SOURCE _POSIX_C_SOURCE=200809L
     KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
 target_link_libraries(keysharp-desktop-capture PUBLIC
-    keysharp-desktop-common keysharp-desktop-x11 PkgConfig::GIO)
+    keysharp-desktop-common keysharp-desktop-x11 keysharp-desktop-wayland
+    PkgConfig::GIO)
 
 # Linked into the worker executable and nothing else. The whole argument that
 # root never touches X rests on this one edge, so it is a separate target
@@ -166,6 +168,7 @@ add_library(keysharp-desktop-wayland STATIC
     src/wayland/wl_connect.c
     src/wayland/wl_clipboard.c
     src/wayland/wl_windows.c
+    src/wayland/wl_worker.c
     ${KSD_WAYLAND_GENERATED})
 target_include_directories(keysharp-desktop-wayland PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -181,7 +184,8 @@ target_link_libraries(keysharp-desktop-wayland PUBLIC
 add_executable(keysharp-desktop-capture-worker
     src/capture_worker_entry.c)
 target_link_libraries(keysharp-desktop-capture-worker PRIVATE
-    keysharp-desktop-capture keysharp-desktop-x11)
+    keysharp-desktop-capture keysharp-desktop-x11
+    keysharp-desktop-wayland)
 target_link_libraries(keysharp-desktop PRIVATE
     keysharp-desktop-common keysharp-desktop-client keysharp-desktop-capture
     PkgConfig::GIO Threads::Threads)
@@ -376,13 +380,15 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_include_directories(capture-pipe-security-tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/x11)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/x11
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/wayland)
     target_compile_definitions(capture-pipe-security-tests PRIVATE
         _GNU_SOURCE _POSIX_C_SOURCE=200809L
         KSD_CAPTURE_WORKER_TESTING
         KSD_CAPTURE_WORKER_PATH="${KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH}")
     target_link_libraries(capture-pipe-security-tests PRIVATE
-        keysharp-desktop-common keysharp-desktop-x11 PkgConfig::GIO)
+        keysharp-desktop-common keysharp-desktop-x11 keysharp-desktop-wayland
+        PkgConfig::GIO)
     add_test(NAME capture-pipe-security-tests
         COMMAND capture-pipe-security-tests)
     set_tests_properties(capture-pipe-security-tests PROPERTIES

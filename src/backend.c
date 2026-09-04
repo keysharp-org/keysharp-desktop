@@ -300,10 +300,23 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
     return true;
 }
 
+/* What a Wayland compositor with no extension of its own can be asked for.
+ * This is a CEILING, not a promise: it is what the shared protocols make
+ * possible, and any given compositor implements some subset. The daemon probes
+ * what is actually advertised and narrows this at registration, which is
+ * exactly what the withhold-only registration mask exists for.
+ *
+ * Everything absent here is absent because no protocol provides it, not
+ * because it is unwritten. A client on the outside of a Wayland compositor
+ * cannot restack another client's window, set its geometry or opacity, learn
+ * its pid, or ask which one has focus -- there is no request for any of it.
+ * See the capability audit; those nine are impossible rather than pending. */
+#define KSD_GENERIC_OPERATIONS     (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_CLIPBOARD_MIMETYPES      | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT)
+
 uint64_t ksd_backend_operations(ksd_backend backend)
 {
     if (backend == KSD_BACKEND_GENERIC)
-        return 0u;
+        return KSD_GENERIC_OPERATIONS;
     if (backend == KSD_BACKEND_X11)
         return KSD_X11_OPERATIONS;
     if (backend == KSD_BACKEND_KWIN)

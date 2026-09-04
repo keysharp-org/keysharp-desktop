@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "wl_connect.h"
 #include "backend_protocol.h"
 #include "protocol_io.h"
 #include "roles.h"
@@ -134,10 +135,38 @@ failed:
     return -1;
 }
 
+/* What this compositor actually advertises, which is not knowable from a
+ * static table: two compositors of the same kind differ, and the generic
+ * backend is by definition every compositor nobody wrote an extension for.
+ * Probed once at registration and reported, so the authority stores the truth
+ * rather than the ceiling and a client is told what it can really have.
+ *
+ * A probe that cannot connect narrows to nothing rather than falling back to
+ * the ceiling: claiming capability this daemon could not demonstrate is the
+ * one direction the registration mask exists to prevent. */
+static uint64_t probe_generic_operations(void)
+{
+    ksd_wayland *connection = NULL;
+    ksd_wayland_features features;
+    uint64_t operations = 0u;
+
+    if (ksd_wayland_open(NULL, &connection) != KSD_STATUS_OK)
+        return 0u;
+    features = ksd_wayland_supported(connection);
+    if (features.data_control)
+        operations |= KSD_OPERATION_CLIPBOARD_MIMETYPES
+            | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT;
+    if (features.toplevel_list)
+        operations |= KSD_OPERATION_WINDOW_LIST;
+    ksd_wayland_close(connection);
+    return operations;
+}
+
 static bool register_backend(int descriptor, ksd_backend backend,
                              uint64_t deadline, uint64_t *accepted)
 {
-    uint64_t requested = ksd_backend_operations(backend);
+    uint64_t requested = backend == KSD_BACKEND_GENERIC
+        ? probe_generic_operations() : ksd_backend_operations(backend);
     uint8_t message[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     memcpy(message, ksd_backend_registration_magic,
@@ -181,8 +210,8 @@ int ksd_daemon_main(int argc, char **argv)
             backend = KSD_BACKEND_GENERIC;
             fputs(unsupported
                   ? "keysharp-desktop daemon: no supported compositor in this"
-                    " session; registering the generic backend, which"
-                    " advertises no operations\n"
+                    " session; registering the generic backend, which serves"
+                    " what the shared Wayland protocols allow\n"
                   : "keysharp-desktop daemon: no provider appeared;"
                     " registering the generic backend. Enable the shell"
                     " extension and run systemctl --user restart"

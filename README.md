@@ -294,15 +294,32 @@ corners, where GNOME area capture returns the opaque composited stage. KWin
 returns `KSD_CAPTURE_FORMAT_BGRA8_PREMULTIPLIED` for both capture opcodes, so
 a caller compositing the result itself needs different math per backend.
 KWin capture needs
-a `kwin_wayland` compositor: a KDE X11 session gets the generic backend below,
-so it advertises no operations at all.
+a `kwin_wayland` compositor: a KDE X11 session resolves to the X11 backend, which
+serves capture from the X server itself.
 
-On any other compositor - sway, Hyprland, COSMIC and the rest - the service
-registers the generic backend. `keysharp-desktop probe` reports
-`backend=generic` with an empty operation mask. Connecting, prompting through
-polkit, storing a grant, listing it and revoking it all work; every operation
-reports `unavailable`. That is the honest state of an unsupported compositor,
-not a failure.
+On any other compositor - sway, Hyprland, COSMIC, niri, river and the rest -
+the service registers the generic backend, which is no longer empty. It serves
+what the shared Wayland protocols allow a client on the OUTSIDE of a compositor
+to do: the three clipboard reads over `ext-data-control-v1`, and the window
+list over `ext-foreign-toplevel-list-v1`. `keysharp-desktop probe` reports
+`backend=generic` with whichever of those the compositor actually implements -
+the daemon probes and narrows, so the mask is what you can really have rather
+than a ceiling.
+
+Two limits are worth stating plainly, because both are protocol and not
+backlog. The window list carries a title, an app id and an opaque identifier,
+and omits geometry, pid and window state entirely rather than reporting zeros
+for them - `ext-foreign-toplevel-list` does not carry those, and a zero would
+read as a fact. And nine operations are impossible for a client outside the
+compositor: no Wayland protocol lets one client restack another's window, set
+its geometry or opacity, keep it above, change its decoration, learn a pid to
+signal, or correlate a toplevel to the process about to create it. Nothing
+reports which window has focus either, so there is no active-window verb here.
+Those report `unavailable`, and always will.
+
+Clipboard writes are absent for a different reason, and the same one as on
+X11: owning a selection means staying alive to serve it, and the worker that
+answers exits with its operation.
 
 Pointer control covers `ksd_mouse_move_absolute` plus three frozen fallback
 calls that overlap `keysharp-input`; see Permissions below.

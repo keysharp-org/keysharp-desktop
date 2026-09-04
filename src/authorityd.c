@@ -1326,11 +1326,13 @@ static bool execute_operation(authority_session *session,
     uint64_t before = session->generation;
     uint32_t before_backend = session->backend;
     ksd_operation_result result;
-    /* Three routes. KWin capture and every X11 verb run in the forked,
-     * privilege-dropped worker; everything else goes to a compositor
-     * provider over the session bus. */
+    /* Three routes. KWin capture, every X11 verb, and every generic Wayland
+     * verb run in the forked, privilege-dropped worker; everything else goes
+     * to a compositor provider over the session bus. The generic backend has
+     * no provider to go to at all -- that is what makes it generic. */
     if (session->backend == KSD_BACKEND_KWIN
-        || session->backend == KSD_BACKEND_X11) {
+        || session->backend == KSD_BACKEND_X11
+        || session->backend == KSD_BACKEND_GENERIC) {
         ksd_capture_worker_execute(&session->identity, session->gid, request,
                                    capture_still_authorized, session,
                                    registered_backend_pid(session->state,

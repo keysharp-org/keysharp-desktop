@@ -168,7 +168,32 @@ int main(void)
      * needs a compositor: no clipboard, no window control, no input. Pinned as
      * an exact mask rather than a list of present bits, so a verb added to the
      * backend without an implementation behind it fails here. */
-    assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
+    /* The generic Wayland ceiling: what the shared protocols make possible
+     * for a client on the OUTSIDE of a compositor. Any given compositor
+     * implements some subset, and the daemon narrows this at registration. */
+    assert(ksd_backend_operations(KSD_BACKEND_GENERIC)
+           == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_CLIPBOARD_MIMETYPES
+               | KSD_OPERATION_CLIPBOARD_CONTENT
+               | KSD_OPERATION_CLIPBOARD_TEXT));
+    /* The nine that are IMPOSSIBLE here, not merely unwritten, each because no
+     * Wayland protocol provides it: no client may restack another client's
+     * window, set its geometry, set its opacity, keep it above, change its
+     * decoration, learn a pid to signal, or correlate a toplevel to the
+     * process that will create it. Pinned so that adding one later has to be a
+     * deliberate act with a protocol behind it rather than an oversight. */
+    assert((ksd_backend_operations(KSD_BACKEND_GENERIC)
+            & (KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_KILL
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE_XID
+               | KSD_OPERATION_WINDOW_SET_OPACITY
+               | KSD_OPERATION_WINDOW_SET_ABOVE
+               | KSD_OPERATION_WINDOW_SET_DECORATED
+               | KSD_OPERATION_WINDOW_RESERVE
+               | KSD_OPERATION_WINDOW_GET_RESERVED)) == 0u);
+    /* And active-window, which this protocol cannot answer: nothing in
+     * ext-foreign-toplevel-list says which window has focus. */
+    assert((ksd_backend_operations(KSD_BACKEND_GENERIC)
+            & KSD_OPERATION_WINDOW_ACTIVE) == 0u);
     assert(ksd_backend_operations(KSD_BACKEND_X11)
            == ksd_backend_x11_route(KSD_BACKEND_X11, true));
     assert(ksd_backend_operations(KSD_BACKEND_X11)

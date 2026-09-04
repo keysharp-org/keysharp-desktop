@@ -141,10 +141,20 @@ static void check_registration_mask(void)
     assert((mask & (KSD_OPERATION_MOUSE_BUTTON
                     | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE)) == 0u);
 
-    /* A backend that serves nothing cannot be talked into serving something. */
+    /* The generic backend narrows like any other, and cannot be talked into
+     * more than the shared protocols provide. */
     assert(ksd_backend_registration_mask(KSD_BACKEND_GENERIC, version, 0u,
                                          ~UINT64_C(0), &mask));
-    assert(mask == 0u);
+    assert(mask == ksd_backend_operations(KSD_BACKEND_GENERIC));
+    assert((mask & KSD_OPERATION_WINDOW_MOVE_RESIZE) == 0u);
+
+    /* A daemon that probed its compositor and found no data-control protocol
+     * says so, and is believed. This is the case the registration mask exists
+     * for: what a Wayland compositor implements is not knowable from a static
+     * table, because two compositors of the same kind differ. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_GENERIC, version, 0u,
+                                         KSD_OPERATION_WINDOW_LIST, &mask));
+    assert(mask == KSD_OPERATION_WINDOW_LIST);
 
     /* Only KWin hands over a callback socket, because only a KWin script
      * cannot be reached on the session bus. */
@@ -274,6 +284,8 @@ int main(int argc, char **argv)
     check_registration_mask();
     check_registration_ack();
     check_session_type_table();
-    assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
+    /* No longer zero: the generic backend serves what the shared Wayland
+     * protocols allow a client outside the compositor to do. */
+    assert(ksd_backend_operations(KSD_BACKEND_GENERIC) != 0u);
     return 0;
 }
