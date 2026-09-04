@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "kwin_wire.h"
 #include "operation_scope.h"
 #include "permission_domain.h"
 #include "protocol.h"
@@ -164,6 +165,40 @@ int main(void)
             & KSD_OPERATION_CAPTURE_WINDOW) != 0u);
     assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
             & KSD_OPERATION_CAPTURE_AREA) == 0u);
+    /* KWin serves the two captures from the forked worker and everything else
+     * through the script, over the socket its daemon hands over. Pinned as an
+     * exact mask so a verb cannot be advertised before the script implements
+     * it, which is the defect this project has now made twice. */
+    assert(ksd_backend_operations(KSD_BACKEND_KWIN)
+           == (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW
+               | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
+               | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
+               | KSD_OPERATION_WINDOW_CLOSE
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE
+               | KSD_OPERATION_WINDOW_SET_STATE
+               | KSD_OPERATION_WINDOW_SET_OPACITY
+               | KSD_OPERATION_WINDOW_SET_ABOVE
+               | KSD_OPERATION_WINDOW_SET_DECORATED
+               | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA));
+    /* LOWER stays out on purpose: KWin exposes raise and no lower, and the
+     * script answers UNSUPPORTED rather than approximating it by sending the
+     * window behind everything. Advertising it would promise a verb that is
+     * always refused. */
+    assert((ksd_backend_operations(KSD_BACKEND_KWIN)
+            & KSD_OPERATION_WINDOW_LOWER) == 0u);
+    /* And every KWin verb outside the two captures takes a lane, or it would
+     * be advertised with no way to reach the script. */
+    for (uint32_t opcode = 0u; opcode <= UINT16_MAX; opcode++) {
+        uint64_t bit = ksd_operation_bit((uint16_t)opcode);
+
+        if (bit == 0u
+            || (ksd_backend_operations(KSD_BACKEND_KWIN) & bit) == 0u)
+            continue;
+        if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW)
+            continue;
+        assert(ksd_kwin_lane_for((uint16_t)opcode) != KSD_KWIN_LANE_NONE);
+    }
+
     /* X11 serves the coordinate group and both captures, and nothing that
      * needs a compositor: no clipboard, no window control, no input. Pinned as
      * an exact mask rather than a list of present bits, so a verb added to the

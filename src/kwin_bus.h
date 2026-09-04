@@ -23,7 +23,10 @@ typedef struct ksd_kwin_bus ksd_kwin_bus;
 /* Owns io.github.keysharp.KWinProvider1 on the session bus and registers
  * /io/github/keysharp/KWinProvider. Returns NULL when the name cannot be
  * taken, which means another daemon already holds it. */
-ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host);
+/* relay is the authority's end of the callback socket, or -1. Requests arrive
+ * on it and answers go back out of order, because a cheap verb must not wait
+ * behind an enumeration. */
+ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay);
 
 /* Runs until the authority closes descriptor, then returns. The authority
  * socket is watched as a source on the same loop rather than from another

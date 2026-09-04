@@ -100,6 +100,41 @@ ksd_kwin_poll_outcome ksd_kwin_host_poll(ksd_kwin_host *host,
     return KSD_KWIN_POLL_ANSWERED;
 }
 
+/* Answers a lane whose poll is already parked. The transport calls this both
+ * when work has just been queued and when the idle timer fires, and the two
+ * cases differ only in what the queue happens to hold -- which is why it asks
+ * rather than assuming. A version that always wrote an idle reply would accept
+ * work and then sit on it until the next timer. */
+bool ksd_kwin_host_poll_parked(ksd_kwin_host *host, ksd_kwin_lane lane,
+                               uint64_t now_ms, ksd_buffer *reply)
+{
+    const ksd_kwin_job *batch[KSD_KWIN_JOBS_PER_REPLY_FAST];
+    ksd_kwin_dispatch dispatch[KSD_KWIN_JOBS_PER_REPLY_FAST];
+    size_t taken;
+
+    if (host == NULL || reply == NULL)
+        return false;
+    if (lane != KSD_KWIN_LANE_FAST && lane != KSD_KWIN_LANE_SLOW)
+        return false;
+    host->parked[lane_index(lane)] = false;
+    taken = ksd_kwin_queue_take(&host->queue, lane, batch,
+                                KSD_KWIN_JOBS_PER_REPLY_FAST);
+    if (taken == 0u)
+        return ksd_kwin_format_poll_reply(host->generation, lane,
+                                          KSD_KWIN_IDLE_REPLY_MS, NULL, 0u,
+                                          reply);
+    for (size_t index = 0u; index < taken; index++) {
+        dispatch[index].sequence = batch[index]->sequence;
+        dispatch[index].opcode = batch[index]->opcode;
+        dispatch[index].budget_ms = batch[index]->deadline_ms > now_ms
+            ? (uint32_t)(batch[index]->deadline_ms - now_ms) : 0u;
+        dispatch[index].body = batch[index]->body;
+        dispatch[index].body_length = batch[index]->body_length;
+    }
+    return ksd_kwin_format_poll_reply(host->generation, lane, 0u, dispatch,
+                                      taken, reply);
+}
+
 bool ksd_kwin_host_report(ksd_kwin_host *host, const uint8_t *envelope,
                           size_t length, ksd_buffer *reply)
 {

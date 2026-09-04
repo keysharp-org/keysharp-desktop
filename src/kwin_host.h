@@ -51,6 +51,12 @@ ksd_kwin_poll_outcome ksd_kwin_host_poll(ksd_kwin_host *host,
                                          size_t length, uint64_t now_ms,
                                          ksd_buffer *reply);
 
+/* Answers a lane whose poll is already parked: a batch when the queue has work
+ * for it, an idle reply when it does not. The transport uses this both when
+ * work arrives and when the idle timer fires. */
+bool ksd_kwin_host_poll_parked(ksd_kwin_host *host, ksd_kwin_lane lane,
+                               uint64_t now_ms, ksd_buffer *reply);
+
 /* Matches a report against dispatched jobs. Refuses the whole report if any
  * record in it is one this daemon did not dispatch, rather than believing the
  * part it recognises: a report is one message from one script, and a mixture

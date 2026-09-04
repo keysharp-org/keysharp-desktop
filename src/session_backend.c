@@ -339,7 +339,8 @@ int ksd_daemon_main(int argc, char **argv)
 
         if (issue_generation(generation)) {
             ksd_kwin_host *host = ksd_kwin_host_create(generation);
-            ksd_kwin_bus *bus = host == NULL ? NULL : ksd_kwin_bus_start(host);
+            ksd_kwin_bus *bus = host == NULL ? NULL
+                : ksd_kwin_bus_start(host, provider_pair[0]);
 
             if (bus != NULL) {
                 (void)ksd_kwin_bus_run(bus, descriptor);

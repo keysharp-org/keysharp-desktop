@@ -1,6 +1,8 @@
 #include "kwin_bus.h"
 
 #include "kwin_wire.h"
+#include "protocol.h"
+#include "transport.h"
 
 #include <unistd.h>
 
@@ -59,7 +61,74 @@ struct ksd_kwin_bus {
     GDBusMethodInvocation *parked[KSD_KWIN_LANES];
     guint idle_source[KSD_KWIN_LANES];
     int authority;
+    /* The socket the authority relays requests over, and the requests still
+     * waiting on the script. Answered out of order, because the whole point of
+     * the queue is that a cheap verb need not wait behind an enumeration. */
+    int relay;
+    guint relay_source;
+    struct {
+        bool active;
+        uint64_t request_id;
+        char sequence[KSD_KWIN_SEQ_HEX + 1u];
+    } inflight[KSD_KWIN_MAX_JOBS];
 };
+
+/* Writes one response frame back to the authority. */
+static void relay_answer(ksd_kwin_bus *bus, uint64_t request_id,
+                         uint32_t status, const uint8_t *body,
+                         uint32_t body_length)
+{
+    ksd_frame frame;
+    ksd_buffer packed;
+    ksd_buffer payload;
+
+    /* The status rides in the payload, not the header: a frame carries no
+     * status field, and the rest of this service already answers with an
+     * eight-byte status and detail prologue ahead of the tail. One shape. */
+    ksd_buffer_init(&payload, body_length + 8u);
+    if (!ksd_buffer_u32(&payload, status) || !ksd_buffer_u32(&payload, 0u)
+        || (body_length != 0u
+            && !ksd_buffer_bytes(&payload, body, body_length))) {
+        ksd_buffer_clear(&payload);
+        return;
+    }
+    memset(&frame, 0, sizeof(frame));
+    frame.magic[0] = KSD_FRAME_MAGIC_0;
+    frame.magic[1] = KSD_FRAME_MAGIC_1;
+    frame.magic[2] = KSD_FRAME_MAGIC_2;
+    frame.magic[3] = KSD_FRAME_MAGIC_3;
+    frame.major = KSD_PROTOCOL_MAJOR;
+    frame.minor = KSD_PROTOCOL_MINOR;
+    frame.request_id = request_id;
+    frame.payload = payload.data;
+    frame.payload_length = (uint32_t)payload.length;
+    ksd_buffer_init(&packed, KSD_FRAME_HEADER_SIZE + payload.length + 16u);
+    if (ksd_frame_pack(&frame, &packed))
+        (void)ksd_write_all(bus->relay, packed.data, packed.length);
+    ksd_buffer_clear(&packed);
+    ksd_buffer_clear(&payload);
+}
+
+/* Answers every relayed request whose job the script has now reported. Called
+ * after each Report, because that is the only thing that can complete one. */
+static void relay_drain(ksd_kwin_bus *bus)
+{
+    for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
+        uint32_t status = 0u;
+        const uint8_t *body = NULL;
+        uint32_t body_length = 0u;
+
+        if (!bus->inflight[index].active)
+            continue;
+        if (!ksd_kwin_host_result(bus->host, bus->inflight[index].sequence,
+                                  &status, &body, &body_length))
+            continue;
+        relay_answer(bus, bus->inflight[index].request_id, status, body,
+                     body_length);
+        ksd_kwin_host_release(bus->host, bus->inflight[index].sequence);
+        bus->inflight[index].active = false;
+    }
+}
 
 static size_t lane_slot(ksd_kwin_lane lane)
 {
@@ -91,12 +160,15 @@ static void release_park(ksd_kwin_bus *bus, ksd_kwin_lane lane)
         g_source_remove(bus->idle_source[slot]);
         bus->idle_source[slot] = 0u;
     }
-    /* An idle reply carries no jobs, which is what tells the script the lane
-     * is alive and lets it re-park. */
-    ksd_buffer_init(&reply, 4096u);
-    if (ksd_kwin_format_poll_reply(ksd_kwin_host_generation(bus->host), lane,
-                                   KSD_KWIN_IDLE_REPLY_MS, NULL, 0u,
-                                   &reply)) {
+    /* Whatever the host has for this lane NOW. When work has just been queued
+     * that is a batch; when the idle timer fired it is an empty reply, which
+     * is what tells the script the lane is alive and lets it re-park. Asking
+     * the host rather than assuming is why one function ends a park: an
+     * always-idle version would queue work and then sit on it. */
+    ksd_buffer_init(&reply, 65536u);
+    if (ksd_kwin_host_poll_parked(bus->host, lane,
+                                  (uint64_t)g_get_monotonic_time() / 1000u,
+                                  &reply)) {
         answer(invocation, &reply);
     } else {
         g_dbus_method_invocation_return_error_literal(invocation,
@@ -180,6 +252,10 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
     } else if (g_strcmp0(method, "Report") == 0) {
         ok = ksd_kwin_host_report(bus->host, (const uint8_t *)envelope,
                                   strlen(envelope), &reply);
+        /* A report is the only thing that can complete a job, so it is the
+         * only moment a relayed request can be answered. */
+        if (ok)
+            relay_drain(bus);
     } else if (g_strcmp0(method, "Event") == 0) {
         /* Events never carry a job in either direction, so an event storm
          * cannot delay dispatched work. Acknowledged and nothing more until
@@ -269,7 +345,7 @@ static void on_name_lost(GDBusConnection *connection, const gchar *name,
         g_main_loop_quit(bus->loop);
 }
 
-ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host)
+ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay)
 {
     ksd_kwin_bus *bus;
     GError *error = NULL;
@@ -279,6 +355,7 @@ ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host)
     bus = g_new0(ksd_kwin_bus, 1);
     bus->host = host;
     bus->authority = -1;
+    bus->relay = relay;
     bus->node = g_dbus_node_info_new_for_xml(introspection, &error);
     if (bus->node == NULL) {
         g_printerr("keysharp-desktop daemon: bad KWin introspection: %s\n",
@@ -296,6 +373,73 @@ ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host)
                                   on_bus_acquired, NULL, on_name_lost, bus,
                                   NULL);
     return bus;
+}
+
+/* One relayed request from the authority: queue it for the script, and wake
+ * the lane it belongs to so it goes out on the poll that is already parked
+ * rather than waiting for the idle timer. */
+static gboolean relay_readable(gint descriptor, GIOCondition condition,
+                               gpointer data)
+{
+    ksd_kwin_bus *bus = data;
+    uint8_t header[KSD_FRAME_HEADER_SIZE];
+    uint8_t *body = NULL;
+    uint32_t payload_length;
+    uint64_t request_id;
+    uint16_t opcode;
+    char sequence[KSD_KWIN_SEQ_HEX + 1u];
+    size_t slot = KSD_KWIN_MAX_JOBS;
+
+    (void)descriptor;
+    if ((condition & (G_IO_HUP | G_IO_ERR)) != 0) {
+        bus->relay_source = 0u;
+        return G_SOURCE_REMOVE;
+    }
+    if (!ksd_read_all(bus->relay, header, sizeof(header))) {
+        bus->relay_source = 0u;
+        return G_SOURCE_REMOVE;
+    }
+    payload_length = ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
+    opcode = ksd_decode_u16(header + KSD_FRAME_OPCODE_OFFSET);
+    request_id = ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET);
+    if (payload_length > KSD_MAX_TEXT_BYTES) {
+        bus->relay_source = 0u;
+        return G_SOURCE_REMOVE;
+    }
+    if (payload_length != 0u) {
+        body = g_malloc(payload_length);
+        if (!ksd_read_all(bus->relay, body, payload_length)) {
+            g_free(body);
+            bus->relay_source = 0u;
+            return G_SOURCE_REMOVE;
+        }
+    }
+    for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
+        if (!bus->inflight[index].active) {
+            slot = index;
+            break;
+        }
+    }
+    /* Both refusals are BUSY rather than a failure: neither reached the
+     * compositor, so the caller may retry safely. */
+    if (slot == KSD_KWIN_MAX_JOBS
+        || !ksd_kwin_host_submit(bus->host, opcode, body,
+                                 payload_length,
+                                 (uint64_t)g_get_monotonic_time() / 1000u,
+                                 sequence)) {
+        relay_answer(bus, request_id, KSD_STATUS_BUSY, NULL, 0u);
+        g_free(body);
+        return G_SOURCE_CONTINUE;
+    }
+    g_free(body);
+    bus->inflight[slot].active = true;
+    bus->inflight[slot].request_id = request_id;
+    memcpy(bus->inflight[slot].sequence, sequence, sizeof(sequence));
+    /* The lane this job belongs to may have a poll parked on it. Releasing it
+     * now is what makes a submitted job leave promptly instead of waiting out
+     * the idle timer. */
+    release_park(bus, ksd_kwin_lane_for(opcode));
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean authority_readable(gint descriptor, GIOCondition condition,
@@ -319,6 +463,9 @@ int ksd_kwin_bus_run(ksd_kwin_bus *bus, int descriptor)
         return 1;
     bus->authority = descriptor;
     bus->loop = g_main_loop_new(NULL, FALSE);
+    if (bus->relay >= 0)
+        bus->relay_source = g_unix_fd_add(bus->relay,
+            G_IO_IN | G_IO_HUP | G_IO_ERR, relay_readable, bus);
     g_unix_fd_add(descriptor, G_IO_IN | G_IO_HUP | G_IO_ERR,
                   authority_readable, bus);
     g_main_loop_run(bus->loop);

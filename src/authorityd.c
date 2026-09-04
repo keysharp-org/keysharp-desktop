@@ -2,6 +2,8 @@
 #include "worker_pool.h"
 #include "backend_protocol.h"
 #include "capture_worker.h"
+#include "kwin_relay.h"
+#include "kwin_wire.h"
 #include "protocol.h"
 #include "operation_result.h"
 #include "operation_scope.h"
@@ -106,6 +108,9 @@ typedef struct authority_state {
          * on. Only KWin sends one, because only a KWin script cannot be
          * reached on the session bus. -1 for every other backend. */
         int provider_fd;
+        /* Wraps provider_fd once the registration is accepted, so the many
+         * connection threads can share one socket without serialising on it. */
+        ksd_kwin_relay *relay;
         ksp_identity identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
@@ -395,6 +400,8 @@ static bool register_backend(authority_state *state, int descriptor,
          * reference and a leak here would hold the socket open past the
          * registration it belongs to. */
         state->backends[free_slot].provider_fd = provider_fd;
+        state->backends[free_slot].relay = provider_fd >= 0
+            ? ksd_kwin_relay_create(provider_fd) : NULL;
         state->backends[free_slot].identity = *identity;
         registered = true;
     }
@@ -415,7 +422,11 @@ static void unregister_backend(authority_state *state, uid_t uid,
              * its copy when it handed this over, so this is the only reference
              * and leaking it would hold the socket open for the life of the
              * authority -- and leave the daemon's end never seeing a hangup. */
-            if (state->backends[index].provider_fd >= 0)
+            /* The relay owns the descriptor once it exists, so only one of
+             * these two closes it. */
+            if (state->backends[index].relay != NULL)
+                ksd_kwin_relay_destroy(state->backends[index].relay);
+            else if (state->backends[index].provider_fd >= 0)
                 close(state->backends[index].provider_fd);
             memset(&state->backends[index], 0,
                    sizeof(state->backends[index]));
@@ -458,6 +469,25 @@ static pid_t registered_backend_pid(authority_state *state, uid_t uid)
         }
     pthread_mutex_unlock(&state->mutex);
     return pid;
+}
+
+/* The relay for a uid's registered daemon, or NULL. Returned under the lock
+ * and used after it: the relay outlives the lock because it is destroyed only
+ * by unregister_backend, which the caller's own registration check guards
+ * against for the length of one operation. */
+static ksd_kwin_relay *registered_relay(authority_state *state, uid_t uid)
+{
+    ksd_kwin_relay *relay = NULL;
+
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid) {
+            relay = state->backends[index].relay;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return relay;
 }
 
 static uint32_t registered_backend(authority_state *state, uid_t uid)
@@ -1409,7 +1439,23 @@ static bool execute_operation(authority_session *session,
      * verb run in the forked, privilege-dropped worker; everything else goes
      * to a compositor provider over the session bus. The generic backend has
      * no provider to go to at all -- that is what makes it generic. */
-    if (session->backend == KSD_BACKEND_KWIN
+    if (kwin_script) {
+        /* Everything KWin serves that is not a capture goes to the script, and
+         * the only way to reach it is the socket its daemon handed over. */
+        ksd_kwin_relay *relay = registered_relay(session->state,
+                                                 session->identity.uid);
+
+        if (relay == NULL) {
+            ksd_result_init(&result);
+            ksd_result_error(&result, KSD_STATUS_UNAVAILABLE, 0u,
+                             "this compositor has no script channel");
+        } else {
+            uint64_t now = monotonic_milliseconds();
+
+            (void)ksd_kwin_relay_call(relay, request,
+                                      now + KSD_KWIN_OP_DEADLINE_MS, &result);
+        }
+    } else if (session->backend == KSD_BACKEND_KWIN
         || session->backend == KSD_BACKEND_X11
         || session->backend == KSD_BACKEND_GENERIC) {
         ksd_capture_worker_execute(&session->identity, session->gid, request,

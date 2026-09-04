@@ -74,6 +74,7 @@ add_library(keysharp-desktop-common STATIC
     src/operation_scope.c
     src/kwin_lanes.c
     src/kwin_bus.c
+    src/kwin_relay.c
     src/kwin_host.c
     src/kwin_jobs.c
     src/kwin_peer.c
