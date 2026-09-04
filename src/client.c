@@ -1562,6 +1562,13 @@ ksd_status ksd_window_list_json(ksd_connection *connection,
                                  payload, sizeof(payload), json, error);
 }
 
+ksd_status ksd_window_handles_json(ksd_connection *connection,
+                                   ksd_string *json, ksd_error *error)
+{
+    return request_string_result(connection, KSD_OP_WINDOW_HANDLES,
+                                 NULL, 0u, json, error);
+}
+
 ksd_status ksd_window_active_json(ksd_connection *connection,
                                   ksd_string *json, ksd_error *error)
 {

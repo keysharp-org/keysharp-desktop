@@ -229,6 +229,7 @@ bool ksd_backend_session_unsupported(void)
  * anyway, so shipping a subset buys nothing. */
 #define KSD_X11_COORDINATE_OPERATIONS \
     (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
+     | KSD_OPERATION_WINDOW_HANDLES \
      | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
 
 /* Served by the same forked worker as the coordinate group, but named apart
@@ -311,7 +312,10 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * cannot restack another client's window, set its geometry or opacity, learn
  * its pid, or ask which one has focus -- there is no request for any of it.
  * See the capability audit; those nine are impossible rather than pending. */
-#define KSD_GENERIC_OPERATIONS     (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_CLIPBOARD_MIMETYPES      | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT)
+#define KSD_GENERIC_OPERATIONS \
+    (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES \
+     | KSD_OPERATION_CLIPBOARD_MIMETYPES \
+     | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT)
 
 /* What a KWin session serves. The captures run in the forked worker and never
  * touch the script; everything else is relayed to it over the socket the
@@ -321,7 +325,15 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * script reports UNSUPPORTED rather than approximating it -- so advertising it
  * would promise something that is always refused. The reservations and the
  * watch are absent because nothing serves them yet. */
-#define KSD_KWIN_OPERATIONS     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW      | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE      | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE      | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_MOVE_RESIZE      | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY      | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_SET_DECORATED      | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
+#define KSD_KWIN_OPERATIONS \
+    (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW \
+     | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
+     | KSD_OPERATION_WINDOW_HANDLES \
+     | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE \
+     | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_MOVE_RESIZE \
+     | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY \
+     | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_SET_DECORATED \
+     | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
 
 uint64_t ksd_backend_operations(ksd_backend backend)
 {

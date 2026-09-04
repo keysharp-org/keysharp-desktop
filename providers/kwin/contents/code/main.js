@@ -25,6 +25,7 @@ var IFACE = "io.github.keysharp.KWinProvider1";
 /* Mirrors src/protocol.h. A number that appears in both places is a number that
  * can drift, so each is named once here and nowhere else in this file. */
 var OP_WINDOW_LIST = 0x2010;
+var OP_WINDOW_HANDLES = 0x2013;
 var OP_WINDOW_ACTIVE = 0x2011;
 var OP_WINDOW_FOCUS = 0x2020;
 var OP_WINDOW_RAISE = 0x2021;
@@ -296,6 +297,24 @@ function executeJob(job) {
                 body += ",";
             first = false;
             body += windowJson(windows[index]);
+        }
+        body += "]}";
+        return { sequence: job.sequence, status: STATUS_OK, body: body };
+
+    case OP_WINDOW_HANDLES:
+        /* Identifiers and nothing else. This carries no grant, so it must not
+         * carry a title, a class or a pid either -- the whole difference
+         * between it and the window list is what it declines to say. */
+        windows = api.windowList();
+        body = "{\"ok\":true,\"handles\":[";
+        var firstHandle = true;
+        for (index = 0; index < windows.length; index++) {
+            if (!isOrdinary(windows[index]))
+                continue;
+            if (!firstHandle)
+                body += ",";
+            firstHandle = false;
+            body += jsonString(windowHandle(windows[index]));
         }
         body += "]}";
         return { sequence: job.sequence, status: STATUS_OK, body: body };

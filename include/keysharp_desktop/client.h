@@ -28,7 +28,7 @@ extern "C" {
  * backend for. Minor 4 names the brokered clipboard write, which needs no
  * grant; an older library has no symbol for its operation bit. See docs/integrating.md for exactly which
  * masks are narrowed and which are delivered verbatim. */
-#define KSD_CLIENT_ABI_MINOR 4u
+#define KSD_CLIENT_ABI_MINOR 5u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -132,6 +132,13 @@ typedef uint32_t ksd_backend;
 #define KSD_OPERATION_CURSOR_POSITION UINT64_C(0x0000000004000000)
 #define KSD_OPERATION_WORK_AREA UINT64_C(0x0000000008000000)
 #define KSD_OPERATION_CLIPBOARD_SET_CONTENT UINT64_C(0x0000000010000000)
+/* Enumeration without properties. A handle says a window exists and nothing
+ * else -- not its title, not its owner, not where it is -- so it carries no
+ * grant, while reading anything ABOUT a window still does. That split is why
+ * this is a separate operation rather than a flag on the window list: the list
+ * returns titles and pids in the same reply, which makes the whole reply the
+ * gated side. */
+#define KSD_OPERATION_WINDOW_HANDLES UINT64_C(0x0000000020000000)
 
 /* The mimetype ksd_clipboard_set_text writes. A caller that wants the same
  * bytes through ksd_clipboard_set_content must use this exact string; the
@@ -355,6 +362,16 @@ KSD_API ksd_status ksd_cursor_position(ksd_connection *connection,
 KSD_API ksd_status ksd_work_area(ksd_connection *connection,
                          ksd_rectangle *area, ksd_error *error);
 
+/* Every window's handle, and nothing else about any of them. Needs no grant
+ * and raises no prompt: a handle says a window exists, which is not something
+ * a consent dialog can meaningfully ask about. Reading a window's title, class,
+ * owner or geometry is ksd_window_list_json, and that does need one.
+ *
+ * The reply is {"ok":true,"handles":["...", ...]}. Handles are opaque strings
+ * whatever the backend: an XID on X11, a compositor identifier on Wayland. */
+KSD_API ksd_status ksd_window_handles_json(ksd_connection *connection,
+                                           ksd_string *json,
+                                           ksd_error *error);
 KSD_API ksd_status ksd_window_list_json(ksd_connection *connection,
                                 uint32_t include_hidden,
                                 ksd_string *json, ksd_error *error);

@@ -220,6 +220,54 @@ static bool append_json_string(ksd_buffer *out, const char *value)
     return ksd_buffer_bytes(out, "\"", 1u);
 }
 
+/* Handles only. On this backend the difference from the window list is
+ * smaller than on X11 -- the protocol carries so little that the list is
+ * nearly handles already -- but the permission difference is the same, and a
+ * caller that only wants to know what exists should not need a grant for it. */
+void ksd_wayland_window_handles(ksd_wayland *connection,
+                                ksd_operation_result *result)
+{
+    ksd_buffer out;
+    ksd_buffer framed;
+    bool ok;
+    bool first = true;
+
+    if (!ksd_wayland_supported(connection).toplevel_list) {
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "this compositor does not list its windows");
+        return;
+    }
+    if (!ksd_wayland_roundtrip(connection, KSD_WL_WINDOW_TIMEOUT_MS)) {
+        ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
+                         "the compositor did not answer");
+        return;
+    }
+    sweep_closed(connection);
+
+    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
+    ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"handles\":[", 22u);
+    for (ksd_wl_toplevel *item = connection->toplevels;
+         ok && item != NULL; item = item->next) {
+        if (item->identifier == NULL)
+            continue;
+        if (!first)
+            ok = ksd_buffer_bytes(&out, ",", 1u);
+        first = false;
+        ok = ok && append_json_string(&out, item->identifier);
+    }
+    ok = ok && ksd_buffer_bytes(&out, "]}", 2u);
+
+    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
+    if (!ok || out.length > KSD_MAX_TEXT_BYTES
+        || !ksd_buffer_u32(&framed, (uint32_t)out.length)
+        || !ksd_buffer_bytes(&framed, out.data, out.length)
+        || !ksd_result_copy(result, framed.data, (uint32_t)framed.length))
+        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
+                         "the handle list is too large");
+    ksd_buffer_clear(&framed);
+    ksd_buffer_clear(&out);
+}
+
 void ksd_wayland_window_list(ksd_wayland *connection,
                              ksd_operation_result *result)
 {

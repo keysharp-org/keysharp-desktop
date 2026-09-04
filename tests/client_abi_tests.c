@@ -9,7 +9,7 @@
 int main(void)
 {
     assert(KSD_CLIENT_ABI_MAJOR == 0u);
-    assert(KSD_CLIENT_ABI_MINOR == 4u);
+    assert(KSD_CLIENT_ABI_MINOR == 5u);
     assert(KSD_ROLE_AUTHORIZATION_LEASE == 3u);
     assert(KSD_BACKEND_GENERIC == 4u);
     assert(strcmp(KSD_DEFAULT_SOCKET_PATH,

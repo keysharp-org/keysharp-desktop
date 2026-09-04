@@ -11,6 +11,8 @@
  * which backend answered except by reading the backend value. */
 void ksd_x11_cursor_position(ksd_x11 *connection, ksd_operation_result *result);
 void ksd_x11_work_area(ksd_x11 *connection, ksd_operation_result *result);
+/* Handles only, carrying no properties and needing no grant. */
+void ksd_x11_window_handles(ksd_x11 *connection, ksd_operation_result *result);
 void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
                          ksd_operation_result *result);
 void ksd_x11_window_active(ksd_x11 *connection, ksd_operation_result *result);

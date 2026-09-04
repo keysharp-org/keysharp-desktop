@@ -20,8 +20,13 @@ ksd_kwin_lane ksd_kwin_lane_for(uint16_t opcode)
         case KSD_OP_WORK_AREA:
             return KSD_KWIN_LANE_FAST;
 
-        /* The only verb whose cost grows with the session. */
+        /* The two verbs whose cost grows with the session. Handles is far
+         * cheaper per window -- an id and nothing else -- but it still walks
+         * every window, and the lane split is about whether a verb's cost is
+         * bounded by a constant or by the session, not about how large the
+         * constant factor is. */
         case KSD_OP_WINDOW_LIST:
+        case KSD_OP_WINDOW_HANDLES:
             return KSD_KWIN_LANE_SLOW;
 
         default:
@@ -51,6 +56,7 @@ ksd_kwin_cost ksd_kwin_script_cost(uint16_t opcode)
             return KSD_KWIN_COST_BOUNDED;
 
         case KSD_OP_WINDOW_LIST:
+        case KSD_OP_WINDOW_HANDLES:
             return KSD_KWIN_COST_UNBOUNDED;
 
         default:

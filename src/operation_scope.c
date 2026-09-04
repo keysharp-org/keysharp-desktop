@@ -25,8 +25,12 @@ uint32_t ksd_operation_scope(uint16_t opcode)
 
 bool ksd_operation_scope_free(uint16_t opcode)
 {
+    /* WINDOW_HANDLES is here and WINDOW_LIST is not, which is the whole point
+     * of having both. A handle says a window exists; it does not say what it
+     * is, who owns it or where. Reading any of that is WINDOW_MONITORING. */
     return opcode == KSD_OP_CURSOR_POSITION || opcode == KSD_OP_WORK_AREA
-        || opcode == KSD_OP_CLIPBOARD_SET_CONTENT;
+        || opcode == KSD_OP_CLIPBOARD_SET_CONTENT
+        || opcode == KSD_OP_WINDOW_HANDLES;
 }
 
 bool ksd_operation_chunkable(uint16_t opcode)
@@ -48,6 +52,7 @@ uint64_t ksd_operation_bit(uint16_t opcode)
         case KSD_OP_CAPTURE_AREA: return KSD_OPERATION_CAPTURE_AREA;
         case KSD_OP_CAPTURE_WINDOW: return KSD_OPERATION_CAPTURE_WINDOW;
         case KSD_OP_WINDOW_LIST: return KSD_OPERATION_WINDOW_LIST;
+        case KSD_OP_WINDOW_HANDLES: return KSD_OPERATION_WINDOW_HANDLES;
         case KSD_OP_WINDOW_ACTIVE: return KSD_OPERATION_WINDOW_ACTIVE;
         case KSD_OP_WINDOW_WATCH: return KSD_OPERATION_WINDOW_WATCH;
         case KSD_OP_WINDOW_FOCUS: return KSD_OPERATION_WINDOW_FOCUS;

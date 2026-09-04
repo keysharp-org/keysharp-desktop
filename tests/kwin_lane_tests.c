@@ -57,8 +57,12 @@ static void check_fast_lane_is_bounded(void)
     /* WINDOW_LIST alone is unbounded, and the fast lane is not empty. Both
      * counts are asserted so a change that empties either shows up as a
      * failure rather than a vacuous sweep. */
-    assert(slow == 1u);
+    /* Two enumerations now: the window list and the handle list. Both walk
+     * every window, which is what the slow lane is for -- handles is far
+     * cheaper per window but its cost still grows with the session. */
+    assert(slow == 2u);
     assert(ksd_kwin_lane_for(KSD_OP_WINDOW_LIST) == KSD_KWIN_LANE_SLOW);
+    assert(ksd_kwin_lane_for(KSD_OP_WINDOW_HANDLES) == KSD_KWIN_LANE_SLOW);
     assert(fast >= 10u);
 }
 

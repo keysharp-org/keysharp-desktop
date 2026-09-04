@@ -52,6 +52,8 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
                 && ksd_cursor_finished(&cursor)
                 && ksd_utf8_valid(bytes, length, false);
         }
+        case KSD_OP_WINDOW_HANDLES:
+            return request->payload_length == 0u;
         case KSD_OP_WINDOW_LIST: {
             uint32_t include_hidden;
             uint32_t reserved;
@@ -121,6 +123,9 @@ void ksd_wayland_execute(const ksd_frame *request, pid_t session_pid,
         }
         case KSD_OP_WINDOW_LIST:
             ksd_wayland_window_list(connection, result);
+            break;
+        case KSD_OP_WINDOW_HANDLES:
+            ksd_wayland_window_handles(connection, result);
             break;
         default:
             ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,

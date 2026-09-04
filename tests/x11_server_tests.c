@@ -94,6 +94,79 @@ static void check_window_list(ksd_x11 *connection)
     ksd_result_clear(&result);
 }
 
+static xcb_atom_t intern_in(xcb_connection_t *c, const char *name);
+
+/* Handles carry no properties, which is the entire reason they need no grant.
+ * The gate is not that the ids are right -- it is that nothing ELSE is there. */
+static void check_window_handles(ksd_x11 *connection)
+{
+    ksd_operation_result result;
+
+    ksd_result_init(&result);
+    ksd_x11_window_handles(connection, &result);
+    /* No window manager, so no _NET_CLIENT_LIST, and the honest answer is the
+     * same one the window list gives: cannot be served here. */
+    assert(result.status == KSD_STATUS_UNAVAILABLE);
+    assert(result.tail == NULL);
+    ksd_result_clear(&result);
+}
+
+/* With a stand-in window manager publishing _NET_CLIENT_LIST, the handles come
+ * back and carry nothing but ids. */
+static void check_window_handles_with_manager(ksd_x11 *connection,
+                                              xcb_connection_t *owner,
+                                              xcb_screen_t *screen)
+{
+    ksd_operation_result result;
+    uint32_t length = 0u;
+    const char *body;
+    xcb_window_t window = xcb_generate_id(owner);
+    xcb_atom_t client_list = intern_in(owner, "_NET_CLIENT_LIST");
+    xcb_atom_t wm_name = intern_in(owner, "_NET_WM_NAME");
+    xcb_atom_t utf8 = intern_in(owner, "UTF8_STRING");
+    char expected[32];
+    int written;
+
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, window, screen->root, 0, 0,
+                      32u, 32u, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                      screen->root_visual, 0, NULL);
+    xcb_map_window(owner, window);
+    /* A title and a class, deliberately, so their ABSENCE from the reply is
+     * evidence rather than an accident of the window having none. */
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, wm_name, utf8,
+                        8, 13u, "secret window");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window,
+                        XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, 12u,
+                        "secret\0Secret");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root,
+                        client_list, XCB_ATOM_WINDOW, 32, 1u, &window);
+    xcb_flush(owner);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+
+    ksd_result_init(&result);
+    ksd_x11_window_handles(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    body = json_body(&result, &length);
+    written = snprintf(expected, sizeof(expected), "\"%u\"", (unsigned)window);
+    assert(written > 0);
+    assert(memmem(body, length, expected, (size_t)written) != NULL);
+    assert(memmem(body, length, "handles", 7u) != NULL);
+
+    /* And none of what the window list would have carried. This is the whole
+     * permission argument: the reply is ungated because there is nothing in it
+     * to consent to. */
+    assert(memmem(body, length, "secret", 6u) == NULL);
+    assert(memmem(body, length, "title", 5u) == NULL);
+    assert(memmem(body, length, "class", 5u) == NULL);
+    assert(memmem(body, length, "pid", 3u) == NULL);
+    assert(memmem(body, length, "frame", 5u) == NULL);
+    ksd_result_clear(&result);
+
+    xcb_delete_property(owner, screen->root, client_list);
+    xcb_destroy_window(owner, window);
+    xcb_flush(owner);
+}
+
 static void check_window_active(ksd_x11 *connection)
 {
     ksd_operation_result result;
@@ -877,6 +950,7 @@ int main(void)
     check_work_area(connection);
     check_window_list(connection);
     check_window_active(connection);
+    check_window_handles(connection);
 
     /* A second connection owns the windows, because the one under test has to
      * see them the way any other client would. */
@@ -884,6 +958,7 @@ int main(void)
     assert(xcb_connection_has_error(owner) == 0);
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(owner)).data;
     assert(screen != NULL);
+    check_window_handles_with_manager(connection, owner, screen);
     check_capture(connection, owner, screen);
     check_clipboard(connection, owner, canonical);
     check_control(connection, owner, screen, canonical);

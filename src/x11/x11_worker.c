@@ -69,6 +69,7 @@ bool ksd_x11_request_valid(const ksd_frame *request)
                 && include_hidden <= 1u && reserved == 0u
                 && ksd_cursor_finished(&cursor);
         case KSD_OP_WINDOW_ACTIVE:
+        case KSD_OP_WINDOW_HANDLES:
         case KSD_OP_CURSOR_POSITION:
         case KSD_OP_WORK_AREA:
             return request->payload_length == 0u;
@@ -209,6 +210,9 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
         }
         case KSD_OP_WINDOW_ACTIVE:
             ksd_x11_window_active(connection, result);
+            break;
+        case KSD_OP_WINDOW_HANDLES:
+            ksd_x11_window_handles(connection, result);
             break;
         case KSD_OP_CURSOR_POSITION:
             ksd_x11_cursor_position(connection, result);

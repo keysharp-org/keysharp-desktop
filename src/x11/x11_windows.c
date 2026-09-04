@@ -189,6 +189,57 @@ static void json_result(ksd_buffer *out, ksd_operation_result *result)
     ksd_buffer_clear(out);
 }
 
+/* Handles and nothing else, which is what makes this ungated: it issues no
+ * property request at all, so there is no title, pid or geometry to leak even
+ * by accident. It is also the cheapest window call this backend has -- one
+ * round trip for _NET_CLIENT_LIST and no per-window traffic -- which matters
+ * because a consumer that only wants to know what exists should not pay for
+ * eleven properties per window it is going to ignore. */
+void ksd_x11_window_handles(ksd_x11 *connection, ksd_operation_result *result)
+{
+    xcb_connection_t *c = connection->connection;
+    xcb_window_t root = connection->screen->root;
+    x11_atoms atoms;
+    ksd_buffer out;
+    bool ok;
+    bool first = true;
+
+    ksd_x11_load_atoms(c, &atoms);
+    xcb_get_property_reply_t *reply = ksd_x11_property(c, root,
+        atoms.client_list, XCB_ATOM_WINDOW, KSD_X11_MAX_WINDOWS);
+    if (reply == NULL) {
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "no window manager publishes _NET_CLIENT_LIST");
+        return;
+    }
+    int length = xcb_get_property_value_length(reply);
+    const xcb_window_t *windows = xcb_get_property_value(reply);
+    size_t count = length > 0 ? (size_t)length / sizeof(xcb_window_t) : 0u;
+
+    if (count > KSD_X11_MAX_WINDOWS)
+        count = KSD_X11_MAX_WINDOWS;
+    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
+    ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"handles\":[", 22u);
+    for (size_t index = 0u; ok && index < count; index++) {
+        char text[32];
+        int written = snprintf(text, sizeof(text), first ? "\"%u\"" : ",\"%u\"",
+                               (unsigned)windows[index]);
+
+        first = false;
+        ok = written > 0 && (size_t)written < sizeof(text)
+            && ksd_buffer_bytes(&out, text, (size_t)written);
+    }
+    ok = ok && ksd_buffer_bytes(&out, "]}", 2u);
+    free(reply);
+    if (!ok) {
+        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
+                         "the handle list is too large");
+        ksd_buffer_clear(&out);
+        return;
+    }
+    json_result(&out, result);
+}
+
 void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
                          ksd_operation_result *result)
 {

@@ -45,6 +45,11 @@ static const expected_operation expected_operations[] = {
       KSD_OPERATION_WINDOW_LIST, false },
     { KSD_OP_WINDOW_ACTIVE, KSP_SCOPE_WINDOW_MONITORING,
       KSD_OPERATION_WINDOW_ACTIVE, false },
+    /* Scope 0: enumeration is ungated. A handle says a window exists and
+     * nothing else, so there is nothing to consent to; every verb that reads
+     * something ABOUT a window sits above with WINDOW_MONITORING. */
+    { KSD_OP_WINDOW_HANDLES, 0u,
+      KSD_OPERATION_WINDOW_HANDLES, false },
     { KSD_OP_WINDOW_WATCH, KSP_SCOPE_WINDOW_MONITORING,
       KSD_OPERATION_WINDOW_WATCH, false },
     { KSD_OP_WINDOW_FOCUS, KSP_SCOPE_WINDOW_CONTROL,
@@ -95,7 +100,7 @@ static const expected_operation expected_operations[] = {
     { KSD_OP_WORK_AREA, 0u, KSD_OPERATION_WORK_AREA, false },
 };
 
-#define EXPECTED_OPERATION_COUNT 29u
+#define EXPECTED_OPERATION_COUNT 30u
 #define EXPECTED_OPERATION_ROWS \
     (sizeof(expected_operations) / sizeof(expected_operations[0]))
 
@@ -107,8 +112,27 @@ static const expected_operation *expected_for(uint16_t opcode)
     return NULL;
 }
 
+/* The split the whole operation exists for: enumerating windows carries no
+ * grant, reading anything about one does. If these two ever answered the same
+ * way, WINDOW_HANDLES would be pointless and WINDOW_LIST would be handing out
+ * titles for free. */
+static void check_enumeration_is_ungated(void)
+{
+    assert(ksd_operation_scope_free(KSD_OP_WINDOW_HANDLES));
+    assert(ksd_operation_scope(KSD_OP_WINDOW_HANDLES) == 0u);
+    assert(!ksd_operation_scope_free(KSD_OP_WINDOW_LIST));
+    assert(ksd_operation_scope(KSD_OP_WINDOW_LIST) != 0u);
+    assert(!ksd_operation_scope_free(KSD_OP_WINDOW_ACTIVE));
+    /* And it is a real operation with its own bit, not an alias. */
+    assert(ksd_operation_bit(KSD_OP_WINDOW_HANDLES)
+           == KSD_OPERATION_WINDOW_HANDLES);
+    assert(ksd_operation_bit(KSD_OP_WINDOW_HANDLES)
+           != ksd_operation_bit(KSD_OP_WINDOW_LIST));
+}
+
 int main(void)
 {
+    check_enumeration_is_ungated();
     assert(sizeof(expected_operations) / sizeof(expected_operations[0])
            == EXPECTED_OPERATION_COUNT);
 
@@ -127,9 +151,16 @@ int main(void)
                    == entry->scope);
             assert(!ksd_operation_scope_free(entry->opcode));
         } else {
+            /* The complete list of operations that carry no grant, named one
+             * by one so adding another is a deliberate act. Each is here for
+             * its own reason: the pointer and the work area are readable by
+             * any client of the display anyway, a clipboard write gives
+             * something away rather than taking it, and a handle says a window
+             * exists without saying anything about it. */
             assert(entry->opcode == KSD_OP_CURSOR_POSITION
                    || entry->opcode == KSD_OP_WORK_AREA
-                   || entry->opcode == KSD_OP_CLIPBOARD_SET_CONTENT);
+                   || entry->opcode == KSD_OP_CLIPBOARD_SET_CONTENT
+                   || entry->opcode == KSD_OP_WINDOW_HANDLES);
             assert(ksd_operation_scope_free(entry->opcode));
         }
     }
@@ -172,6 +203,7 @@ int main(void)
     assert(ksd_backend_operations(KSD_BACKEND_KWIN)
            == (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW
                | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
+               | KSD_OPERATION_WINDOW_HANDLES
                | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
                | KSD_OPERATION_WINDOW_CLOSE
                | KSD_OPERATION_WINDOW_MOVE_RESIZE
@@ -207,7 +239,8 @@ int main(void)
      * for a client on the OUTSIDE of a compositor. Any given compositor
      * implements some subset, and the daemon narrows this at registration. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC)
-           == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_CLIPBOARD_MIMETYPES
+           == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES
+               | KSD_OPERATION_CLIPBOARD_MIMETYPES
                | KSD_OPERATION_CLIPBOARD_CONTENT
                | KSD_OPERATION_CLIPBOARD_TEXT));
     /* The nine that are IMPOSSIBLE here, not merely unwritten, each because no
@@ -233,6 +266,7 @@ int main(void)
            == ksd_backend_x11_route(KSD_BACKEND_X11, true));
     assert(ksd_backend_operations(KSD_BACKEND_X11)
            == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
+               | KSD_OPERATION_WINDOW_HANDLES
                | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA
                | KSD_OPERATION_CAPTURE_AREA
                | KSD_OPERATION_CAPTURE_WINDOW

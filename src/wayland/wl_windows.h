@@ -14,6 +14,9 @@
  * Changing a window needs a different protocol than listing them, and the one
  * that can (wlr-foreign-toplevel-management) is not part of wayland-protocols.
  * So this backend can say what exists and not act on it. */
+/* Handles only, carrying no properties and needing no grant. */
+void ksd_wayland_window_handles(ksd_wayland *connection,
+                                ksd_operation_result *result);
 void ksd_wayland_window_list(ksd_wayland *connection,
                              ksd_operation_result *result);
 
