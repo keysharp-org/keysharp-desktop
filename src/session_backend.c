@@ -342,8 +342,15 @@ int ksd_daemon_main(int argc, char **argv)
         attempts++;
         if (!waiting) {
             waiting = true;
-            fputs("keysharp-desktop daemon: waiting for a supported"
-                  " compositor; KWin capture needs a kwin_wayland session\n",
+            /* Naming the thing that is actually missing. This used to mention
+             * only kwin_wayland, which on a GNOME or Cinnamon session
+             * describes a compositor the user is not running and says nothing
+             * about the extension they have not enabled -- the one cause this
+             * message exists to report. */
+            fputs("keysharp-desktop daemon: waiting for a compositor provider."
+                  " On GNOME and Cinnamon this is the keysharp shell"
+                  " extension: enable it, then log out and back in. KWin needs"
+                  " no extension, but does need a kwin_wayland session.\n",
                   stderr);
         }
         while (nanosleep(&retry, &retry) != 0 && errno == EINTR) {

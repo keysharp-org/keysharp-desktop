@@ -88,6 +88,11 @@ the permission store, enables and starts
 `keysharp-desktop-authority.socket`, and enables the per-user
 `keysharp-desktop.service` for every account.
 
+It does **not** turn on the shell extension, and on GNOME or Cinnamon nothing
+works until you do: the daemon finds no provider, registers no backend, and
+clients are told the selected backend is `None`. See
+[Enable the compositor extension](#enable-the-compositor-extension) below.
+
 An account that is already logged in picks the user service up at its next
 login, or immediately with:
 
