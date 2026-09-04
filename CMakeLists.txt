@@ -263,6 +263,10 @@ install(DIRECTORY providers/gnome/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/gnome-shell/extensions/keysharp@keysharp.io)
 install(DIRECTORY providers/cinnamon/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/cinnamon/extensions/keysharp@keysharp.io)
+# A KPackage, not an extension, so it goes where Scripting::start() looks and is
+# named by the KPlugin.Id in its manifest rather than by a uuid directory.
+install(DIRECTORY providers/kwin/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/kwin/scripts/io.github.keysharp.desktop.kwin)
 install(FILES LICENSE README.md SECURITY.md PROVENANCE.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-desktop)
 install(DIRECTORY docs/
