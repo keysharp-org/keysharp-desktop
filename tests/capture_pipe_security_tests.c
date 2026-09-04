@@ -1,3 +1,4 @@
+#include "install_mode.h"
 #include "local_capture.h"
 #include "operation_result.h"
 #include "protocol.h"
@@ -212,6 +213,97 @@ static void encode_bootstrap(uint8_t header[32], uint16_t version,
  * is why the version had to move: the worker used to guess its route from the
  * payload shape, which cannot distinguish a KWin area capture from an X11 one,
  * and sent every KWin capture to the X11 path. */
+/* The capture pipe is checked twice on its way through a capture: once by the
+ * worker, and once inside the forked capture child. Between those two checks
+ * the worker calls setresuid to become the client, so anything the two
+ * validators disagree about becomes a capture that one half accepts and the
+ * other refuses.
+ *
+ * They did disagree. ksd_capture_pipe_valid asked whether the owner was the
+ * current effective uid, while ksd_capture_child_endpoints_valid asked whether
+ * it was root -- the same question only up until the drop that always happens
+ * between them. A system installation failed the first check and a user
+ * installation the second, so local and KWin captures were broken in both, at
+ * different lines.
+ *
+ * This runs unprivileged deliberately: the pipe is built exactly as the
+ * authority builds it, owned by the installation owner, and both validators
+ * must accept it. Neither may hold an opinion about ownership that the other
+ * does not share.
+ */
+static void check_pipe_validators_agree(void)
+{
+    int descriptors[2];
+    int metadata[2];
+    int child_write;
+    int child_metadata;
+    int read_flags;
+    int status;
+    pid_t child;
+
+    assert(pipe2(descriptors, O_CLOEXEC) == 0);
+    /* Exactly what the authority's create_capture_pipe produces: owned by the
+     * installation owner, openable by nobody. */
+    assert(fchown(descriptors[0], ksd_install_owner(),
+                  ksd_install_group()) == 0);
+    assert(fchmod(descriptors[0], 0u) == 0);
+    read_flags = fcntl(descriptors[0], F_GETFL);
+    assert(read_flags >= 0);
+    assert(fcntl(descriptors[0], F_SETFL, read_flags | O_NONBLOCK) == 0);
+    assert(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+                      metadata) == 0);
+    child_write = fcntl(descriptors[1], F_DUPFD_CLOEXEC, 10);
+    child_metadata = fcntl(metadata[1], F_DUPFD_CLOEXEC, 10);
+    assert(child_write >= 10 && child_metadata >= 10);
+
+    /* The worker's side of the pair. */
+    assert(ksd_capture_pipe_valid(descriptors));
+
+    /* The child's side has to be asked in a child, because it also insists on
+     * a bare descriptor table -- it is written for the moment right after
+     * close_range, and asking it anywhere else fails for a reason that has
+     * nothing to do with ownership. */
+    child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        (void)close(0);
+        (void)close(1);
+        (void)close(2);
+        if (dup2(child_write, 3) < 0 || dup2(child_metadata, 4) < 0)
+            _exit(91);
+        if (close_range(5u, UINT_MAX, 0) != 0)
+            _exit(91);
+        _exit(ksd_capture_child_endpoints_valid(3, 4) ? 0 : 92);
+    }
+
+    close(child_write);
+    close(child_metadata);
+    close(descriptors[0]);
+    close(descriptors[1]);
+    close(metadata[0]);
+    close(metadata[1]);
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status));
+    /* 92 is the disagreement this exists to catch: the parent accepted the
+     * pipe and the child refused the same one. */
+    assert(WEXITSTATUS(status) == 0);
+}
+
+/* The owner is read once and does not move afterwards. A live read would
+ * change under the worker's own privilege drop, which is what broke the pipe
+ * checks above -- so the property is worth pinning on its own, not only
+ * through the validators that depend on it. */
+static void check_owner_is_latched(void)
+{
+    uid_t first = ksd_install_owner();
+    gid_t first_group = ksd_install_group();
+
+    ksd_install_identity_latch();
+    assert(ksd_install_owner() == first);
+    assert(ksd_install_group() == first_group);
+    assert(first == geteuid());
+}
+
 static void check_bootstrap_header_parse(void)
 {
     uint8_t header[32];
@@ -322,6 +414,8 @@ int main(void)
     assert(ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL));
     assert(!ksd_capture_tail_valid(boundary, KSD_MAX_CAPTURE_TAIL - 1u));
 
+    check_owner_is_latched();
+    check_pipe_validators_agree();
     check_bootstrap_header_parse();
     check_scalar_ok_round_trip();
 

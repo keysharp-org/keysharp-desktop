@@ -15,18 +15,47 @@
 
 #define KSD_USER_SOCKET_TAIL "/keysharp-desktop/keysharp-desktop.sock"
 
+/* Read once, at startup, and never again.
+ *
+ * The credentials this process began with, not the ones it currently holds.
+ * Those differ: the capture worker drops to the CLIENT's uid partway through
+ * its life, and everything it validates afterwards -- the capture pipe, the
+ * spool -- was created before that drop, by the installation owner. A live
+ * geteuid() answers "who am I now", while every ownership check here is asking
+ * "who does this installation belong to". Between those two questions sits
+ * setresuid, and reading it live made a root installation reject its own
+ * root-owned pipe the moment the worker became the client.
+ *
+ * Latching is also strictly the safer of the two: a root daemon keeps
+ * demanding root-owned artefacts even after dropping privileges, where the
+ * live read would have started accepting the client's.
+ */
+static uid_t install_uid;
+static gid_t install_gid;
+static bool install_latched;
+
+void ksd_install_identity_latch(void)
+{
+    if (install_latched)
+        return;
+    install_uid = geteuid();
+    install_gid = getegid();
+    install_latched = true;
+}
+
 uid_t ksd_install_owner(void)
 {
-    /* The effective uid, not a stored decision and not anything the caller can
-     * pass in. This is the whole safety argument for the user installation:
-     * while this process is root the answer is root, so every ownership test
-     * built on it stays exactly as strict as it was. */
-    return geteuid();
+    /* Latched here as well as at startup, so a caller that never reaches an
+     * entry point -- the client library linked into somebody else's process --
+     * still gets an answer taken before it could have changed. */
+    ksd_install_identity_latch();
+    return install_uid;
 }
 
 gid_t ksd_install_group(void)
 {
-    return getegid();
+    ksd_install_identity_latch();
+    return install_gid;
 }
 
 bool ksd_install_is_system(void)

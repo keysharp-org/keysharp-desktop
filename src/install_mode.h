@@ -23,8 +23,18 @@
  * process's own credentials and from nothing else.
  */
 
-/* The uid every trusted artefact must be owned by: root when this process is
- * root, and this process's own uid otherwise. */
+/* Reads and remembers the credentials this process started with. Called once at
+ * every entry point, before anything can change them.
+ *
+ * It has to be a latch rather than a live read because the capture worker drops
+ * to the client's uid partway through, and the artefacts it checks afterwards
+ * were created before that drop by the installation owner. Calling it early is
+ * what guarantees the remembered value is the starting one; the getters latch
+ * too, so a caller that never runs through an entry point is still answered. */
+void ksd_install_identity_latch(void);
+
+/* The uid every trusted artefact must be owned by: root when this process
+ * started as root, and its own uid otherwise. */
 uid_t ksd_install_owner(void);
 
 /* The gid that goes with the owner, for artefacts that carry both. Derived

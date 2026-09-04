@@ -241,7 +241,12 @@ endforeach()
 file(READ "${SOURCE_DIR}/src/install_mode.c" install_mode)
 foreach(required
         "KSD_SYSTEM_SOCKET"
-        "return geteuid()"
+        # Still derived from the process credentials and nothing else -- but
+        # read once and remembered, because the capture worker drops to the
+        # client's uid partway through and a live read would start answering a
+        # different question at that point.
+        "install_uid = geteuid()"
+        "ksd_install_identity_latch"
         "XDG_RUNTIME_DIR")
     string(FIND "${install_mode}" "${required}" position)
     if(position EQUAL -1)

@@ -281,8 +281,14 @@ bool ksd_capture_child_endpoints_valid(int write_descriptor,
     if (write_descriptor < 0 || metadata_descriptor < 0
         || write_descriptor == metadata_descriptor
         || fstat(write_descriptor, &status) != 0
-        || !S_ISFIFO(status.st_mode) || status.st_uid != 0u
-        || status.st_gid != 0u || (status.st_mode & 0777u) != 0u
+        || !S_ISFIFO(status.st_mode)
+        /* The same descriptor ksd_capture_pipe_valid inspected before the
+         * worker dropped privileges, so it has to be judged by the same rule.
+         * Hardcoding root here made the two disagree on one pipe: on a user
+         * installation this rejected a pipe the other had just accepted. */
+        || !ksd_install_owner_trusted(status.st_uid)
+        || status.st_gid != ksd_install_group()
+        || (status.st_mode & 0777u) != 0u
         || (flags = fcntl(write_descriptor, F_GETFL)) < 0
         || (flags & O_ACCMODE) != O_WRONLY
         || getsockopt(metadata_descriptor, SOL_SOCKET, SO_TYPE,
