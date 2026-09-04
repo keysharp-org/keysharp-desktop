@@ -1,5 +1,6 @@
 #include "kwin_jobs.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* The per-reply cap for a lane. The two differ on purpose: a fast batch drains
@@ -59,13 +60,25 @@ bool ksd_kwin_queue_init(ksd_kwin_queue *queue, const char *generation)
     return true;
 }
 
+/* Frees what a slot owns and returns it to the free list. */
+static void release_slot(ksd_kwin_job *job)
+{
+    free(job->body);
+    free(job->reply);
+    memset(job, 0, sizeof(*job));
+    job->state = KSD_KWIN_JOB_FREE;
+}
+
 bool ksd_kwin_queue_submit(ksd_kwin_queue *queue, uint16_t opcode,
+                           const uint8_t *body, uint32_t body_length,
                            uint64_t now_ms,
                            char sequence[KSD_KWIN_SEQ_HEX + 1u])
 {
     ksd_kwin_lane lane;
 
     if (queue == NULL || sequence == NULL)
+        return false;
+    if (body_length != 0u && body == NULL)
         return false;
     lane = ksd_kwin_lane_for(opcode);
     /* An opcode that takes no lane never reaches the script -- a capture runs
@@ -86,6 +99,21 @@ bool ksd_kwin_queue_submit(ksd_kwin_queue *queue, uint16_t opcode,
         job->deadline_ms = now_ms + KSD_KWIN_OP_DEADLINE_MS;
         job->ticket = queue->next_ticket++;
         job->status = 0u;
+        job->reply = NULL;
+        job->reply_length = 0u;
+        job->body = NULL;
+        job->body_length = 0u;
+        if (body_length != 0u) {
+            /* Copied, not referenced: the frame this came from is gone long
+             * before the job is dispatched. */
+            job->body = malloc(body_length);
+            if (job->body == NULL) {
+                release_slot(job);
+                return false;
+            }
+            memcpy(job->body, body, body_length);
+            job->body_length = body_length;
+        }
         memcpy(sequence, job->sequence, KSD_KWIN_SEQ_HEX + 1u);
         return true;
     }
@@ -126,7 +154,8 @@ size_t ksd_kwin_queue_take(ksd_kwin_queue *queue, ksd_kwin_lane lane,
 }
 
 bool ksd_kwin_queue_complete(ksd_kwin_queue *queue, const char *generation,
-                             const char *sequence, uint32_t status)
+                             const char *sequence, uint32_t status,
+                             const uint8_t *reply, uint32_t reply_length)
 {
     if (queue == NULL || generation == NULL || sequence == NULL)
         return false;
@@ -146,6 +175,18 @@ bool ksd_kwin_queue_complete(ksd_kwin_queue *queue, const char *generation,
          * that no run of the script produced. */
         if (job->state != KSD_KWIN_JOB_DISPATCHED)
             return false;
+        if (reply_length != 0u && reply == NULL)
+            return false;
+        if (reply_length != 0u) {
+            uint8_t *copy = malloc(reply_length);
+
+            if (copy == NULL)
+                return false;
+            memcpy(copy, reply, reply_length);
+            free(job->reply);
+            job->reply = copy;
+            job->reply_length = reply_length;
+        }
         job->state = KSD_KWIN_JOB_DONE;
         job->status = status;
         return true;
@@ -168,8 +209,7 @@ size_t ksd_kwin_queue_expire(ksd_kwin_queue *queue, uint64_t now_ms)
          * that may well have run. */
         if (job->state != KSD_KWIN_JOB_QUEUED || job->deadline_ms > now_ms)
             continue;
-        memset(job, 0, sizeof(*job));
-        job->state = KSD_KWIN_JOB_FREE;
+        release_slot(job);
         expired++;
     }
     return expired;
@@ -187,4 +227,36 @@ size_t ksd_kwin_queue_count(const ksd_kwin_queue *queue,
             count++;
     }
     return count;
+}
+
+const ksd_kwin_job *ksd_kwin_queue_find(const ksd_kwin_queue *queue,
+                                        const char *sequence)
+{
+    if (queue == NULL || sequence == NULL)
+        return NULL;
+    for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
+        const ksd_kwin_job *job = queue->jobs + index;
+
+        if (job->state == KSD_KWIN_JOB_FREE)
+            continue;
+        if (memcmp(job->sequence, sequence, KSD_KWIN_SEQ_HEX + 1u) == 0)
+            return job;
+    }
+    return NULL;
+}
+
+void ksd_kwin_queue_release(ksd_kwin_queue *queue, const char *sequence)
+{
+    if (queue == NULL || sequence == NULL)
+        return;
+    for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
+        ksd_kwin_job *job = queue->jobs + index;
+
+        if (job->state == KSD_KWIN_JOB_FREE)
+            continue;
+        if (memcmp(job->sequence, sequence, KSD_KWIN_SEQ_HEX + 1u) == 0) {
+            release_slot(job);
+            return;
+        }
+    }
 }

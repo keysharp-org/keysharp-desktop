@@ -47,6 +47,15 @@ typedef struct ksd_kwin_job {
      * compact the array when a job in the middle completes. */
     uint64_t ticket;
     uint32_t status;
+    /* The request body, owned by the queue and freed with the slot. A job is
+     * dispatched long after the frame it came from is gone, so the bytes have
+     * to be copied rather than pointed at. */
+    uint8_t *body;
+    uint32_t body_length;
+    /* What the script sent back. Also owned here, and read once by whoever is
+     * waiting on this sequence. */
+    uint8_t *reply;
+    uint32_t reply_length;
 } ksd_kwin_job;
 
 typedef struct ksd_kwin_queue {
@@ -66,6 +75,7 @@ bool ksd_kwin_queue_init(ksd_kwin_queue *queue, const char *generation);
 /* Submits one operation and writes its sequence. Returns false when the queue
  * is full or the opcode takes no lane, in which case nothing is stored. */
 bool ksd_kwin_queue_submit(ksd_kwin_queue *queue, uint16_t opcode,
+                           const uint8_t *body, uint32_t body_length,
                            uint64_t now_ms,
                            char sequence[KSD_KWIN_SEQ_HEX + 1u]);
 
@@ -82,7 +92,18 @@ size_t ksd_kwin_queue_take(ksd_kwin_queue *queue, ksd_kwin_lane lane,
  *     work it was never given,
  *   - a job already completed, which is a replay. */
 bool ksd_kwin_queue_complete(ksd_kwin_queue *queue, const char *generation,
-                             const char *sequence, uint32_t status);
+                             const char *sequence, uint32_t status,
+                             const uint8_t *reply, uint32_t reply_length);
+
+/* The job a sequence names, or NULL. Used by whoever is waiting on it to read
+ * the result once the script has reported. */
+const ksd_kwin_job *ksd_kwin_queue_find(const ksd_kwin_queue *queue,
+                                        const char *sequence);
+
+/* Releases a completed job's slot. Separate from completing it because the
+ * thread that submitted the job is not the one that received the report, and
+ * the result has to survive until the submitter has read it. */
+void ksd_kwin_queue_release(ksd_kwin_queue *queue, const char *sequence);
 
 /* Drops queued jobs whose deadline has passed and reports how many. Dispatched
  * jobs are deliberately untouched; see KSD_KWIN_JOB_DISPATCHED. */

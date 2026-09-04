@@ -73,6 +73,7 @@ add_library(keysharp-desktop-common STATIC
     src/operation_result.c
     src/operation_scope.c
     src/kwin_lanes.c
+    src/kwin_host.c
     src/kwin_jobs.c
     src/kwin_peer.c
     src/kwin_envelope.c
@@ -439,6 +440,10 @@ if(BUILD_TESTING)
     add_executable(kwin-job-tests tests/kwin_job_tests.c)
     target_link_libraries(kwin-job-tests PRIVATE keysharp-desktop-common)
     add_test(NAME kwin-job-tests COMMAND kwin-job-tests)
+
+    add_executable(kwin-host-tests tests/kwin_host_tests.c)
+    target_link_libraries(kwin-host-tests PRIVATE keysharp-desktop-common)
+    add_test(NAME kwin-host-tests COMMAND kwin-host-tests)
 
     # Compiles the clipboard source rather than linking it, so the hook that
     # lowers the deadline is reachable, and links wayland-server so the test

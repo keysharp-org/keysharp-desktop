@@ -47,11 +47,11 @@ static void check_submit_and_take(void)
 
     /* An opcode that never reaches the script cannot be queued. Queueing one
      * would park a caller on work nothing will ever run. */
-    assert(!ksd_kwin_queue_submit(&queue, KSD_OP_CAPTURE_AREA, 0u, sequence));
-    assert(!ksd_kwin_queue_submit(&queue, 0xfffeu, 0u, sequence));
+    assert(!ksd_kwin_queue_submit(&queue, KSD_OP_CAPTURE_AREA, NULL, 0u, 0u, sequence));
+    assert(!ksd_kwin_queue_submit(&queue, 0xfffeu, NULL, 0u, 0u, sequence));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_QUEUED) == 0u);
 
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, first));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, first));
     assert(strlen(first) == KSD_KWIN_SEQ_HEX);
     for (size_t index = 0u; index < KSD_KWIN_SEQ_HEX; index++)
         assert((first[index] >= '0' && first[index] <= '9')
@@ -59,14 +59,14 @@ static void check_submit_and_take(void)
 
     /* Sequences are never reused, so a stale report cannot land on a fresh
      * job that happens to sit in the same slot. */
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
     assert(strcmp(sequence, first) != 0);
 
     /* A fast reply carries only fast work, and never more than its cap. Ten
      * are queued against a cap of eight. */
     for (int index = 0; index < 8; index++)
-        assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
-    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, 0u, sequence));
+        assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, NULL, 0u, 0u, sequence));
 
     taken = ksd_kwin_queue_take(&queue, KSD_KWIN_LANE_FAST, batch,
                                 KSD_KWIN_MAX_JOBS);
@@ -79,7 +79,7 @@ static void check_submit_and_take(void)
     assert(strcmp(batch[0]->sequence, first) == 0);
 
     /* An enumeration is pinned to one per callback whatever is waiting. */
-    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, NULL, 0u, 0u, sequence));
     taken = ksd_kwin_queue_take(&queue, KSD_KWIN_LANE_SLOW, batch,
                                 KSD_KWIN_MAX_JOBS);
     assert(taken == KSD_KWIN_JOBS_PER_REPLY_SLOW);
@@ -99,7 +99,7 @@ static void check_no_job_is_dispatched_twice(void)
     const ksd_kwin_job *batch[KSD_KWIN_MAX_JOBS];
 
     assert(ksd_kwin_queue_init(&queue, GEN_A));
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
     assert(ksd_kwin_queue_take(&queue, KSD_KWIN_LANE_FAST, batch,
                                KSD_KWIN_MAX_JOBS) == 1u);
     /* The second poll must not be answered with the same job. Running an
@@ -118,33 +118,33 @@ static void check_completion_rules(void)
     const ksd_kwin_job *batch[KSD_KWIN_MAX_JOBS];
 
     assert(ksd_kwin_queue_init(&queue, GEN_A));
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, dispatched));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, dispatched));
     assert(ksd_kwin_queue_take(&queue, KSD_KWIN_LANE_FAST, batch,
                                KSD_KWIN_MAX_JOBS) == 1u);
-    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, 0u, queued));
+    assert(ksd_kwin_queue_submit(&queue, SLOW_OP, NULL, 0u, 0u, queued));
 
     /* A report from another generation names sequences that mean nothing
      * here. After a script restart the old script's numbering is gone, and
      * completing one against the other hands a caller a result from a job
      * that no longer exists. */
-    assert(!ksd_kwin_queue_complete(&queue, GEN_B, dispatched, 0u));
+    assert(!ksd_kwin_queue_complete(&queue, GEN_B, dispatched, 0u, NULL, 0u));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_DONE) == 0u);
 
     /* A sequence that names no job at all. */
-    assert(!ksd_kwin_queue_complete(&queue, GEN_A, "ffffffffffffffff", 0u));
+    assert(!ksd_kwin_queue_complete(&queue, GEN_A, "ffffffffffffffff", 0u, NULL, 0u));
 
     /* A job the script was never given. A wedged or replaced script claiming
      * to have run work it never received would otherwise return a fabricated
      * result to whoever is waiting on it. */
-    assert(!ksd_kwin_queue_complete(&queue, GEN_A, queued, 0u));
+    assert(!ksd_kwin_queue_complete(&queue, GEN_A, queued, 0u, NULL, 0u));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_DONE) == 0u);
 
-    assert(ksd_kwin_queue_complete(&queue, GEN_A, dispatched, 7u));
+    assert(ksd_kwin_queue_complete(&queue, GEN_A, dispatched, 7u, NULL, 0u));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_DONE) == 1u);
 
     /* Replay. The same result arriving twice must not complete anything a
      * second time. */
-    assert(!ksd_kwin_queue_complete(&queue, GEN_A, dispatched, 0u));
+    assert(!ksd_kwin_queue_complete(&queue, GEN_A, dispatched, 0u, NULL, 0u));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_DONE) == 1u);
 }
 
@@ -155,10 +155,10 @@ static void check_expiry_spares_dispatched_work(void)
     const ksd_kwin_job *batch[KSD_KWIN_MAX_JOBS];
 
     assert(ksd_kwin_queue_init(&queue, GEN_A));
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
     assert(ksd_kwin_queue_take(&queue, KSD_KWIN_LANE_FAST, batch,
                                KSD_KWIN_MAX_JOBS) == 1u);
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
 
     /* Before the deadline nothing moves. */
     assert(ksd_kwin_queue_expire(&queue, KSD_KWIN_OP_DEADLINE_MS - 1u) == 0u);
@@ -185,18 +185,18 @@ static void check_queue_is_bounded(void)
 
     assert(ksd_kwin_queue_init(&queue, GEN_A));
     for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++)
-        assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+        assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
     /* One job per connection thread is the ceiling, so a further job is one
      * nobody is waiting for. Refusing is what turns an overrun into BUSY at
      * the caller rather than into a write past the array. */
-    assert(!ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(!ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
     assert(ksd_kwin_queue_count(&queue, KSD_KWIN_JOB_QUEUED)
            == KSD_KWIN_MAX_JOBS);
 
     /* A freed slot is reusable, or a long-lived daemon would run out. */
     assert(ksd_kwin_queue_expire(&queue, KSD_KWIN_OP_DEADLINE_MS)
            == KSD_KWIN_MAX_JOBS);
-    assert(ksd_kwin_queue_submit(&queue, FAST_OP, 0u, sequence));
+    assert(ksd_kwin_queue_submit(&queue, FAST_OP, NULL, 0u, 0u, sequence));
 }
 
 /* A batch may never exceed what one report can carry back, or a result would
