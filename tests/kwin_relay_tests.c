@@ -167,7 +167,7 @@ static void check_out_of_order_demux(void)
         assert(callers[index].echoed == callers[index].opcode);
     }
     assert(daemon.answered == WORKERS);
-    ksd_kwin_relay_destroy(relay);
+    ksd_kwin_relay_retire(relay);
     close(pair[1]);
 }
 
@@ -205,7 +205,7 @@ static void check_deadline_reports_timeout(void)
     assert(result.status == KSD_STATUS_TIMEOUT);
     ksd_result_clear(&result);
 
-    ksd_kwin_relay_destroy(relay);
+    ksd_kwin_relay_retire(relay);
     close(pair[1]);
 }
 
@@ -236,7 +236,94 @@ static void check_closed_channel(void)
     assert(ksd_kwin_relay_call(relay, &request, (uint64_t)-1, &result));
     assert(result.status != KSD_STATUS_OK);
     ksd_result_clear(&result);
-    ksd_kwin_relay_destroy(relay);
+    ksd_kwin_relay_retire(relay);
+}
+
+/* A daemon that writes half a header and then stalls. ksd_read_all has no
+ * deadline, so before this was bounded the caller holding the reader role
+ * blocked in it for ever -- and because it was the reader, every other caller
+ * waited on it too. One stalled write would have wedged the backend for that
+ * uid permanently and parked a root thread. */
+static void check_partial_write_does_not_wedge(void)
+{
+    int pair[2];
+    ksd_kwin_relay *relay;
+    ksd_frame request;
+    ksd_operation_result result;
+    struct timespec now;
+    uint64_t deadline;
+    uint8_t half[8] = { 0 };
+
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+    relay = ksd_kwin_relay_create(pair[0]);
+    assert(relay != NULL);
+
+    memset(&request, 0, sizeof(request));
+    request.magic[0] = KSD_FRAME_MAGIC_0;
+    request.magic[1] = KSD_FRAME_MAGIC_1;
+    request.magic[2] = KSD_FRAME_MAGIC_2;
+    request.magic[3] = KSD_FRAME_MAGIC_3;
+    request.major = KSD_PROTOCOL_MAJOR;
+    request.minor = KSD_PROTOCOL_MINOR;
+    request.opcode = KSD_OP_WINDOW_FOCUS;
+
+    /* Eight bytes of a header that needs more, and then silence. */
+    assert(write(pair[1], half, sizeof(half)) == (ssize_t)sizeof(half));
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    deadline = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u
+        + 250u;
+    ksd_result_init(&result);
+    assert(ksd_kwin_relay_call(relay, &request, deadline, &result));
+    assert(result.status != KSD_STATUS_OK);
+    ksd_result_clear(&result);
+
+    ksd_kwin_relay_retire(relay);
+    close(pair[1]);
+}
+
+/* A relay retired while a caller is inside a call must not be freed under
+ * them. Before it was reference counted, unregister_backend freed it while a
+ * call was in flight, and the window was exactly as wide as an operation is
+ * slow -- a use-after-free in the root process. */
+static void check_retire_during_call_is_safe(void)
+{
+    int pair[2];
+    ksd_kwin_relay *relay;
+    ksd_frame request;
+    ksd_operation_result result;
+    struct timespec now;
+    uint64_t deadline;
+
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+    relay = ksd_kwin_relay_create(pair[0]);
+    assert(relay != NULL);
+    /* The caller's reference, as registered_relay takes under the lock. */
+    ksd_kwin_relay_acquire(relay);
+    /* The registration ends while that reference is held. */
+    ksd_kwin_relay_retire(relay);
+
+    memset(&request, 0, sizeof(request));
+    request.magic[0] = KSD_FRAME_MAGIC_0;
+    request.magic[1] = KSD_FRAME_MAGIC_1;
+    request.magic[2] = KSD_FRAME_MAGIC_2;
+    request.magic[3] = KSD_FRAME_MAGIC_3;
+    request.major = KSD_PROTOCOL_MAJOR;
+    request.minor = KSD_PROTOCOL_MINOR;
+    request.opcode = KSD_OP_WINDOW_FOCUS;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    deadline = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u
+        + 250u;
+    ksd_result_init(&result);
+    /* Answers, on memory that is still there, and says the channel is gone. */
+    assert(ksd_kwin_relay_call(relay, &request, deadline, &result));
+    assert(result.status != KSD_STATUS_OK);
+    ksd_result_clear(&result);
+
+    /* And the last reference is what actually frees it. */
+    ksd_kwin_relay_release(relay);
+    close(pair[1]);
 }
 
 int main(void)
@@ -247,5 +334,7 @@ int main(void)
     check_out_of_order_demux();
     check_deadline_reports_timeout();
     check_closed_channel();
+    check_partial_write_does_not_wedge();
+    check_retire_during_call_is_safe();
     return 0;
 }

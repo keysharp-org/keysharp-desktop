@@ -424,8 +424,11 @@ static void unregister_backend(authority_state *state, uid_t uid,
              * authority -- and leave the daemon's end never seeing a hangup. */
             /* The relay owns the descriptor once it exists, so only one of
              * these two closes it. */
+            /* Retired, not destroyed: a caller may be inside a call on it
+             * right now, holding its own reference. Retiring wakes them onto a
+             * closed channel; the memory goes when the last one leaves. */
             if (state->backends[index].relay != NULL)
-                ksd_kwin_relay_destroy(state->backends[index].relay);
+                ksd_kwin_relay_retire(state->backends[index].relay);
             else if (state->backends[index].provider_fd >= 0)
                 close(state->backends[index].provider_fd);
             memset(&state->backends[index], 0,
@@ -484,6 +487,10 @@ static ksd_kwin_relay *registered_relay(authority_state *state, uid_t uid)
         if (state->backends[index].active
             && state->backends[index].uid == uid) {
             relay = state->backends[index].relay;
+            /* Referenced while the slot is still active and the lock still
+             * held, so it cannot be freed between here and the caller's use
+             * of it -- which lasts as long as an operation deadline. */
+            ksd_kwin_relay_acquire(relay);
             break;
         }
     pthread_mutex_unlock(&state->mutex);
@@ -1454,6 +1461,7 @@ static bool execute_operation(authority_session *session,
 
             (void)ksd_kwin_relay_call(relay, request,
                                       now + KSD_KWIN_OP_DEADLINE_MS, &result);
+            ksd_kwin_relay_release(relay);
         }
     } else if (session->backend == KSD_BACKEND_KWIN
         || session->backend == KSD_BACKEND_X11

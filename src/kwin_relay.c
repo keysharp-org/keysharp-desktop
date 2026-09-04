@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 /* One per connection thread is the ceiling, the same bound the worker pool
@@ -35,6 +36,8 @@ struct ksd_kwin_relay {
     pthread_mutex_t write_mutex;
     bool reading;
     bool broken;
+    /* One for the registration, one for each caller currently inside a call. */
+    unsigned refs;
     uint64_t next_request_id;
     relay_pending pending[KSD_KWIN_RELAY_PENDING];
 };
@@ -59,6 +62,7 @@ ksd_kwin_relay *ksd_kwin_relay_create(int descriptor)
         return NULL;
     relay->descriptor = descriptor;
     relay->next_request_id = 1u;
+    relay->refs = 1u;
     if (pthread_mutex_init(&relay->mutex, NULL) != 0
         || pthread_mutex_init(&relay->write_mutex, NULL) != 0
         || pthread_cond_init(&relay->changed, NULL) != 0) {
@@ -68,22 +72,56 @@ ksd_kwin_relay *ksd_kwin_relay_create(int descriptor)
     return relay;
 }
 
-void ksd_kwin_relay_destroy(ksd_kwin_relay *relay)
+void ksd_kwin_relay_acquire(ksd_kwin_relay *relay)
 {
     if (relay == NULL)
         return;
     pthread_mutex_lock(&relay->mutex);
-    relay->broken = true;
+    relay->refs++;
+    pthread_mutex_unlock(&relay->mutex);
+}
+
+void ksd_kwin_relay_release(ksd_kwin_relay *relay)
+{
+    bool last;
+
+    if (relay == NULL)
+        return;
+    pthread_mutex_lock(&relay->mutex);
+    last = --relay->refs == 0u;
+    pthread_mutex_unlock(&relay->mutex);
+    if (!last)
+        return;
+    /* Nobody else can reach it now, so the teardown needs no lock of its own
+     * and destroying the mutexes is safe. */
     for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++)
         free(relay->pending[index].tail);
-    pthread_cond_broadcast(&relay->changed);
-    pthread_mutex_unlock(&relay->mutex);
     if (relay->descriptor >= 0)
         close(relay->descriptor);
     pthread_mutex_destroy(&relay->mutex);
     pthread_mutex_destroy(&relay->write_mutex);
     pthread_cond_destroy(&relay->changed);
     free(relay);
+}
+
+void ksd_kwin_relay_retire(ksd_kwin_relay *relay)
+{
+    if (relay == NULL)
+        return;
+    pthread_mutex_lock(&relay->mutex);
+    /* Marked broken BEFORE the reference is dropped, so a caller still inside
+     * a call stops waiting on a channel that is going away rather than
+     * blocking out its full deadline against a socket nobody will answer. */
+    relay->broken = true;
+    if (relay->descriptor >= 0) {
+        /* Shut down rather than closed: a caller may be blocked in poll or
+         * read on this descriptor right now, and closing it under them would
+         * let the number be reused for something else. */
+        shutdown(relay->descriptor, SHUT_RDWR);
+    }
+    pthread_cond_broadcast(&relay->changed);
+    pthread_mutex_unlock(&relay->mutex);
+    ksd_kwin_relay_release(relay);
 }
 
 /* Waits for the socket to become readable, or gives up at the deadline.
@@ -106,6 +144,32 @@ static int wait_readable(int descriptor, uint64_t deadline_ms)
     }
 }
 
+/* Reads exactly length bytes, or gives up at the deadline. ksd_read_all has no
+ * deadline of its own, so a peer that writes half a header and then stalls
+ * parks this thread for ever -- and it is the reader, so every other caller
+ * waits on it too. Waiting for readable before each read is what bounds that:
+ * a peer that stops mid-record loses the channel rather than owning it. */
+static bool read_all_until(int descriptor, void *data, size_t length,
+                           uint64_t deadline_ms)
+{
+    uint8_t *bytes = data;
+    size_t offset = 0u;
+
+    while (offset < length) {
+        ssize_t count;
+
+        if (wait_readable(descriptor, deadline_ms) <= 0)
+            return false;
+        count = read(descriptor, bytes + offset, length - offset);
+        if (count < 0 && errno == EINTR)
+            continue;
+        if (count <= 0)
+            return false;
+        offset += (size_t)count;
+    }
+    return true;
+}
+
 /* Reads one response frame and hands it to whoever was waiting for it. Called
  * with the lock NOT held, by whichever caller took the reader role. Returns
  * false only on a broken channel; a deadline that passes with nothing to read
@@ -122,7 +186,8 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
         return true;
     if (ready < 0)
         return false;
-    if (!ksd_read_all(relay->descriptor, header, sizeof(header)))
+    if (!read_all_until(relay->descriptor, header, sizeof(header),
+                        deadline_ms))
         return false;
     uint32_t payload_length =
         ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
@@ -132,8 +197,8 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
         return false;
     if (payload_length != 0u) {
         body = malloc(payload_length);
-        if (body == NULL || !ksd_read_all(relay->descriptor, body,
-                                          payload_length)) {
+        if (body == NULL || !read_all_until(relay->descriptor, body,
+                                            payload_length, deadline_ms)) {
             free(body);
             return false;
         }
