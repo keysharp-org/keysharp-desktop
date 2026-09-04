@@ -3,6 +3,7 @@
 #include "backend_protocol.h"
 
 #include "protocol.h"
+#include "protocol_io.h"
 
 #include <gio/gio.h>
 #include <stdbool.h>
@@ -324,4 +325,44 @@ uint64_t ksd_backend_operations(ksd_backend backend)
     if (backend == KSD_BACKEND_GNOME)
         operations |= KSD_OPERATION_CAPTURE_AREA;
     return operations;
+}
+
+void ksd_backend_ack_encode(uint8_t *reply, uint16_t status, uint32_t backend,
+                            uint64_t accepted)
+{
+    if (reply == NULL)
+        return;
+    memset(reply, 0, KSD_BACKEND_REGISTRATION_SIZE);
+    memcpy(reply, ksd_backend_ack_magic, sizeof(ksd_backend_ack_magic));
+    ksd_encode_u16(reply + 4u, KSD_BACKEND_REGISTRATION_VERSION);
+    ksd_encode_u16(reply + 6u, status);
+    ksd_encode_u32(reply + 8u, backend);
+    /* A rejection carries no mask. Reporting one for a registration that was
+     * refused would describe a state that does not exist. */
+    if (status == KSD_BACKEND_ACK_ACCEPTED)
+        ksd_encode_u64(reply + 16u, accepted);
+}
+
+bool ksd_backend_ack_parse(const uint8_t *reply, uint32_t expected_backend,
+                           uint64_t requested, uint64_t *accepted)
+{
+    uint64_t stored;
+
+    if (reply == NULL || accepted == NULL)
+        return false;
+    if (memcmp(reply, ksd_backend_ack_magic,
+               sizeof(ksd_backend_ack_magic)) != 0
+        || ksd_decode_u16(reply + 4u) != KSD_BACKEND_REGISTRATION_VERSION
+        || ksd_decode_u16(reply + 6u) != KSD_BACKEND_ACK_ACCEPTED
+        || ksd_decode_u32(reply + 8u) != expected_backend
+        || ksd_decode_u32(reply + 12u) != 0u)
+        return false;
+    stored = ksd_decode_u64(reply + 16u);
+    /* Withhold-only, checked from this side as well. A widened mask is not a
+     * generous authority, it is one this daemon should not believe: it would
+     * have this daemon advertise a capability it never claimed. */
+    if ((stored & ~requested) != 0u)
+        return false;
+    *accepted = stored;
+    return true;
 }

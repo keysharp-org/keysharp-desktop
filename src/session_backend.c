@@ -135,8 +135,9 @@ failed:
 }
 
 static bool register_backend(int descriptor, ksd_backend backend,
-                             uint64_t deadline)
+                             uint64_t deadline, uint64_t *accepted)
 {
+    uint64_t requested = ksd_backend_operations(backend);
     uint8_t message[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     memcpy(message, ksd_backend_registration_magic,
@@ -147,16 +148,13 @@ static bool register_backend(int descriptor, ksd_backend backend,
      * backend statically supports; a daemon that probes its compositor and
      * finds a capability missing reports less here, and the authority narrows
      * to it. It can never widen. */
-    ksd_encode_u64(message + 16u, ksd_backend_operations(backend));
+    ksd_encode_u64(message + 16u, requested);
+    /* The acknowledgement is parsed by the shared codec rather than checked
+     * field by field here, so the two ends cannot drift on the layout, and so
+     * the withhold-only rule is enforced from this side too. */
     return transfer_fixed(descriptor, message, sizeof(message), true, deadline)
         && transfer_fixed(descriptor, reply, sizeof(reply), false, deadline)
-        && memcmp(reply, ksd_backend_ack_magic,
-                  sizeof(ksd_backend_ack_magic)) == 0
-        && ksd_decode_u16(reply + 4u)
-            == KSD_BACKEND_REGISTRATION_VERSION
-        && ksd_decode_u16(reply + 6u) == KSD_BACKEND_ACK_ACCEPTED
-        && ksd_decode_u32(reply + 8u) == backend
-        && ksd_decode_u32(reply + 12u) == 0u;
+        && ksd_backend_ack_parse(reply, backend, requested, accepted);
 }
 
 int ksd_daemon_main(int argc, char **argv)
@@ -205,8 +203,10 @@ int ksd_daemon_main(int argc, char **argv)
     uint64_t now = monotonic_milliseconds();
     uint64_t deadline = now == 0u
         ? 0u : now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
+    uint64_t accepted = 0u;
     int descriptor = deadline == 0u ? -1 : connect_backend(deadline);
-    if (descriptor < 0 || !register_backend(descriptor, backend, deadline)) {
+    if (descriptor < 0
+        || !register_backend(descriptor, backend, deadline, &accepted)) {
         if (descriptor >= 0)
             close(descriptor);
         fputs("keysharp-desktop daemon: authority unavailable. The root"
@@ -215,6 +215,14 @@ int ksd_daemon_main(int argc, char **argv)
               stderr);
         return 1;
     }
+    /* Said out loud when it happens. The authority may narrow what this daemon
+     * asked to advertise, and a narrowing that goes unreported is the kind of
+     * thing that gets diagnosed as "the compositor is broken" from the far end
+     * of a client, long after the fact. */
+    if (accepted != ksd_backend_operations(backend))
+        fprintf(stderr, "keysharp-desktop daemon: the authority accepted"
+                " %llu of the operations offered, not all of them\n",
+                (unsigned long long)__builtin_popcountll(accepted));
     signal(SIGPIPE, SIG_IGN);
     for (;;) {
         struct pollfd item = {

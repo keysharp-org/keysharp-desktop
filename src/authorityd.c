@@ -482,13 +482,11 @@ static uint32_t registered_backend(authority_state *state, uid_t uid)
 }
 
 static bool send_backend_ack(int descriptor, uint16_t status,
-                             uint32_t backend, uint64_t deadline)
+                             uint32_t backend, uint64_t accepted,
+                             uint64_t deadline)
 {
     uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
-    memcpy(reply, ksd_backend_ack_magic, sizeof(ksd_backend_ack_magic));
-    ksd_encode_u16(reply + 4u, KSD_BACKEND_REGISTRATION_VERSION);
-    ksd_encode_u16(reply + 6u, status);
-    ksd_encode_u32(reply + 8u, backend);
+    ksd_backend_ack_encode(reply, status, backend, accepted);
     return fixed_io_until(descriptor, reply, sizeof(reply), true, deadline);
 }
 
@@ -523,11 +521,14 @@ static void handle_backend_connection(authority_state *state, int descriptor,
                             advertised);
     if (!valid) {
         (void)send_backend_ack(descriptor, KSD_BACKEND_ACK_REJECTED,
-                               KSD_BACKEND_NONE, deadline);
+                               KSD_BACKEND_NONE, 0u, deadline);
         return;
     }
+    /* The stored mask, not the requested one: the daemon is told what it is
+     * actually serving, which is the only way it can notice that the authority
+     * narrowed it. */
     if (!send_backend_ack(descriptor, KSD_BACKEND_ACK_ACCEPTED,
-                          backend, deadline)) {
+                          backend, advertised, deadline)) {
         unregister_backend(state, peer->uid, descriptor);
         return;
     }

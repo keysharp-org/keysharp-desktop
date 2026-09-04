@@ -286,7 +286,7 @@ foreach(required
         "connect_backend(deadline)"
         "ksd_backend_session_unsupported()"
         "backend = KSD_BACKEND_GENERIC;"
-        "register_backend(descriptor, backend, deadline)")
+        "register_backend(descriptor, backend, deadline, &accepted)")
     string(FIND "${session_backend}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR

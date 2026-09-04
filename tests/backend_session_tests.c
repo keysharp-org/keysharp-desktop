@@ -1,5 +1,6 @@
 #include "backend.h"
 #include "backend_protocol.h"
+#include "protocol_io.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -185,6 +186,71 @@ static void check_registration_mask(void)
                                           &mask));
 }
 
+/* The acknowledgement is the only way a daemon learns what it is actually
+ * serving. Without it the withhold-only rule is invisible from the far end:
+ * the authority narrows the mask, the daemon carries on believing the wider
+ * one, and answers for operations the authority will refuse on its behalf. */
+static void check_registration_ack(void)
+{
+    uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE];
+    uint64_t accepted = 0u;
+    const uint64_t requested = ksd_backend_operations(KSD_BACKEND_GNOME);
+
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, requested);
+    assert(ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                 &accepted));
+    assert(accepted == requested);
+
+    /* A narrowed mask is the ordinary case and must round-trip exactly. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, KSD_OPERATION_WINDOW_LIST);
+    assert(ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                 &accepted));
+    assert(accepted == KSD_OPERATION_WINDOW_LIST);
+
+    /* Withhold-only, enforced from the daemon side too. An authority that
+     * answered with more than was offered would have this daemon advertise a
+     * capability it never claimed, on the say-so of the other end. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, ~UINT64_C(0));
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME,
+                                  KSD_OPERATION_WINDOW_LIST, &accepted));
+
+    /* A rejection carries no mask, and is not an acceptance. Reporting one for
+     * a registration that was refused would describe a state that does not
+     * exist. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_REJECTED,
+                           KSD_BACKEND_NONE, requested);
+    assert(ksd_decode_u64(reply + 16u) == 0u);
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_NONE, requested,
+                                  &accepted));
+
+    /* An acknowledgement for another backend is not this one. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_CINNAMON, requested);
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                  &accepted));
+
+    /* Magic and version are both load-bearing. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, requested);
+    reply[0] = 0x58u;
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                  &accepted));
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, requested);
+    ksd_encode_u16(reply + 4u, KSD_BACKEND_REGISTRATION_VERSION + 1u);
+    assert(!ksd_backend_ack_parse(reply, KSD_BACKEND_GNOME, requested,
+                                  &accepted));
+
+    /* The accepted mask sits at the offset the request carries its own, so the
+     * offset itself means mask and the two ends cannot drift on it. */
+    ksd_backend_ack_encode(reply, KSD_BACKEND_ACK_ACCEPTED,
+                           KSD_BACKEND_GNOME, requested);
+    assert(ksd_decode_u64(reply + 16u) == requested);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "resolve") == 0) {
@@ -206,6 +272,7 @@ int main(int argc, char **argv)
     assert(child_backend("X-Cinnamon") == KSD_BACKEND_NONE);
     assert(child_backend("KDE") == KSD_BACKEND_NONE);
     check_registration_mask();
+    check_registration_ack();
     check_session_type_table();
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
     return 0;

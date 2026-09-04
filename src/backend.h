@@ -3,6 +3,7 @@
 
 #include "keysharp_desktop/client.h"
 
+#include <stdint.h>
 #include <sys/types.h>
 
 ksd_backend ksd_backend_resolve(void);
@@ -20,6 +21,24 @@ uint64_t ksd_backend_operations(ksd_backend backend);
  * "nothing changes on Wayland" is a property this function makes checkable
  * rather than a promise made in prose. */
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session);
+/* The registration acknowledgement, written once and read once, so the two
+ * ends cannot drift on where the accepted mask lives. It sits at the same
+ * offset the request carries its own mask: the offset itself means "mask".
+ *
+ * Telling the daemon what was actually stored closes a gap the withhold-only
+ * rule leaves open. The authority may narrow what a daemon asked to advertise,
+ * and without this the daemon would carry on believing it serves the wider
+ * set -- answering for operations the authority will refuse on its behalf, and
+ * with no way to notice. */
+void ksd_backend_ack_encode(uint8_t *reply, uint16_t status, uint32_t backend,
+                            uint64_t accepted);
+/* Checks an acknowledgement against what was asked for. Refuses a mask wider
+ * than the request: withhold-only is a rule the daemon can enforce too, and a
+ * daemon that accepted a widened mask would advertise a capability it never
+ * claimed on the say-so of the other end. */
+bool ksd_backend_ack_parse(const uint8_t *reply, uint32_t expected_backend,
+                           uint64_t requested, uint64_t *accepted);
+
 /* The mask to store for a registration, given what the daemon asked to
  * advertise. Withhold-only: the result is always a subset of what the backend
  * statically supports. Returns false when the record itself is unacceptable,
