@@ -2,6 +2,8 @@
 
 #include "kwin_wire.h"
 
+#include <unistd.h>
+
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <string.h>
@@ -40,6 +42,11 @@ static const char introspection[] =
 
 struct ksd_kwin_bus {
     ksd_kwin_host *host;
+    /* The unique name of the script, learned from the first call that carries
+     * the right generation, and required to match on every call after. Empty
+     * until then. */
+    char peer[64];
+    uid_t uid;
     GDBusNodeInfo *node;
     GDBusConnection *connection;
     guint name_id;
@@ -135,12 +142,38 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
     ksd_buffer reply;
     bool ok = false;
 
-    (void)connection;
-    (void)sender;
     (void)path;
     (void)iface;
     g_variant_get(parameters, "(&s&s)", &generation, &envelope);
     ksd_buffer_init(&reply, 65536u);
+
+    /* Exactly one peer is ever legitimate on this interface, and until now the
+     * sender was discarded -- ksd_kwin_peer_allowed existed and was never
+     * applied, so any process on the session bus could have driven the
+     * channel. The first caller presenting the right generation is taken as
+     * the script; every later call must be the same connection.
+     *
+     * The generation is what makes that safe to learn rather than configure:
+     * it is 32 random hex digits this daemon issued and told nobody else, so
+     * a caller that has it has been through Hello on this run. */
+    if (sender != NULL && generation != NULL) {
+        if (bus->peer[0] == 0) {
+            if (g_strcmp0(generation,
+                          ksd_kwin_host_generation(bus->host)) == 0) {
+                g_strlcpy(bus->peer, sender, sizeof(bus->peer));
+                bus->uid = getuid();
+            }
+        } else if (!ksd_kwin_peer_allowed(bus->peer, sender, bus->uid,
+                                          bus->uid, generation,
+                                          ksd_kwin_host_generation(bus->host))) {
+            g_dbus_method_invocation_return_error_literal(invocation,
+                G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
+                "not the script this daemon is talking to");
+            ksd_buffer_clear(&reply);
+            return;
+        }
+    }
+    (void)connection;
 
     if (g_strcmp0(method, "Hello") == 0) {
         ok = ksd_kwin_host_hello(bus->host, &reply);
