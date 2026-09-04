@@ -70,7 +70,8 @@ target_link_libraries(keysharp-desktop-client PRIVATE
 add_library(keysharp-desktop-common STATIC
     src/backend.c
     src/operation_result.c
-    src/operation_scope.c)
+    src/operation_scope.c
+    src/kwin_lanes.c)
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -342,6 +343,10 @@ if(BUILD_TESTING)
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
         keysharp-desktop-x11 keysharp-desktop-common)
+
+    add_executable(kwin-lane-tests tests/kwin_lane_tests.c)
+    target_link_libraries(kwin-lane-tests PRIVATE keysharp-desktop-common)
+    add_test(NAME kwin-lane-tests COMMAND kwin-lane-tests)
 
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
