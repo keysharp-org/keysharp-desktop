@@ -33,6 +33,24 @@
 bool ksd_authority_admit_worker(size_t workers, size_t uid_workers,
                                 bool *from_reserve);
 
+/* KWin serves every consumer of a desktop through one script on the
+ * compositor main thread, so work there is strictly serial and a consumer that
+ * floods it delays everyone else on that desktop. Every consumer of a desktop
+ * also shares a uid, so a per-uid cap cannot tell them apart; the pid can.
+ *
+ * Four is deliberately reachable -- one request in flight per connection means
+ * a five-connection consumer hits it -- because a cap nobody can reach is a
+ * cap no test can prove works.
+ *
+ * Over the cap the answer is BUSY, immediately, with no provider call and no
+ * queue entry. BUSY and TIMEOUT are a split worth keeping honest: BUSY means
+ * the request never reached the compositor and is always safe to retry, while
+ * TIMEOUT means it was dispatched and its outcome is unknown, which is not
+ * safe to retry for close or move-resize. */
+#define KSD_MAX_KWIN_INFLIGHT_PER_PID 4u
+
+bool ksd_authority_admit_kwin(size_t pid_inflight);
+
 /* Whether a connection that has now been classified may keep the slot it was
  * admitted into. A reserved slot serving an ordinary connection is exactly the
  * starvation the reserve exists to prevent, so it is refused and the

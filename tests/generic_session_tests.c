@@ -110,6 +110,26 @@ static void check_capture_memfd_is_sealed(void)
 }
 int ksd_authority_test_capture_budget(unsigned int uid, unsigned int pid,
                                       int reserve);
+int ksd_authority_test_kwin_slot(unsigned int pid, int reserve);
+
+/* Rule F1, driven through the real table rather than only the pure predicate,
+ * so the slot bookkeeping is covered too: a consumer that releases must get
+ * its slot back, and one consumer filling the cap must not affect another. */
+static void check_kwin_admission(void)
+{
+    for (unsigned int index = 0u; index < 4u; index++)
+        assert(ksd_authority_test_kwin_slot(700u, 1) == 1);
+    assert(ksd_authority_test_kwin_slot(700u, 1) == 0);
+
+    /* A different consumer is unaffected, which is the whole point of keying
+     * on pid rather than on the uid they share. */
+    assert(ksd_authority_test_kwin_slot(701u, 1) == 1);
+
+    /* Releasing returns the slot. */
+    assert(ksd_authority_test_kwin_slot(700u, 0) == 1);
+    assert(ksd_authority_test_kwin_slot(700u, 1) == 1);
+    assert(ksd_authority_test_kwin_slot(700u, 1) == 0);
+}
 
 static void check_capture_budget(void)
 {
@@ -387,6 +407,7 @@ int main(void)
     check_capture_mask_matches_dispatch();
     check_capture_memfd_is_sealed();
     check_capture_budget();
+    check_kwin_admission();
 
     assert(close(sockets[0]) == 0);
     assert(pthread_join(thread, NULL) == 0);

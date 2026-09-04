@@ -145,6 +145,18 @@ a capture and other work to proceed at the same time must hold two
 connections**. Handing the pixels over as a descriptor removed the transfer
 from that window; it did not remove the window.
 
+`BUSY` and `TIMEOUT` are not interchangeable, and the difference decides
+whether a retry is safe. `BUSY` means the request never reached the compositor
+and provably did not execute, so retrying it is always safe. `TIMEOUT` means it
+was dispatched and its outcome is unknown, so retrying `WINDOW_CLOSE`,
+`WINDOW_MOVE_RESIZE` or `WINDOW_SET_STATE` can apply it twice.
+
+On KWin every operation runs on the compositor's own thread, one at a time, so
+a caller is held to four requests in flight. Over that it is answered `BUSY`
+immediately rather than queued: the limit is per process rather than per user
+because every consumer of one desktop shares a user, and it is the individual
+caller that has to be held back.
+
 A capture is admitted against a budget: one per process, two per user, four
 across the service. The per-process limit exists because every consumer of one
 desktop shares a user, so without it a single process could hold both of its

@@ -52,6 +52,21 @@ int main(void)
     assert(ksd_authority_worker_keeps_slot(true, true));
     assert(!ksd_authority_worker_keeps_slot(true, false));
 
+    /* F1. A consumer may have four KWin requests in flight and no more.
+     * Everything a KWin script does runs on the compositor main thread, so one
+     * consumer flooding it delays every other consumer of that desktop, and a
+     * per-uid cap cannot tell them apart because they share a uid. */
+    assert(ksd_authority_admit_kwin(0u));
+    assert(ksd_authority_admit_kwin(KSD_MAX_KWIN_INFLIGHT_PER_PID - 1u));
+    assert(!ksd_authority_admit_kwin(KSD_MAX_KWIN_INFLIGHT_PER_PID));
+    assert(!ksd_authority_admit_kwin(KSD_MAX_KWIN_INFLIGHT_PER_PID + 1u));
+
+    /* Reachable on purpose: one request in flight per connection means a
+     * consumer holding five connections hits it. A cap nobody can reach is a
+     * cap no test can prove works. */
+    assert(KSD_MAX_KWIN_INFLIGHT_PER_PID
+           < KSD_MAX_AUTHORITY_WORKERS_PER_UID);
+
     /* The reserve must be smaller than the pool, or holding it back would
      * leave nothing for ordinary work. */
     assert(KSD_AUTHORITY_REGISTRATION_RESERVE < KSD_MAX_AUTHORITY_WORKERS);

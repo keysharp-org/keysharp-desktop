@@ -21,6 +21,11 @@ bool ksd_authority_admit_worker(size_t workers, size_t uid_workers,
     return true;
 }
 
+bool ksd_authority_admit_kwin(size_t pid_inflight)
+{
+    return pid_inflight < KSD_MAX_KWIN_INFLIGHT_PER_PID;
+}
+
 bool ksd_authority_worker_keeps_slot(bool from_reserve, bool is_registration)
 {
     return !from_reserve || is_registration;

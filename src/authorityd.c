@@ -85,6 +85,14 @@ typedef struct authority_state {
         pid_t pid;
         size_t count;
     } capture_pid_usage[KSD_MAX_AUTHORITY_WORKERS];
+    /* KWin requests in flight per consumer. Keyed on pid because every
+     * consumer of a desktop shares a uid, and on a compositor that runs every
+     * script operation on one thread it is the individual consumer that has to
+     * be held back. */
+    struct {
+        pid_t pid;
+        size_t count;
+    } kwin_inflight[KSD_MAX_AUTHORITY_WORKERS];
     struct {
         bool active;
         uid_t uid;
@@ -1088,6 +1096,58 @@ static bool start_watch(authority_session *session,
     return false;
 }
 
+static bool reserve_kwin_slot(authority_state *state, pid_t pid)
+{
+    size_t slot = KSD_MAX_AUTHORITY_WORKERS;
+    size_t inflight = 0u;
+    bool reserved = false;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->kwin_inflight[index].count != 0u
+            && state->kwin_inflight[index].pid == pid) {
+            slot = index;
+            inflight = state->kwin_inflight[index].count;
+            break;
+        }
+        if (slot == KSD_MAX_AUTHORITY_WORKERS
+            && state->kwin_inflight[index].count == 0u)
+            slot = index;
+    }
+    if (slot < KSD_MAX_AUTHORITY_WORKERS
+        && ksd_authority_admit_kwin(inflight)) {
+        state->kwin_inflight[slot].pid = pid;
+        state->kwin_inflight[slot].count++;
+        reserved = true;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return reserved;
+}
+
+static void release_kwin_slot(authority_state *state, pid_t pid)
+{
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
+        if (state->kwin_inflight[index].count != 0u
+            && state->kwin_inflight[index].pid == pid) {
+            state->kwin_inflight[index].count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+}
+
+#ifdef KSD_AUTHORITY_TESTING
+int ksd_authority_test_kwin_slot(unsigned int pid, int reserve)
+{
+    static authority_state kwin_state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    if (reserve == 0) {
+        release_kwin_slot(&kwin_state, (pid_t)pid);
+        return 1;
+    }
+    return reserve_kwin_slot(&kwin_state, (pid_t)pid) ? 1 : 0;
+}
+#endif
+
 static bool reserve_capture_memory(authority_state *state, uid_t uid,
                                    pid_t pid)
 {
@@ -1245,6 +1305,16 @@ static bool execute_operation(authority_session *session,
                                 NULL, 0u, false);
     bool capture = request->opcode == KSD_OP_CAPTURE_AREA
         || request->opcode == KSD_OP_CAPTURE_WINDOW;
+    /* Rule F1. A KWin operation that reaches the script is held to four per
+     * consumer, refused before the provider call rather than queued, because
+     * BUSY that provably never reached the compositor is always safe to retry
+     * and a queue entry would not be. */
+    bool kwin_script = session->backend == KSD_BACKEND_KWIN && !capture;
+    if (kwin_script
+        && !reserve_kwin_slot(session->state, session->identity.pid))
+        return forward_response(session, request, KSD_STATUS_BUSY, 0u,
+                                "too many concurrent requests for this"
+                                " compositor", NULL, 0u, false);
     if (capture && !reserve_capture_memory(session->state,
                                            session->identity.uid,
                                            session->identity.pid))
@@ -1296,6 +1366,8 @@ static bool execute_operation(authority_session *session,
     if (capture)
         release_capture_memory(session->state, session->identity.uid,
                                session->identity.pid);
+    if (kwin_script)
+        release_kwin_slot(session->state, session->identity.pid);
     return ok;
 }
 
