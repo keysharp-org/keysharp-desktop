@@ -178,7 +178,26 @@ int main(void)
                | KSD_OPERATION_CAPTURE_WINDOW
                | KSD_OPERATION_CLIPBOARD_MIMETYPES
                | KSD_OPERATION_CLIPBOARD_CONTENT
-               | KSD_OPERATION_CLIPBOARD_TEXT));
+               | KSD_OPERATION_CLIPBOARD_TEXT
+               | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
+               | KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_CLOSE
+               | KSD_OPERATION_WINDOW_KILL
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE
+               | KSD_OPERATION_WINDOW_SET_STATE
+               | KSD_OPERATION_WINDOW_SET_OPACITY
+               | KSD_OPERATION_WINDOW_SET_ABOVE
+               | KSD_OPERATION_WINDOW_SET_DECORATED));
+    /* Still absent, and each for its own reason rather than merely being
+     * unwritten. WATCH needs an event stream this worker has no way to hold
+     * open; the reservations are a compositor-side table; MOVE_RESIZE_XID is
+     * the same verb as MOVE_RESIZE here, since an X11 handle already is an
+     * XID; and input belongs to keysharp-input. */
+    assert((ksd_backend_operations(KSD_BACKEND_X11)
+            & (KSD_OPERATION_WINDOW_WATCH | KSD_OPERATION_WINDOW_RESERVE
+               | KSD_OPERATION_WINDOW_GET_RESERVED
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE_XID
+               | KSD_OPERATION_CLIPBOARD_WATCH
+               | KSD_OPERATION_MOUSE_BUTTON)) == 0u);
     /* Reading the clipboard is served; writing it is not, and must not be
      * advertised while no process outlives the request to hold the selection.
      * A client told it can set the clipboard here would watch the content

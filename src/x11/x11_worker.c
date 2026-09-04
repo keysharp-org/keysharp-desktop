@@ -4,6 +4,7 @@
 #include "protocol_io.h"
 #include "x11_capture.h"
 #include "x11_clipboard.h"
+#include "x11_control.h"
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
@@ -41,6 +42,15 @@ static bool parse_xid(const uint8_t *bytes, uint32_t length, uint32_t *xid)
         return false;
     *xid = (uint32_t)value;
     return true;
+}
+
+/* A window handle on the wire is 64 bits because a compositor id is, but on
+ * this backend it names an XID, which is 32. A value that does not fit is not
+ * a window on this display, and truncating it would aim the verb at whatever
+ * window happens to wear the low half. */
+static bool handle_is_xid(uint64_t handle)
+{
+    return handle != 0u && handle <= UINT32_MAX;
 }
 
 bool ksd_x11_request_valid(const ksd_frame *request)
@@ -87,6 +97,51 @@ bool ksd_x11_request_valid(const ksd_frame *request)
         case KSD_OP_CLIPBOARD_MIMETYPES:
         case KSD_OP_CLIPBOARD_TEXT:
             return request->payload_length == 0u;
+        case KSD_OP_WINDOW_FOCUS:
+        case KSD_OP_WINDOW_RAISE:
+        case KSD_OP_WINDOW_LOWER:
+        case KSD_OP_WINDOW_CLOSE:
+        case KSD_OP_WINDOW_KILL: {
+            uint64_t handle;
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_finished(&cursor)
+                && handle_is_xid(handle);
+        }
+        case KSD_OP_WINDOW_MOVE_RESIZE: {
+            uint64_t handle;
+            int32_t x;
+            int32_t y;
+            uint32_t width;
+            uint32_t height;
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && ksd_cursor_u32(&cursor, &width)
+                && ksd_cursor_u32(&cursor, &height)
+                && ksd_cursor_finished(&cursor)
+                && handle_is_xid(handle)
+                && width != 0u && height != 0u
+                && width <= (uint32_t)INT16_MAX
+                && height <= (uint32_t)INT16_MAX
+                && x >= INT16_MIN && x <= INT16_MAX
+                && y >= INT16_MIN && y <= INT16_MAX;
+        }
+        case KSD_OP_WINDOW_SET_STATE:
+        case KSD_OP_WINDOW_SET_OPACITY:
+        case KSD_OP_WINDOW_SET_ABOVE:
+        case KSD_OP_WINDOW_SET_DECORATED: {
+            uint64_t handle;
+            uint32_t value;
+            uint32_t tail_reserved;
+            uint32_t ceiling = request->opcode == KSD_OP_WINDOW_SET_STATE
+                ? 2u : (request->opcode == KSD_OP_WINDOW_SET_OPACITY
+                        ? 255u : 1u);
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_u32(&cursor, &value)
+                && ksd_cursor_u32(&cursor, &tail_reserved)
+                && ksd_cursor_finished(&cursor)
+                && handle_is_xid(handle) && tail_reserved == 0u
+                && value <= ceiling;
+        }
         case KSD_OP_CLIPBOARD_CONTENT: {
             uint32_t length;
             const uint8_t *bytes;
@@ -245,6 +300,70 @@ void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
             (void)parse_xid(bytes, length, &xid);
             ksd_x11_capture_window(connection, xid,
                 (flags & KSD_CAPTURE_WINDOW_INCLUDE_DECORATION) != 0u, result);
+            break;
+        }
+        case KSD_OP_WINDOW_FOCUS:
+        case KSD_OP_WINDOW_RAISE:
+        case KSD_OP_WINDOW_LOWER:
+        case KSD_OP_WINDOW_CLOSE:
+        case KSD_OP_WINDOW_KILL: {
+            ksd_cursor cursor;
+            uint64_t handle = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u64(&cursor, &handle);
+            uint32_t xid = (uint32_t)handle;
+            if (request->opcode == KSD_OP_WINDOW_FOCUS)
+                ksd_x11_window_focus(connection, xid, result);
+            else if (request->opcode == KSD_OP_WINDOW_RAISE)
+                ksd_x11_window_raise(connection, xid, true, result);
+            else if (request->opcode == KSD_OP_WINDOW_LOWER)
+                ksd_x11_window_raise(connection, xid, false, result);
+            else if (request->opcode == KSD_OP_WINDOW_CLOSE)
+                ksd_x11_window_close(connection, xid, result);
+            else
+                ksd_x11_window_kill(connection, xid, result);
+            break;
+        }
+        case KSD_OP_WINDOW_MOVE_RESIZE: {
+            ksd_cursor cursor;
+            uint64_t handle = 0u;
+            int32_t x = 0;
+            int32_t y = 0;
+            uint32_t width = 0u;
+            uint32_t height = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u64(&cursor, &handle);
+            (void)ksd_cursor_i32(&cursor, &x);
+            (void)ksd_cursor_i32(&cursor, &y);
+            (void)ksd_cursor_u32(&cursor, &width);
+            (void)ksd_cursor_u32(&cursor, &height);
+            ksd_x11_window_move_resize(connection, (uint32_t)handle, x, y,
+                                       width, height, result);
+            break;
+        }
+        case KSD_OP_WINDOW_SET_STATE:
+        case KSD_OP_WINDOW_SET_OPACITY:
+        case KSD_OP_WINDOW_SET_ABOVE:
+        case KSD_OP_WINDOW_SET_DECORATED: {
+            ksd_cursor cursor;
+            uint64_t handle = 0u;
+            uint32_t value = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u64(&cursor, &handle);
+            (void)ksd_cursor_u32(&cursor, &value);
+            uint32_t xid = (uint32_t)handle;
+            if (request->opcode == KSD_OP_WINDOW_SET_STATE)
+                ksd_x11_window_set_state(connection, xid, value, result);
+            else if (request->opcode == KSD_OP_WINDOW_SET_OPACITY)
+                ksd_x11_window_set_opacity(connection, xid, value, result);
+            else if (request->opcode == KSD_OP_WINDOW_SET_ABOVE)
+                ksd_x11_window_set_above(connection, xid, value != 0u, result);
+            else
+                ksd_x11_window_set_decorated(connection, xid, value != 0u,
+                                             result);
             break;
         }
         case KSD_OP_CLIPBOARD_MIMETYPES:

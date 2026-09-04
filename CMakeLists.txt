@@ -113,6 +113,7 @@ add_library(keysharp-desktop-x11 STATIC
     src/x11/x11_windows.c
     src/x11/x11_capture.c
     src/x11/x11_clipboard.c
+    src/x11/x11_control.c
     src/x11/x11_worker.c)
 target_include_directories(keysharp-desktop-x11 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

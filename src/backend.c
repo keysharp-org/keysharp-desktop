@@ -244,9 +244,22 @@ bool ksd_backend_session_unsupported(void)
     (KSD_OPERATION_CLIPBOARD_MIMETYPES | KSD_OPERATION_CLIPBOARD_CONTENT \
      | KSD_OPERATION_CLIPBOARD_TEXT)
 
+/* The control verbs. Almost all of these are requests to the window manager
+ * rather than server operations, so on a bare display they are correctly
+ * formed and nothing happens. That is EWMH working as specified rather than a
+ * defect: the manager is the party that moves a managed window, and there is
+ * not one. Raise, lower and kill are the exceptions, being server operations a
+ * client may perform itself. */
+#define KSD_X11_CONTROL_OPERATIONS \
+    (KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE \
+     | KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_CLOSE \
+     | KSD_OPERATION_WINDOW_KILL | KSD_OPERATION_WINDOW_MOVE_RESIZE \
+     | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY \
+     | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_SET_DECORATED)
+
 #define KSD_X11_OPERATIONS \
     (KSD_X11_COORDINATE_OPERATIONS | KSD_X11_CAPTURE_OPERATIONS \
-     | KSD_X11_CLIPBOARD_OPERATIONS)
+     | KSD_X11_CLIPBOARD_OPERATIONS | KSD_X11_CONTROL_OPERATIONS)
 
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
 {
