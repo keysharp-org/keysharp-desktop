@@ -136,9 +136,31 @@ target_link_libraries(keysharp-desktop-x11 PUBLIC
 # ones the compositor on this machine was built against.
 pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client>=1.20)
 pkg_check_modules(WAYLAND_SCANNER REQUIRED wayland-scanner)
-pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols>=1.32)
 pkg_get_variable(WAYLAND_SCANNER_BIN wayland-scanner wayland_scanner)
-pkg_get_variable(WAYLAND_PROTOCOL_DIR wayland-protocols pkgdatadir)
+
+# Distributions lag the protocol definitions badly -- Ubuntu 24.04 ships 1.34,
+# Debian 12 ships 1.31 -- and the package is data only, so demanding a
+# system-wide upgrade would be a heavy answer to a directory of XML. Pointing at
+# a newer checkout is still reading the definitions at build time rather than
+# vendoring them, which is what keeps them from drifting away from the protocol
+# the compositor actually implements.
+#
+# The version floor is therefore checked only when there is no override to
+# check instead. Demanding it first would make the escape hatch unreachable on
+# exactly the machines that need it.
+set(KEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR "" CACHE PATH
+    "wayland-protocols data directory, overriding the installed one")
+if(KEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR STREQUAL "")
+    # 1.39 is where ext-data-control-v1 arrived, and the clipboard needs it.
+    # The floor used to be 1.32 -- the version that added
+    # ext-foreign-toplevel-list-v1, the other protocol used here -- so it passed
+    # on distributions that then failed further down with a missing file,
+    # naming a path where the real answer was a version.
+    pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols>=1.39)
+    pkg_get_variable(WAYLAND_PROTOCOL_DIR wayland-protocols pkgdatadir)
+else()
+    set(WAYLAND_PROTOCOL_DIR "${KEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR}")
+endif()
 
 set(KSD_WAYLAND_GENERATED)
 foreach(spec
@@ -147,7 +169,12 @@ foreach(spec
     get_filename_component(stem "${spec}" NAME)
     set(xml "${WAYLAND_PROTOCOL_DIR}/${spec}.xml")
     if(NOT EXISTS "${xml}")
-        message(FATAL_ERROR "wayland protocol missing: ${xml}")
+        message(FATAL_ERROR
+            "wayland protocol missing: ${xml}
+"
+            "The installed wayland-protocols does not carry ${spec}. It is a "
+            "data-only package: clone a newer copy and configure with "
+            "-DKEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR=/path/to/wayland-protocols")
     endif()
     set(header "${CMAKE_CURRENT_BINARY_DIR}/${stem}-client-protocol.h")
     set(source "${CMAKE_CURRENT_BINARY_DIR}/${stem}-protocol.c")

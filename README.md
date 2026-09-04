@@ -45,18 +45,43 @@ installation alone can pass `--skip-if-compatible`.
 
 ### From source
 
-You need CMake 3.20+, a C11 compiler, and GLib; polkit is needed at run time for
-authorization prompts. The `keysharp-permissions` dependency is a submodule, so
-clone recursively:
+You need CMake 3.20+, a C11 compiler, GLib, the XCB and Wayland client
+libraries, and `wayland-scanner` with `wayland-protocols`; polkit is needed at
+run time for authorization prompts. The X11 and Wayland backends are not
+optional -- they are what serves window queries, clipboard reads and capture --
+so their development packages are required to configure at all. The
+`keysharp-permissions` dependency is a submodule, so clone recursively:
 
 ```bash
 git clone --recurse-submodules https://github.com/keysharp-org/keysharp-desktop
 cd keysharp-desktop
-sudo apt install cmake make gcc pkg-config libglib2.0-dev polkitd
+sudo apt install cmake make gcc pkg-config polkitd     libglib2.0-dev libxcb1-dev libxcb-shm0-dev     libwayland-dev libwayland-bin wayland-protocols
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 sudo cmake --install build
 ```
+
+`wayland-protocols` must be 1.39 or newer, which is where the clipboard
+protocol `ext-data-control-v1` was added. Distributions lag well behind it:
+Ubuntu 24.04 ships 1.34 and Debian 12 ships 1.31, so on either you will need a
+backport or a source build of that one package. Check with:
+
+```bash
+pkg-config --modversion wayland-protocols
+```
+
+That package is data only -- XML definitions and a pkg-config file, no code --
+so a machine whose copy is too old does not need it upgraded system-wide. Clone
+a newer one anywhere and point the build at it:
+
+```bash
+git clone --depth 1 --branch 1.39     https://gitlab.freedesktop.org/wayland/wayland-protocols.git     "$HOME/wayland-protocols"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release     -DKEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR="$HOME/wayland-protocols"
+```
+
+The definitions are still read at build time rather than vendored into this
+repository, so they cannot drift from the protocol the compositor implements --
+which is the whole reason they are not checked in here.
 
 The install step finishes the system side: it refreshes the linker cache, creates
 the permission store, enables and starts
@@ -71,10 +96,10 @@ systemctl --user daemon-reload
 systemctl --user restart keysharp-desktop.service
 ```
 
-`sudo ./install.sh` does all of the above, additionally installs the distribution
-packages listed here, and refreshes the invoking user's session for you;
-`PREFIX` and `BUILD_DIR` move the destination and the build tree. To build and
-test without installing anything, stop after `ctest`:
+`sudo ./install.sh` does all of the above and refreshes the invoking user's
+session for you; `PREFIX` and `BUILD_DIR` move the destination and the build
+tree. It does not install distribution packages -- run the `apt` line above
+first. To build and test without installing anything, stop after `ctest`:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
