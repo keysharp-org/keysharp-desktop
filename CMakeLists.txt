@@ -72,6 +72,7 @@ add_library(keysharp-desktop-common STATIC
     src/operation_result.c
     src/operation_scope.c
     src/kwin_lanes.c
+    src/kwin_jobs.c
     src/kwin_envelope.c
     src/worker_pool.c)
 target_include_directories(keysharp-desktop-common PUBLIC
@@ -368,6 +369,10 @@ if(BUILD_TESTING)
     add_executable(kwin-lane-tests tests/kwin_lane_tests.c)
     target_link_libraries(kwin-lane-tests PRIVATE keysharp-desktop-common)
     add_test(NAME kwin-lane-tests COMMAND kwin-lane-tests)
+
+    add_executable(kwin-job-tests tests/kwin_job_tests.c)
+    target_link_libraries(kwin-job-tests PRIVATE keysharp-desktop-common)
+    add_test(NAME kwin-job-tests COMMAND kwin-job-tests)
 
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
