@@ -1,0 +1,70 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  The KWin script's only way out.
+
+  A KWin script cannot be called, so this is not an interface the script
+  implements; it is one the session daemon implements FOR the script to call.
+  Every method is therefore driven from inside the compositor, and the daemon's
+  job is to answer.
+
+  Four methods, and every one of them "in ss, out s". The single signature is
+  deliberate and load-bearing: callDBus drops its callback on any error at all,
+  including a signature mismatch, so with jobs in flight a signature slip would
+  not fail loudly, it would make the script go deaf and the channel would wedge.
+  One signature is also what makes a batched reply safe to add without a format
+  change.
+
+  Argument 0 is the generation token, argument 1 the KSK1 envelope. The
+  generation is passed separately as well as inside the envelope so a reply
+  from the previous run of the script can be refused before its body is parsed.
+-->
+<node>
+  <interface name="io.github.keysharp.KWinProvider1">
+    <!--
+      Announces a freshly started script and receives the generation it now
+      belongs to. The daemon issues that token, never the script: a script that
+      named its own run could name the previous one.
+    -->
+    <method name="Hello">
+      <arg type="s" direction="in" name="generation"/>
+      <arg type="s" direction="in" name="envelope"/>
+      <arg type="s" direction="out" name="reply"/>
+    </method>
+
+    <!--
+      Asks for work on one lane. The daemon holds this invocation until it has
+      some or until the idle timer fires, which is why there is no timer on the
+      script side and no polling loop: the reply is the wakeup. A parked
+      invocation is always completed and never dropped, because the script has
+      exactly one of these outstanding per lane.
+    -->
+    <method name="Poll">
+      <arg type="s" direction="in" name="generation"/>
+      <arg type="s" direction="in" name="envelope"/>
+      <arg type="s" direction="out" name="reply"/>
+    </method>
+
+    <!--
+      Carries the results of a dispatched batch. Answered with an
+      acknowledgement and never with more work: a report is the script saying
+      what finished, and handing it a batch would put those jobs outside the
+      per-lane accounting that bounds one.
+    -->
+    <method name="Report">
+      <arg type="s" direction="in" name="generation"/>
+      <arg type="s" direction="in" name="envelope"/>
+      <arg type="s" direction="out" name="reply"/>
+    </method>
+
+    <!--
+      Window events, pushed as they happen rather than polled. Never carries a
+      job in either direction, so an event storm cannot delay dispatched work.
+    -->
+    <method name="Event">
+      <arg type="s" direction="in" name="generation"/>
+      <arg type="s" direction="in" name="envelope"/>
+      <arg type="s" direction="out" name="reply"/>
+    </method>
+  </interface>
+</node>
