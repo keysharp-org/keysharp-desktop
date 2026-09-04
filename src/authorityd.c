@@ -90,6 +90,10 @@ typedef struct authority_state {
         uid_t uid;
         int descriptor;
         uint32_t backend;
+        /* What this daemon reported it can serve, already narrowed to what the
+         * backend statically supports. Read in place of the static table, so a
+         * daemon whose compositor lacks a capability can say so. */
+        uint64_t advertised;
         ksp_identity identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
@@ -332,9 +336,27 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
             || ksd_backend_resolve_process(peer->pid) == backend);
 }
 
+static uint64_t registered_operations(authority_state *state, uid_t uid,
+                                      uint32_t backend)
+{
+    uint64_t advertised = 0u;
+    bool found = false;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++)
+        if (state->backends[index].active
+            && state->backends[index].uid == uid) {
+            advertised = state->backends[index].advertised;
+            found = true;
+            break;
+        }
+    pthread_mutex_unlock(&state->mutex);
+    return ksd_backend_reported_operations(backend, found, advertised);
+}
+
 static bool register_backend(authority_state *state, int descriptor,
                              const struct ucred *peer, uint32_t backend,
-                             const ksp_identity *identity)
+                             const ksp_identity *identity,
+                             uint64_t advertised)
 {
     size_t free_slot = KSD_MAX_BACKEND_REGISTRATIONS;
     bool registered = false;
@@ -352,6 +374,7 @@ static bool register_backend(authority_state *state, int descriptor,
         state->backends[free_slot].uid = peer->uid;
         state->backends[free_slot].descriptor = descriptor;
         state->backends[free_slot].backend = backend;
+        state->backends[free_slot].advertised = advertised;
         state->backends[free_slot].identity = *identity;
         registered = true;
     }
@@ -474,12 +497,19 @@ static void handle_backend_connection(authority_state *state, int descriptor,
                   sizeof(ksd_backend_registration_magic)) == 0
         && ksd_decode_u16(registration + 4u)
             == KSD_BACKEND_REGISTRATION_VERSION
-        && ksd_decode_u16(registration + 6u) == 0u
-        && ksd_decode_u32(registration + 12u) == 0u;
-    if (valid)
+        && ksd_decode_u32(registration + 12u) == 0u
+        && ksd_decode_u64(registration + 24u) == 0u;
+    uint64_t advertised = 0u;
+    if (valid) {
         backend = ksd_decode_u32(registration + 8u);
+        valid = ksd_backend_registration_mask(backend,
+            ksd_decode_u16(registration + 4u),
+            ksd_decode_u16(registration + 6u),
+            ksd_decode_u64(registration + 16u), &advertised);
+    }
     valid = valid && trusted_backend_peer(peer, backend, &identity)
-        && register_backend(state, descriptor, peer, backend, &identity);
+        && register_backend(state, descriptor, peer, backend, &identity,
+                            advertised);
     if (!valid) {
         (void)send_backend_ack(descriptor, KSD_BACKEND_ACK_REJECTED,
                                KSD_BACKEND_NONE, deadline);
@@ -1173,7 +1203,9 @@ static bool execute_operation(authority_session *session,
     uint64_t bit = ksd_operation_bit(request->opcode);
     session->backend = registered_backend(session->state,
                                           session->identity.uid);
-    uint64_t available = ksd_backend_operations(session->backend);
+    uint64_t available = registered_operations(session->state,
+                                               session->identity.uid,
+                                               session->backend);
     bool generation_changed = false;
 
     if (bit == 0u)
@@ -1433,7 +1465,10 @@ static bool start_public_session(authority_session *session)
     bool replied;
     if (status == KSD_STATUS_OK) {
         ksd_encode_u32(tail, session->granted_scopes);
-        ksd_encode_u64(tail + 8u, ksd_backend_operations(session->backend));
+        ksd_encode_u64(tail + 8u,
+                       registered_operations(session->state,
+                                             session->identity.uid,
+                                             session->backend));
         ksd_encode_u32(tail + 16u, session->backend);
         replied = forward_response(session, &hello, KSD_STATUS_OK, 0u,
                                    NULL, tail, sizeof(tail), false);

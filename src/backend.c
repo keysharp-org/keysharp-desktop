@@ -1,5 +1,7 @@
 #include "backend.h"
 
+#include "backend_protocol.h"
+
 #include "protocol.h"
 
 #include <gio/gio.h>
@@ -239,6 +241,32 @@ uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
     /* Never more than the backend advertises. Routing a bit outside the mask
      * would serve an operation the client was told does not exist. */
     return KSD_X11_COORDINATE_OPERATIONS & ksd_backend_operations(backend);
+}
+
+uint64_t ksd_backend_reported_operations(ksd_backend backend, bool registered,
+                                         uint64_t advertised)
+{
+    uint64_t supported = ksd_backend_operations(backend);
+    return registered ? (advertised & supported) : supported;
+}
+
+bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
+                                   uint16_t flags, uint64_t requested,
+                                   uint64_t *stored)
+{
+    if (stored == NULL || version != KSD_BACKEND_REGISTRATION_VERSION
+        || (flags & (uint16_t)~KSD_BACKEND_FLAGS_ALL) != 0u)
+        return false;
+    /* Only a KWin daemon hands over a callback socket. Accepting the flag from
+     * any other backend would take a descriptor the authority has no reason to
+     * hold and no path that would ever use. */
+    if ((flags & KSD_BACKEND_FLAG_PROVIDER_FD) != 0u
+        && backend != KSD_BACKEND_KWIN)
+        return false;
+    /* Withhold-only. The static table is the ceiling, so a daemon can report
+     * less than its backend supports but never more. */
+    *stored = requested & ksd_backend_operations(backend);
+    return true;
 }
 
 uint64_t ksd_backend_operations(ksd_backend backend)

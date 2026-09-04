@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "backend_protocol.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -107,6 +108,78 @@ static void check_session_type_table(void)
     assert(ksd_backend_operations(KSD_BACKEND_X11) != 0u);
     assert(ksd_backend_x11_route(KSD_BACKEND_X11, false) == 0u);
 }
+/* The registration mask may only ever narrow. A daemon whose compositor lacks
+ * a capability reports less and the authority believes it; a daemon that asks
+ * for more than its backend supports gets the intersection, not the union,
+ * because otherwise a compromised daemon could advertise capability the
+ * service cannot deliver and every caller would be told a lie. */
+static void check_registration_mask(void)
+{
+    uint64_t mask = 0u;
+    const uint16_t version = KSD_BACKEND_REGISTRATION_VERSION;
+
+    /* Asking for everything yields exactly what the backend supports. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_GNOME, version, 0u,
+                                         ~UINT64_C(0), &mask));
+    assert(mask == ksd_backend_operations(KSD_BACKEND_GNOME));
+
+    /* Asking for less yields less: this is the whole point of carrying it. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_GNOME, version, 0u,
+                                         KSD_OPERATION_WINDOW_LIST, &mask));
+    assert(mask == (KSD_OPERATION_WINDOW_LIST
+                    & ksd_backend_operations(KSD_BACKEND_GNOME)));
+
+    /* Asking for something the backend does not have yields nothing extra. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_X11, version, 0u,
+                                         ~UINT64_C(0), &mask));
+    assert(mask == ksd_backend_operations(KSD_BACKEND_X11));
+    assert((mask & KSD_OPERATION_CAPTURE_AREA) == 0u);
+
+    /* A backend that serves nothing cannot be talked into serving something. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_GENERIC, version, 0u,
+                                         ~UINT64_C(0), &mask));
+    assert(mask == 0u);
+
+    /* Only KWin hands over a callback socket, because only a KWin script
+     * cannot be reached on the session bus. */
+    assert(ksd_backend_registration_mask(KSD_BACKEND_KWIN, version,
+                                         KSD_BACKEND_FLAG_PROVIDER_FD,
+                                         ~UINT64_C(0), &mask));
+    assert(!ksd_backend_registration_mask(KSD_BACKEND_GNOME, version,
+                                          KSD_BACKEND_FLAG_PROVIDER_FD,
+                                          ~UINT64_C(0), &mask));
+    assert(!ksd_backend_registration_mask(KSD_BACKEND_X11, version,
+                                          KSD_BACKEND_FLAG_PROVIDER_FD,
+                                          ~UINT64_C(0), &mask));
+
+    /* An unknown flag is a record this service does not understand, which is
+     * a rejected registration rather than one with the flag ignored. */
+    assert(!ksd_backend_registration_mask(KSD_BACKEND_KWIN, version, 0x8000u,
+                                          0u, &mask));
+
+    /* A registration narrows what is reported; its absence falls back to the
+     * static table. Without a registration the answer must not be zero, or a
+     * backend would appear to serve nothing before its daemon registers. */
+    assert(ksd_backend_reported_operations(KSD_BACKEND_GNOME, false, 0u)
+           == ksd_backend_operations(KSD_BACKEND_GNOME));
+    assert(ksd_backend_reported_operations(KSD_BACKEND_GNOME, true,
+                                           KSD_OPERATION_WINDOW_LIST)
+           == KSD_OPERATION_WINDOW_LIST);
+    assert(ksd_backend_reported_operations(KSD_BACKEND_GNOME, true, 0u) == 0u);
+    /* A registration can never widen, even if a stored value somehow did. */
+    assert(ksd_backend_reported_operations(KSD_BACKEND_X11, true,
+                                           ~UINT64_C(0))
+           == ksd_backend_operations(KSD_BACKEND_X11));
+
+    /* And a version it does not speak. */
+    assert(!ksd_backend_registration_mask(KSD_BACKEND_GNOME,
+                                          (uint16_t)(version - 1u), 0u, 0u,
+                                          &mask));
+    assert(!ksd_backend_registration_mask(KSD_BACKEND_GNOME,
+                                          (uint16_t)(version + 1u), 0u, 0u,
+                                          &mask));
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "resolve") == 0) {
@@ -127,6 +200,7 @@ int main(int argc, char **argv)
     assert(child_backend("ubuntu:GNOME") == KSD_BACKEND_NONE);
     assert(child_backend("X-Cinnamon") == KSD_BACKEND_NONE);
     assert(child_backend("KDE") == KSD_BACKEND_NONE);
+    check_registration_mask();
     check_session_type_table();
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC) == 0u);
     return 0;

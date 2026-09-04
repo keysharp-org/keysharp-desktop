@@ -20,5 +20,18 @@ uint64_t ksd_backend_operations(ksd_backend backend);
  * "nothing changes on Wayland" is a property this function makes checkable
  * rather than a promise made in prose. */
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session);
+/* The mask to store for a registration, given what the daemon asked to
+ * advertise. Withhold-only: the result is always a subset of what the backend
+ * statically supports. Returns false when the record itself is unacceptable,
+ * which rejects the registration rather than silently clamping it. */
+bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
+                                   uint16_t flags, uint64_t requested,
+                                   uint64_t *stored);
+/* What to report for a backend, given whether a registration was found and
+ * what it advertised. A registration narrows; its absence falls back to the
+ * static table. Narrowed again on the way out, because staying a subset is the
+ * invariant and asserting it costs nothing. */
+uint64_t ksd_backend_reported_operations(ksd_backend backend, bool registered,
+                                         uint64_t advertised);
 
 #endif

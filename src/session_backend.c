@@ -143,6 +143,11 @@ static bool register_backend(int descriptor, ksd_backend backend,
            sizeof(ksd_backend_registration_magic));
     ksd_encode_u16(message + 4u, KSD_BACKEND_REGISTRATION_VERSION);
     ksd_encode_u32(message + 8u, backend);
+    /* What this daemon believes it can serve. Today that is everything the
+     * backend statically supports; a daemon that probes its compositor and
+     * finds a capability missing reports less here, and the authority narrows
+     * to it. It can never widen. */
+    ksd_encode_u64(message + 16u, ksd_backend_operations(backend));
     return transfer_fixed(descriptor, message, sizeof(message), true, deadline)
         && transfer_fixed(descriptor, reply, sizeof(reply), false, deadline)
         && memcmp(reply, ksd_backend_ack_magic,
