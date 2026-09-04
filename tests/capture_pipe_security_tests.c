@@ -194,6 +194,9 @@ static void encode_bootstrap(uint8_t header[32], uint16_t version,
     memset(header, 0, 32u);
     memcpy(header, "KSCW", 4u);
     ksd_encode_u16(header + 4u, version);
+    /* Backend zero is KSD_BACKEND_NONE, which is in range. The field is at
+     * offset 6, where v2 kept a reserved zero. */
+    ksd_encode_u16(header + 6u, 0u);
     ksd_encode_u32(header + 8u, 1000u);
     ksd_encode_u32(header + 12u, 1000u);
     ksd_encode_u32(header + 16u, group_count);
@@ -204,34 +207,59 @@ static void encode_bootstrap(uint8_t header[32], uint16_t version,
 /* The header carries the registered daemon pid at an offset that, under the
  * previous 24-byte layout, is where the group array starts. A version that is
  * tolerated rather than required would therefore read a group id as a pid. */
+/* The header carries the registered daemon pid at an offset that, under the
+ * original 24-byte layout, is where the group array starts. A version that is
+ * tolerated rather than required would therefore read a group id as a pid.
+ *
+ * v3 added the backend at offset 6, where v2 kept a reserved zero. That field
+ * is why the version had to move: the worker used to guess its route from the
+ * payload shape, which cannot distinguish a KWin area capture from an X11 one,
+ * and sent every KWin capture to the X11 path. */
 static void check_bootstrap_header_parse(void)
 {
     uint8_t header[32];
     size_t frame_length = KSD_FRAME_HEADER_SIZE;
     size_t total = 32u + frame_length;
 
-    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
     assert(ksd_capture_worker_test_parse_header(header, total));
 
-    /* An older layout must be refused outright, not reinterpreted. */
+    /* Both older layouts must be refused outright, not reinterpreted. v2 is
+     * the dangerous one now: it is the same 32 bytes with a different meaning
+     * at offset 6, so tolerating it would read a reserved zero as a backend
+     * and route every request as KSD_BACKEND_NONE. */
+    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
     encode_bootstrap(header, 1u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* A future one likewise. */
+    encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
+    assert(!ksd_capture_worker_test_parse_header(header, total));
+
+    /* Every backend the service knows is accepted, and nothing past it. A
+     * value out of range would select no route at all and the request would be
+     * refused for a reason that names the wrong thing. */
+    for (uint16_t backend = 0u; backend <= KSD_BACKEND_GENERIC; backend++) {
+        encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+        ksd_encode_u16(header + 6u, backend);
+        assert(ksd_capture_worker_test_parse_header(header, total));
+    }
     encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
+    ksd_encode_u16(header + 6u, (uint16_t)(KSD_BACKEND_GENERIC + 1u));
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* No pid means no authenticated party to take a display from. */
-    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 0u);
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 0u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* The declared lengths must account for the whole message exactly. */
-    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
     assert(!ksd_capture_worker_test_parse_header(header, total + 1u));
     assert(!ksd_capture_worker_test_parse_header(header, total - 1u));
 
     /* Reserved bytes are reserved. */
-    encode_bootstrap(header, 2u, 0u, (uint32_t)frame_length, 4321u);
+    encode_bootstrap(header, 3u, 0u, (uint32_t)frame_length, 4321u);
     ksd_encode_u32(header + 28u, 1u);
     assert(!ksd_capture_worker_test_parse_header(header, total));
 }

@@ -13,10 +13,15 @@ typedef bool (*ksd_capture_worker_continue_fn)(void *user_data);
 /* session_pid is the REGISTERED session daemon's pid, not the calling
  * client's. The worker reads the display environment from it after dropping
  * privileges, so it must name the party the authority authenticated. */
+/* backend is the one the authority resolved for this session. It travels
+ * because the worker cannot infer it: an area capture is byte-identical
+ * whichever backend will serve it, and guessing sent every KWin capture down
+ * the X11 path. */
 void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 const ksd_frame *request,
                                 ksd_capture_worker_continue_fn keep_running,
                                 void *user_data, pid_t session_pid,
+                                uint32_t backend,
                                 ksd_operation_result *result);
 int ksd_capture_worker_main(int argc, char **argv);
 

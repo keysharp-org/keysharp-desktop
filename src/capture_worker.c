@@ -28,7 +28,11 @@
 #include <unistd.h>
 
 #define KSD_CAPTURE_WORKER_FD 3
-#define KSD_CAPTURE_WORKER_VERSION 2u
+/* v3 carries the backend. v2 did not, and the worker guessed the route from
+ * the payload shape instead -- which sent every KWin capture to the X11 path,
+ * because an area capture looks identical either way. That path then refused
+ * the XWayland server KWin runs, so KWin area capture could never succeed. */
+#define KSD_CAPTURE_WORKER_VERSION 3u
 #define KSD_CAPTURE_WORKER_HEADER_SIZE 32u
 #define KSD_CAPTURE_WORKER_MAX_GROUPS 256u
 #define KSD_CAPTURE_WORKER_ENV_LIMIT (64u * 1024u)
@@ -321,7 +325,8 @@ static int create_capture_spool(void)
 static bool send_bootstrap(int descriptor, const ksp_identity *identity,
                            gid_t gid, const gid_t *groups, size_t group_count,
                            const ksd_frame *request,
-                           const int capture_pipe[2], pid_t session_pid)
+                           const int capture_pipe[2], pid_t session_pid,
+                           uint32_t backend)
 {
     ksd_buffer frame;
     ksd_buffer message;
@@ -333,7 +338,7 @@ static bool send_bootstrap(int descriptor, const ksp_identity *identity,
         && ksd_frame_pack(request, &frame) && frame.length <= UINT32_MAX
         && ksd_buffer_bytes(&message, worker_magic, sizeof(worker_magic))
         && ksd_buffer_u16(&message, KSD_CAPTURE_WORKER_VERSION)
-        && ksd_buffer_u16(&message, 0u)
+        && ksd_buffer_u16(&message, (uint16_t)backend)
         && ksd_buffer_u32(&message, (uint32_t)identity->uid)
         && ksd_buffer_u32(&message, (uint32_t)gid)
         && ksd_buffer_u32(&message, (uint32_t)group_count)
@@ -552,6 +557,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 const ksd_frame *request,
                                 ksd_capture_worker_continue_fn keep_running,
                                 void *user_data, pid_t session_pid,
+                                uint32_t backend,
                                 ksd_operation_result *result)
 {
     worker_environment environment = { 0 };
@@ -619,7 +625,8 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
     sockets[1] = -1;
     if (worker < 0 || !send_bootstrap(sockets[0], identity, gid,
                                       groups, group_count, request,
-                                      capture_pipe, session_pid)) {
+                                      capture_pipe, session_pid,
+                                      backend)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "capture worker bootstrap failed");
         goto done;
@@ -819,6 +826,9 @@ typedef struct worker_bootstrap {
     uint32_t group_count;
     uint32_t frame_length;
     pid_t session_pid;
+    /* Which backend the authority resolved. The worker cannot infer this: an
+     * area capture is byte-identical whichever backend will serve it. */
+    uint32_t backend;
 } worker_bootstrap;
 
 /* The whole header is validated before any field is used, because a version
@@ -831,7 +841,7 @@ static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
     if (length < KSD_CAPTURE_WORKER_HEADER_SIZE
         || memcmp(bootstrap, worker_magic, sizeof(worker_magic)) != 0
         || ksd_decode_u16(bootstrap + 4u) != KSD_CAPTURE_WORKER_VERSION
-        || ksd_decode_u16(bootstrap + 6u) != 0u
+        || ksd_decode_u16(bootstrap + 6u) > KSD_BACKEND_GENERIC
         || ksd_decode_u32(bootstrap + 28u) != 0u)
         return false;
     parsed->uid = (uid_t)ksd_decode_u32(bootstrap + 8u);
@@ -839,6 +849,7 @@ static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
     parsed->group_count = ksd_decode_u32(bootstrap + 16u);
     parsed->frame_length = ksd_decode_u32(bootstrap + 20u);
     parsed->session_pid = (pid_t)ksd_decode_u32(bootstrap + 24u);
+    parsed->backend = ksd_decode_u16(bootstrap + 6u);
     size_t groups_length = (size_t)parsed->group_count * sizeof(uint32_t);
     return (uint64_t)parsed->uid == ksd_decode_u32(bootstrap + 8u)
         && (uint64_t)parsed->gid == ksd_decode_u32(bootstrap + 12u)
@@ -906,11 +917,15 @@ int ksd_capture_worker_main(int argc, char **argv)
     bool unpacked = ksd_frame_unpack(packed, frame_length, public_magic,
         KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
         KSD_CAPTURE_WORKER_MAX_REQUEST, true, &request);
-    bool x11 = unpacked && ksd_x11_request_valid(&request);
-    /* X11 is asked first, so a display session that is both -- an X11 session
-     * with a compositor reachable, or the reverse -- resolves the same way the
-     * backend resolver does rather than by which check ran first. */
-    bool wayland = unpacked && !x11 && ksd_wayland_request_valid(&request);
+    /* Routed by the BACKEND the authority resolved, not by the shape of the
+     * payload. Shape cannot tell these apart: an area capture is the same
+     * sixteen bytes whoever will serve it, so guessing sent every KWin capture
+     * down the X11 path, where it met an XWayland server and was refused. The
+     * backend is the only thing that actually decides, and it now travels. */
+    bool x11 = unpacked && header.backend == KSD_BACKEND_X11
+        && ksd_x11_request_valid(&request);
+    bool wayland = unpacked && header.backend == KSD_BACKEND_GENERIC
+        && ksd_wayland_request_valid(&request);
     if (!unpacked || request.flags != 0u || request.request_id == 0u
         || !(x11 || wayland || ksd_local_capture_request_valid(&request))) {
         if (unpacked)

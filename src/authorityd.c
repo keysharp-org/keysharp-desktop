@@ -1416,7 +1416,7 @@ static bool execute_operation(authority_session *session,
                                    capture_still_authorized, session,
                                    registered_backend_pid(session->state,
                                        session->identity.uid),
-                                   &result);
+                                   session->backend, &result);
     } else {
         ksd_provider_execute(session->identity.uid, session->identity.pid,
                              session->backend, request, &result);
