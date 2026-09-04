@@ -6,40 +6,56 @@
 #include <stdlib.h>
 #include <string.h>
 
-static xcb_atom_t intern(xcb_connection_t *c, const char *name)
-{
-    /* only_if_exists. Interning with creation would add every EWMH name to
-     * the atom table of a server that has no window manager, and would make a
-     * property that cannot exist look merely empty. */
-    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(c, 1,
-        (uint16_t)strlen(name), name);
-    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c, cookie, NULL);
-    xcb_atom_t atom = XCB_ATOM_NONE;
-
-    if (reply != NULL) {
-        atom = reply->atom;
-        free(reply);
-    }
-    return atom;
-}
-
+/* Every name is asked for in one pass and every answer collected in a second.
+ * xcb returns a cookie without waiting, so the fifteen interns cost one round
+ * trip rather than fifteen; issuing and immediately awaiting each is the shape
+ * xcb exists to let callers avoid. */
 void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
 {
-    atoms->client_list = intern(c, "_NET_CLIENT_LIST");
-    atoms->active_window = intern(c, "_NET_ACTIVE_WINDOW");
-    atoms->work_area = intern(c, "_NET_WORKAREA");
-    atoms->current_desktop = intern(c, "_NET_CURRENT_DESKTOP");
-    atoms->wm_desktop = intern(c, "_NET_WM_DESKTOP");
-    atoms->wm_name = intern(c, "_NET_WM_NAME");
-    atoms->wm_pid = intern(c, "_NET_WM_PID");
-    atoms->wm_state = intern(c, "_NET_WM_STATE");
-    atoms->state_hidden = intern(c, "_NET_WM_STATE_HIDDEN");
-    atoms->state_above = intern(c, "_NET_WM_STATE_ABOVE");
-    atoms->state_max_vert = intern(c, "_NET_WM_STATE_MAXIMIZED_VERT");
-    atoms->state_max_horz = intern(c, "_NET_WM_STATE_MAXIMIZED_HORZ");
-    atoms->frame_extents = intern(c, "_NET_FRAME_EXTENTS");
-    atoms->opacity = intern(c, "_NET_WM_WINDOW_OPACITY");
-    atoms->utf8_string = intern(c, "UTF8_STRING");
+    static const char *const names[] = {
+        "_NET_CLIENT_LIST", "_NET_ACTIVE_WINDOW", "_NET_WORKAREA",
+        "_NET_CURRENT_DESKTOP", "_NET_WM_DESKTOP", "_NET_WM_NAME",
+        "_NET_WM_PID", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
+        "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_MAXIMIZED_VERT",
+        "_NET_WM_STATE_MAXIMIZED_HORZ", "_NET_FRAME_EXTENTS",
+        "_NET_WM_WINDOW_OPACITY", "UTF8_STRING",
+    };
+    size_t count = sizeof(names) / sizeof(names[0]);
+    xcb_intern_atom_cookie_t cookies[15];
+    xcb_atom_t *fields[15];
+
+    fields[0] = &atoms->client_list;
+    fields[1] = &atoms->active_window;
+    fields[2] = &atoms->work_area;
+    fields[3] = &atoms->current_desktop;
+    fields[4] = &atoms->wm_desktop;
+    fields[5] = &atoms->wm_name;
+    fields[6] = &atoms->wm_pid;
+    fields[7] = &atoms->wm_state;
+    fields[8] = &atoms->state_hidden;
+    fields[9] = &atoms->state_above;
+    fields[10] = &atoms->state_max_vert;
+    fields[11] = &atoms->state_max_horz;
+    fields[12] = &atoms->frame_extents;
+    fields[13] = &atoms->opacity;
+    fields[14] = &atoms->utf8_string;
+
+    /* only_if_exists. Interning with creation would add every EWMH name to the
+     * atom table of a server that has no window manager, and would make a
+     * property that cannot exist look merely empty. */
+    for (size_t index = 0u; index < count; index++)
+        cookies[index] = xcb_intern_atom(c, 1,
+            (uint16_t)strlen(names[index]), names[index]);
+    for (size_t index = 0u; index < count; index++) {
+        xcb_intern_atom_reply_t *reply =
+            xcb_intern_atom_reply(c, cookies[index], NULL);
+
+        *fields[index] = XCB_ATOM_NONE;
+        if (reply != NULL) {
+            *fields[index] = reply->atom;
+            free(reply);
+        }
+    }
 }
 
 xcb_get_property_reply_t *ksd_x11_property(xcb_connection_t *c,
@@ -235,4 +251,71 @@ void ksd_x11_work_area(ksd_x11 *connection, ksd_operation_result *result)
         return;
     }
     numeric_result(result, values, 4u);
+}
+
+xcb_get_property_cookie_t ksd_x11_property_cookie(xcb_connection_t *c,
+                                                  xcb_window_t window,
+                                                  xcb_atom_t name,
+                                                  xcb_atom_t type,
+                                                  uint32_t words)
+{
+    /* An atom the server does not know cannot name a property, but a request
+     * still has to be issued so the collect pass stays in step with the issue
+     * pass. XCB_ATOM_NONE as the property yields a None-typed reply, which
+     * ksd_x11_take_property reports as absent. */
+    return xcb_get_property(c, 0, window, name, type, 0u, words);
+}
+
+xcb_get_property_reply_t *ksd_x11_take_property(xcb_connection_t *c,
+                                                xcb_get_property_cookie_t cookie)
+{
+    xcb_get_property_reply_t *reply = xcb_get_property_reply(c, cookie, NULL);
+
+    if (reply != NULL && reply->type == XCB_ATOM_NONE) {
+        free(reply);
+        return NULL;
+    }
+    return reply;
+}
+
+bool ksd_x11_state_has(const xcb_get_property_reply_t *state,
+                       xcb_atom_t wanted)
+{
+    if (state == NULL || wanted == XCB_ATOM_NONE)
+        return false;
+
+    int length = xcb_get_property_value_length(state);
+    const xcb_atom_t *atoms = xcb_get_property_value(state);
+    size_t count = length > 0 ? (size_t)length / sizeof(xcb_atom_t) : 0u;
+
+    for (size_t index = 0u; index < count; index++)
+        if (atoms[index] == wanted)
+            return true;
+    return false;
+}
+
+bool ksd_x11_append_text_reply(ksd_buffer *out, xcb_get_property_reply_t *reply)
+{
+    bool ok;
+
+    if (reply == NULL)
+        return append_json_string(out, "", 0u);
+
+    int raw = xcb_get_property_value_length(reply);
+    const char *value = xcb_get_property_value(reply);
+    size_t length = raw > 0 ? (size_t)raw : 0u;
+
+    if (length > KSD_X11_MAX_TEXT)
+        length = KSD_X11_MAX_TEXT;
+    for (size_t index = 0u; index < length; index++)
+        if (value[index] == 0) {
+            length = index;
+            break;
+        }
+    while (length != 0u
+        && !ksd_utf8_valid((const uint8_t *)value, length, false))
+        length--;
+    ok = append_json_string(out, value, length);
+    free(reply);
+    return ok;
 }

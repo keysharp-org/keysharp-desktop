@@ -339,6 +339,10 @@ if(BUILD_TESTING)
             $<TARGET_FILE:x11-server-tests>)
     set_tests_properties(x11-server-tests PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(x11-bench-tests tests/x11_bench_tests.c)
+    target_link_libraries(x11-bench-tests PRIVATE
+        keysharp-desktop-x11 keysharp-desktop-common)
+
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
         keysharp-desktop-common)
