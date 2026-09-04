@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "worker_pool.h"
 #include "backend_protocol.h"
 #include "capture_worker.h"
 #include "protocol.h"
@@ -34,8 +35,7 @@
 #include <unistd.h>
 
 #define KSD_POLKIT_ACTION "org.keysharp.desktop.grant"
-#define KSD_MAX_AUTHORITY_WORKERS 128u
-#define KSD_MAX_AUTHORITY_WORKERS_PER_UID 32u
+/* Both live in worker_pool.h, beside the admission rules that use them. */
 #define KSD_MAX_BACKEND_REGISTRATIONS 128u
 #define KSD_BACKEND_REGISTRATION_POLL_MS 1000
 #define KSD_GENERIC_REGISTRATION_POLL_MS 30000
@@ -119,6 +119,9 @@ typedef struct authority_client {
     authority_state *state;
     int descriptor;
     struct ucred credentials;
+    /* Set when the slot came out of the reserve held for registrations, which
+     * an ordinary connection may not keep. */
+    bool from_reserve;
 } authority_client;
 static const uint8_t public_magic[4] = {
     KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
@@ -1545,8 +1548,16 @@ static void *connection_worker(void *argument)
     authority_client *client = argument;
     uint8_t magic[4];
     if (peek_connection_magic(client->descriptor, magic)) {
-        if (memcmp(magic, ksd_backend_registration_magic,
-                   sizeof(magic)) == 0) {
+        bool registration = memcmp(magic, ksd_backend_registration_magic,
+                                   sizeof(magic)) == 0;
+        /* The kind is only known now, so this is where a slot drawn from the
+         * registration reserve is kept or given back. An ordinary connection
+         * on a reserved slot is the starvation the reserve exists to prevent,
+         * and it is closed before it can say anything. */
+        if (!ksd_authority_worker_keeps_slot(client->from_reserve,
+                                             registration)) {
+            registration = false;
+        } else if (registration) {
             handle_backend_connection(client->state, client->descriptor,
                                       &client->credentials);
         } else if (memcmp(magic, public_magic, sizeof(magic)) == 0) {
@@ -1570,25 +1581,27 @@ static void *connection_worker(void *argument)
     return NULL;
 }
 
-static bool reserve_worker(authority_state *state, uid_t uid)
+static bool reserve_worker(authority_state *state, uid_t uid,
+                           bool *from_reserve)
 {
     size_t slot = KSD_MAX_AUTHORITY_WORKERS;
+    size_t uid_workers = 0u;
     bool reserved = false;
     pthread_mutex_lock(&state->mutex);
     for (size_t index = 0u; index < KSD_MAX_AUTHORITY_WORKERS; index++) {
         if (state->worker_usage[index].count != 0u
             && state->worker_usage[index].uid == uid) {
             slot = index;
+            uid_workers = state->worker_usage[index].count;
             break;
         }
         if (slot == KSD_MAX_AUTHORITY_WORKERS
             && state->worker_usage[index].count == 0u)
             slot = index;
     }
-    if (state->workers < KSD_MAX_AUTHORITY_WORKERS
-        && slot < KSD_MAX_AUTHORITY_WORKERS
-        && state->worker_usage[slot].count
-            < KSD_MAX_AUTHORITY_WORKERS_PER_UID) {
+    if (slot < KSD_MAX_AUTHORITY_WORKERS
+        && ksd_authority_admit_worker(state->workers, uid_workers,
+                                      from_reserve)) {
         state->workers++;
         state->worker_usage[slot].uid = uid;
         state->worker_usage[slot].count++;
@@ -1656,12 +1669,13 @@ int ksd_authority_main(int argc, char **argv)
         struct ucred credentials;
         socklen_t credentials_size = sizeof(credentials);
         authority_client *client = calloc(1u, sizeof(*client));
+        bool from_reserve = false;
         if (client == NULL
             || getsockopt(connection, SOL_SOCKET, SO_PEERCRED,
                           &credentials, &credentials_size) != 0
             || credentials_size != sizeof(credentials)
             || credentials.uid == 0u
-            || !reserve_worker(&state, credentials.uid)) {
+            || !reserve_worker(&state, credentials.uid, &from_reserve)) {
             free(client);
             close(connection);
             continue;
@@ -1669,6 +1683,7 @@ int ksd_authority_main(int argc, char **argv)
         client->state = &state;
         client->descriptor = connection;
         client->credentials = credentials;
+        client->from_reserve = from_reserve;
         pthread_t worker;
         if (pthread_create(&worker, NULL, connection_worker, client) != 0) {
             pthread_mutex_lock(&state.mutex);

@@ -72,7 +72,8 @@ add_library(keysharp-desktop-common STATIC
     src/operation_result.c
     src/operation_scope.c
     src/kwin_lanes.c
-    src/kwin_envelope.c)
+    src/kwin_envelope.c
+    src/worker_pool.c)
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -344,6 +345,10 @@ if(BUILD_TESTING)
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
         keysharp-desktop-x11 keysharp-desktop-common)
+
+    add_executable(worker-pool-tests tests/worker_pool_tests.c)
+    target_link_libraries(worker-pool-tests PRIVATE keysharp-desktop-common)
+    add_test(NAME worker-pool-tests COMMAND worker-pool-tests)
 
     add_executable(kwin-envelope-tests tests/kwin_envelope_tests.c)
     target_link_libraries(kwin-envelope-tests PRIVATE keysharp-desktop-common)
