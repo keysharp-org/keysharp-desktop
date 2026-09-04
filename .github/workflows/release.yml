@@ -122,21 +122,36 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes cmake gcc pkg-config libglib2.0-dev polkitd
+          sudo apt-get install --yes \
+            cmake gcc pkg-config polkitd xvfb \
+            libglib2.0-dev libxcb1-dev libxcb-shm0-dev \
+            libwayland-dev libwayland-bin wayland-protocols
+
+      # ubuntu-24.04 ships wayland-protocols 1.34, and ext-data-control-v1 --
+      # the clipboard protocol -- arrived in 1.39. The package is data only, so
+      # a pinned checkout is cheaper and more reproducible than a PPA, and it
+      # keeps the definitions read at build time rather than vendored here.
+      - name: Fetch wayland-protocols carrying ext-data-control
+        run: >-
+          git clone --depth 1 --branch 1.39
+          https://gitlab.freedesktop.org/wayland/wayland-protocols.git
+          "$RUNNER_TEMP/wayland-protocols"
 
       - name: Configure and build
         run: |
           cmake -S . -B build-portable \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON \
+            -DKEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR="$RUNNER_TEMP/wayland-protocols"
           cmake --build build-portable --parallel
           ctest --test-dir build-portable --output-on-failure
           cmake -S . -B build-deb \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DBUILD_TESTING=OFF \
-            -DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF
+            -DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF \
+            -DKEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR="$RUNNER_TEMP/wayland-protocols"
           cmake --build build-deb --parallel
 
       - name: Assemble release files

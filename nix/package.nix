@@ -5,6 +5,10 @@
   pkg-config,
   glib,
   polkit,
+  xorg,
+  wayland,
+  wayland-scanner,
+  wayland-protocols,
   keysharpPermissions,
 }:
 
@@ -17,8 +21,19 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     cmake
     pkg-config
+    # A build tool, not a library: it turns the protocol XML into C at build
+    # time and nothing links against it.
+    wayland-scanner
   ];
-  buildInputs = [ glib ];
+  # The X11 and Wayland backends are not optional -- they are what serves window
+  # queries, clipboard reads and capture -- so their libraries are as required
+  # as glib. libxcb carries both the xcb and xcb-shm pkg-config files.
+  buildInputs = [
+    glib
+    xorg.libxcb
+    wayland
+    wayland-protocols
+  ];
 
   cmakeFlags = [
     "-DBUILD_TESTING=ON"
