@@ -236,6 +236,7 @@ static bool issue_generation(char out[KSD_KWIN_GENERATION_HEX + 1u])
 
 static bool backend_is_current(ksd_backend backend)
 {
+    (void)ksd_backend_refresh_session_environment();
     ksd_backend current = ksd_backend_resolve();
     return backend == KSD_BACKEND_GENERIC
         ? current == KSD_BACKEND_NONE : current == backend;
@@ -309,6 +310,7 @@ int ksd_daemon_main(int argc, char **argv)
     ksd_backend backend;
     bool waiting = false;
     unsigned attempts = 0u;
+    (void)ksd_backend_refresh_session_environment();
     while ((backend = ksd_backend_resolve()) == KSD_BACKEND_NONE) {
         struct timespec retry = {
             .tv_sec = KSD_BACKEND_STARTUP_RETRY_SECONDS,
@@ -339,6 +341,7 @@ int ksd_daemon_main(int argc, char **argv)
         }
         while (nanosleep(&retry, &retry) != 0 && errno == EINTR) {
         }
+        (void)ksd_backend_refresh_session_environment();
     }
     uint64_t now = ksd_monotonic_milliseconds();
     uint64_t deadline = now == 0u

@@ -47,6 +47,12 @@ registration at a time and restarts when the compositor identity changes. A
 session with no supported compositor registers the generic backend rather than
 retrying forever, then upgrades if a supported provider appears later.
 
+The user manager can survive a logout while its graphical-session environment
+is replaced for the next login. The daemon refreshes the session-defining
+variables from that live environment while waiting and while rechecking a
+registered backend, so a restart between desktops cannot pin it to the old
+desktop identity.
+
 Install and removal scripts reload the dynamic-linker cache after adding or
 removing the SONAME library. They reload systemd, enable the system socket,
 and refresh the invoking graphical user's service. Other active users refresh

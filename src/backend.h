@@ -3,9 +3,17 @@
 
 #include "keysharp_desktop/client.h"
 
+#include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
+/* Synchronize the graphical-session variables inherited by this daemon with
+ * the current systemd user-manager environment. A user manager survives
+ * logout, so a service restarted between sessions can otherwise keep the old
+ * desktop identity for its whole lifetime. */
+bool ksd_backend_refresh_session_environment(void);
+bool ksd_backend_apply_session_environment(const char *const *environment,
+                                           size_t count);
 ksd_backend ksd_backend_resolve(void);
 ksd_backend ksd_backend_resolve_process(pid_t pid);
 /* The process owning this compositor's canonical session-bus name. The caller

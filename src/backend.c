@@ -16,6 +16,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#define KSD_SYSTEMD_SERVICE "org.freedesktop.systemd1"
+#define KSD_SYSTEMD_PATH "/org/freedesktop/systemd1"
+#define KSD_SYSTEMD_MANAGER "org.freedesktop.systemd1.Manager"
+
 static GDBusConnection *get_session_bus(void)
 {
     GError *error = NULL;
@@ -24,6 +28,81 @@ static GDBusConnection *get_session_bus(void)
     if (error != NULL)
         g_error_free(error);
     return session_bus;
+}
+
+bool ksd_backend_apply_session_environment(const char *const *environment,
+                                           size_t count)
+{
+    static const char *const names[] = {
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY",
+        "DISPLAY",
+        "XAUTHORITY",
+    };
+
+    if (environment == NULL && count != 0u)
+        return false;
+    for (size_t name_index = 0u;
+         name_index < sizeof(names) / sizeof(names[0]); name_index++) {
+        const char *name = names[name_index];
+        size_t name_length = strlen(name);
+        const char *value = NULL;
+
+        for (size_t entry_index = 0u; entry_index < count; entry_index++) {
+            const char *entry = environment[entry_index];
+            if (entry != NULL && strncmp(entry, name, name_length) == 0
+                && entry[name_length] == '=') {
+                value = entry + name_length + 1u;
+                break;
+            }
+        }
+        if ((value != NULL && setenv(name, value, 1) != 0)
+            || (value == NULL && unsetenv(name) != 0))
+            return false;
+    }
+    return true;
+}
+
+bool ksd_backend_refresh_session_environment(void)
+{
+    GDBusConnection *connection = get_session_bus();
+    GError *error = NULL;
+    GVariant *reply = NULL;
+    GVariant *boxed = NULL;
+    GVariant *environment = NULL;
+    const gchar **values = NULL;
+    gsize count = 0u;
+    bool refreshed = false;
+
+    if (connection == NULL)
+        return false;
+    reply = g_dbus_connection_call_sync(connection, KSD_SYSTEMD_SERVICE,
+        KSD_SYSTEMD_PATH, "org.freedesktop.DBus.Properties", "Get",
+        g_variant_new("(ss)", KSD_SYSTEMD_MANAGER, "Environment"),
+        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
+    if (reply == NULL)
+        goto done;
+    g_variant_get(reply, "(@v)", &boxed);
+    environment = g_variant_get_variant(boxed);
+    if (!g_variant_is_of_type(environment, G_VARIANT_TYPE("as")))
+        goto done;
+    values = g_variant_get_strv(environment, &count);
+    refreshed = ksd_backend_apply_session_environment(
+        (const char *const *)values, (size_t)count);
+
+done:
+    g_free(values);
+    if (environment != NULL)
+        g_variant_unref(environment);
+    if (boxed != NULL)
+        g_variant_unref(boxed);
+    if (reply != NULL)
+        g_variant_unref(reply);
+    if (error != NULL)
+        g_error_free(error);
+    g_object_unref(connection);
+    return refreshed;
 }
 
 static bool name_has_owner(const char *name)

@@ -3,15 +3,138 @@
 #include "protocol_io.h"
 
 #include <assert.h>
+#include <gio/gio.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define TEST_BUS_ADDRESS \
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/keysharp-desktop-bus"
+#define SYSTEMD_SERVICE "org.freedesktop.systemd1"
+#define SYSTEMD_PATH "/org/freedesktop/systemd1"
+
+static const char manager_xml[] =
+    "<node>"
+    " <interface name='org.freedesktop.systemd1.Manager'>"
+    "  <property name='Environment' type='as' access='read'/>"
+    " </interface>"
+    "</node>";
+
+static const char *const manager_environment[] = {
+    "XDG_CURRENT_DESKTOP=KDE",
+    "XDG_SESSION_TYPE=wayland",
+    "WAYLAND_DISPLAY=wayland-0",
+    "DISPLAY=:1",
+    "PATH=/not-imported",
+};
+
+static GVariant *manager_property(GDBusConnection *connection,
+                                  const char *sender,
+                                  const char *object_path,
+                                  const char *interface_name,
+                                  const char *property_name,
+                                  GError **error, void *user_data)
+{
+    (void)connection;
+    (void)sender;
+    (void)object_path;
+    (void)interface_name;
+    (void)error;
+    (void)user_data;
+    assert(strcmp(property_name, "Environment") == 0);
+    return g_variant_new_strv(manager_environment,
+        (gssize)(sizeof(manager_environment) / sizeof(manager_environment[0])));
+}
+
+static const GDBusInterfaceVTable manager_vtable = {
+    .get_property = manager_property,
+};
+
+static void run_manager(int ready)
+{
+    GError *error = NULL;
+    GDBusConnection *connection;
+    GDBusNodeInfo *manager_info;
+    GVariant *reply;
+    uint32_t name_result;
+
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() == 1)
+        _exit(0);
+    connection = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    assert(connection != NULL && error == NULL);
+    reply = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus",
+        "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
+        g_variant_new("(su)", SYSTEMD_SERVICE, 0u), G_VARIANT_TYPE("(u)"),
+        G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
+    assert(reply != NULL && error == NULL);
+    g_variant_get(reply, "(u)", &name_result);
+    assert(name_result == 1u);
+    g_variant_unref(reply);
+    manager_info = g_dbus_node_info_new_for_xml(manager_xml, &error);
+    assert(manager_info != NULL && error == NULL);
+    assert(g_dbus_connection_register_object(connection, SYSTEMD_PATH,
+        manager_info->interfaces[0], &manager_vtable, NULL, NULL, &error)
+        != 0u);
+    assert(error == NULL);
+    assert(write(ready, "1", 1u) == 1);
+    close(ready);
+    GMainLoop *loop = g_main_loop_new(NULL, false);
+    assert(loop != NULL);
+    g_main_loop_run(loop);
+    _exit(0);
+}
+
+static void check_manager_environment_refresh(void)
+{
+    GTestDBus *bus = g_test_dbus_new(G_TEST_DBUS_NONE);
+    char ready_byte;
+    int ready[2];
+    int status;
+    const char *path = getenv("PATH");
+    char *saved_path = path == NULL ? NULL : strdup(path);
+
+    assert(bus != NULL && (path == NULL || saved_path != NULL));
+    g_test_dbus_up(bus);
+    assert(pipe(ready) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(ready[0]);
+        run_manager(ready[1]);
+    }
+    close(ready[1]);
+    assert(read(ready[0], &ready_byte, 1u) == 1);
+    close(ready[0]);
+
+    assert(setenv("XDG_CURRENT_DESKTOP", "GNOME", 1) == 0);
+    assert(setenv("XDG_SESSION_TYPE", "wayland", 1) == 0);
+    assert(setenv("WAYLAND_DISPLAY", "wayland-gnome", 1) == 0);
+    assert(setenv("DISPLAY", ":99", 1) == 0);
+    assert(setenv("XAUTHORITY", "/old-session", 1) == 0);
+    assert(ksd_backend_refresh_session_environment());
+    assert(strcmp(getenv("XDG_CURRENT_DESKTOP"), "KDE") == 0);
+    assert(strcmp(getenv("XDG_SESSION_TYPE"), "wayland") == 0);
+    assert(strcmp(getenv("WAYLAND_DISPLAY"), "wayland-0") == 0);
+    assert(strcmp(getenv("DISPLAY"), ":1") == 0);
+    assert(getenv("XAUTHORITY") == NULL);
+    if (saved_path != NULL)
+        assert(strcmp(getenv("PATH"), saved_path) == 0);
+    else
+        assert(getenv("PATH") == NULL);
+
+    kill(child, SIGTERM);
+    assert(waitpid(child, &status, 0) == child);
+    free(saved_path);
+    g_test_dbus_down(bus);
+    g_object_unref(bus);
+}
 
 typedef struct session_environment {
     const char *desktop;
@@ -305,6 +428,7 @@ int main(int argc, char **argv)
     check_registration_mask();
     check_registration_ack();
     check_session_type_table();
+    check_manager_environment_refresh();
     /* No longer zero: the generic backend serves what the shared Wayland
      * protocols allow a client outside the compositor to do. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC) != 0u);

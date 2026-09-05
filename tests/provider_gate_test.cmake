@@ -363,6 +363,7 @@ foreach(required
         "SO_ERROR"
         "connect_backend(deadline)"
         "ksd_backend_session_unsupported()"
+        "ksd_backend_refresh_session_environment()"
         "backend = KSD_BACKEND_GENERIC;"
         "register_backend(descriptor, backend, deadline, provider_pair[1],"
         "backend_is_current(backend)"
