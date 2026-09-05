@@ -3,6 +3,7 @@
   stdenv,
   cmake,
   pkg-config,
+  dbus,
   glib,
   polkit,
   xorg,
@@ -22,6 +23,8 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     cmake
     pkg-config
+    # GTestDBus starts dbus-daemon for the portal capture integration test.
+    dbus
     # A build tool, not a library: it turns the protocol XML into C at build
     # time and nothing links against it.
     wayland-scanner

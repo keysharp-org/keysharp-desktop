@@ -795,7 +795,7 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "client_abi_minor=7")
+        PASS_REGULAR_EXPRESSION "client_abi_minor=8")
     add_test(NAME unknown-command-rejected
         COMMAND keysharp-desktop unknown-command)
     set_tests_properties(unknown-command-rejected PROPERTIES WILL_FAIL TRUE)
