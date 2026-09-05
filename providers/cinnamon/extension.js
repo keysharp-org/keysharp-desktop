@@ -11,6 +11,302 @@ const CinnamonCairoGI = imports.gi.cairo;
 const CinnamonMain = imports.ui.main;
 const CinnamonByteArray = imports.byteArray;
 
+const LAUNCHER_ENTRY_IFACE = 'com.canonical.Unity.LauncherEntry';
+const GROUPED_WINDOW_LIST_UUID = 'grouped-window-list@cinnamon.org';
+const LAUNCHER_ATTENTION_CLASS = 'grouped-window-list-item-demands-attention';
+
+class CinnamonLauncherEntryBridge {
+    constructor() {
+        this._entries = new Map();
+        this._serial = 0;
+        this._updateSignalId = 0;
+        this._nameWatchId = 0;
+        this._windowCreatedId = 0;
+        this._workspaceChangedId = 0;
+        this._applySourceId = 0;
+    }
+
+    enable() {
+        try {
+            this._updateSignalId = CinnamonGio.DBus.session.signal_subscribe(
+                null,
+                LAUNCHER_ENTRY_IFACE,
+                'Update',
+                null,
+                null,
+                CinnamonGio.DBusSignalFlags.NONE,
+                (_connection, sender, _path, _iface, _signal, parameters) =>
+                    this._onUpdate(sender, parameters));
+            this._nameWatchId = CinnamonGio.DBus.session.signal_subscribe(
+                'org.freedesktop.DBus',
+                'org.freedesktop.DBus',
+                'NameOwnerChanged',
+                '/org/freedesktop/DBus',
+                null,
+                CinnamonGio.DBusSignalFlags.NONE,
+                (_connection, _sender, _path, _iface, _signal, parameters) =>
+                    this._onNameOwnerChanged(parameters));
+            this._windowCreatedId = global.display.connect('window-created', () =>
+                this._scheduleApply(50));
+            this._workspaceChangedId = global.workspace_manager.connect(
+                'active-workspace-changed', () => this._scheduleApply());
+        } catch (e) {
+            global.logError(e, 'Keysharp: could not start LauncherEntry integration');
+            this.disable();
+        }
+    }
+
+    disable() {
+        if (this._applySourceId !== 0) {
+            try { CinnamonGLib.source_remove(this._applySourceId); } catch (_e) {}
+            this._applySourceId = 0;
+        }
+        if (this._updateSignalId !== 0) {
+            try { CinnamonGio.DBus.session.signal_unsubscribe(this._updateSignalId); } catch (_e) {}
+            this._updateSignalId = 0;
+        }
+        if (this._nameWatchId !== 0) {
+            try { CinnamonGio.DBus.session.signal_unsubscribe(this._nameWatchId); } catch (_e) {}
+            this._nameWatchId = 0;
+        }
+        if (this._windowCreatedId !== 0) {
+            try { global.display.disconnect(this._windowCreatedId); } catch (_e) {}
+            this._windowCreatedId = 0;
+        }
+        if (this._workspaceChangedId !== 0) {
+            try { global.workspace_manager.disconnect(this._workspaceChangedId); } catch (_e) {}
+            this._workspaceChangedId = 0;
+        }
+
+        this._entries.clear();
+        this._apply();
+    }
+
+    _onUpdate(sender, parameters) {
+        try {
+            const [uri, rawProperties] = parameters.deep_unpack();
+            const desktopId = this._normalizeDesktopId(uri);
+            if (!sender || !desktopId || rawProperties === null
+                || typeof rawProperties !== 'object')
+                return;
+
+            const key = `${sender}\u0000${desktopId}`;
+            const previous = this._entries.get(key) || {
+                sender,
+                desktopId,
+                count: 0,
+                countVisible: false,
+                progress: 0,
+                progressVisible: false,
+                urgent: false,
+            };
+            const value = name => this._variantValue(rawProperties[name]);
+
+            if (Object.prototype.hasOwnProperty.call(rawProperties, 'count'))
+                previous.count = Number(value('count'));
+            if (Object.prototype.hasOwnProperty.call(rawProperties, 'count-visible'))
+                previous.countVisible = Boolean(value('count-visible'));
+            if (Object.prototype.hasOwnProperty.call(rawProperties, 'progress'))
+                previous.progress = Number(value('progress'));
+            if (Object.prototype.hasOwnProperty.call(rawProperties, 'progress-visible'))
+                previous.progressVisible = Boolean(value('progress-visible'));
+            if (Object.prototype.hasOwnProperty.call(rawProperties, 'urgent'))
+                previous.urgent = Boolean(value('urgent'));
+
+            previous.serial = ++this._serial;
+            this._entries.set(key, previous);
+            this._scheduleApply();
+        } catch (e) {
+            global.logError(e, 'Keysharp: invalid LauncherEntry update');
+        }
+    }
+
+    _onNameOwnerChanged(parameters) {
+        let name, oldOwner, newOwner;
+        try {
+            [name, oldOwner, newOwner] = parameters.deep_unpack();
+        } catch (_e) {
+            return;
+        }
+        if (!name || !oldOwner || newOwner)
+            return;
+
+        let removed = false;
+        for (const [key, entry] of this._entries.entries()) {
+            if (entry.sender === name) {
+                this._entries.delete(key);
+                removed = true;
+            }
+        }
+        if (removed)
+            this._scheduleApply();
+    }
+
+    _variantValue(value) {
+        let result = value;
+        for (let depth = 0; depth < 2
+                && result && typeof result.deep_unpack === 'function'; depth++)
+            result = result.deep_unpack();
+        return result;
+    }
+
+    _normalizeDesktopId(value) {
+        let id = String(value || '').trim();
+        if (id.toLowerCase().startsWith('application://'))
+            id = id.substring('application://'.length);
+        try { id = decodeURIComponent(id); } catch (_e) {}
+        if (id.toLowerCase().endsWith('.desktop'))
+            id = id.substring(0, id.length - '.desktop'.length);
+        return id.toLowerCase();
+    }
+
+    _scheduleApply(delay = 0) {
+        if (this._applySourceId !== 0)
+            return;
+        this._applySourceId = CinnamonGLib.timeout_add(
+            CinnamonGLib.PRIORITY_DEFAULT, delay, () => {
+                this._applySourceId = 0;
+                this._apply();
+                return CinnamonGLib.SOURCE_REMOVE;
+            });
+    }
+
+    _currentEntries() {
+        const current = new Map();
+        for (const entry of this._entries.values()) {
+            const prior = current.get(entry.desktopId);
+            if (!prior || prior.serial < entry.serial)
+                current.set(entry.desktopId, entry);
+        }
+        return current;
+    }
+
+    _appGroups() {
+        const groups = [];
+        try {
+            const applets = CinnamonMain.AppletManager.getRunningInstancesForUuid(
+                GROUPED_WINDOW_LIST_UUID) || [];
+            for (const applet of applets) {
+                for (const workspace of (applet.workspaces || [])) {
+                    for (const group of (workspace.appGroups || [])) {
+                        if (group && group.groupState && !group.groupState.willUnmount)
+                            groups.push(group);
+                    }
+                }
+            }
+        } catch (e) {
+            global.logError(e, 'Keysharp: could not find Cinnamon taskbar buttons');
+        }
+        return groups;
+    }
+
+    _entryForGroup(group, current) {
+        const ids = [group.groupState.appId];
+        for (const win of (group.groupState.metaWindows || [])) {
+            try { ids.push(win.get_gtk_application_id()); } catch (_e) {}
+            try { ids.push(win.get_wm_class()); } catch (_e) {}
+            try { ids.push(win.get_wm_class_instance()); } catch (_e) {}
+        }
+        for (const value of ids) {
+            const entry = current.get(this._normalizeDesktopId(value));
+            if (entry)
+                return entry;
+        }
+        return null;
+    }
+
+    _apply() {
+        const current = this._currentEntries();
+        for (const group of this._appGroups()) {
+            const entry = this._entryForGroup(group, current);
+            if (entry)
+                this._applyToGroup(group, entry);
+            else
+                this._clearGroup(group);
+        }
+    }
+
+    _applyToGroup(group, entry) {
+        group.__launcherEntryDesktopId = entry.desktopId;
+
+        if (entry.countVisible && Number.isFinite(entry.count)) {
+            group.notificationsBadgeLabel.text = String(Math.trunc(entry.count));
+            group.notificationsBadge.show();
+            group.__launcherEntryBadge = true;
+        } else if (group.__launcherEntryBadge) {
+            group.__launcherEntryBadge = false;
+            if (typeof group.updateNotificationsBadge === 'function')
+                group.updateNotificationsBadge();
+            else
+                group.notificationsBadge.hide();
+        }
+
+        if (entry.progressVisible && Number.isFinite(entry.progress)) {
+            group.progress = Math.max(0, Math.min(100, entry.progress * 100));
+            if (group.progress > 0)
+                group.progressOverlay.show();
+            else
+                group.progressOverlay.hide();
+            group.actor.queue_relayout();
+            group.__launcherEntryProgress = true;
+        } else if (group.__launcherEntryProgress) {
+            this._restoreProgress(group);
+        }
+
+        if (entry.urgent && !group.__launcherEntryUrgent) {
+            group.__launcherEntryUrgentHadClass = group.actor.has_style_class_name(
+                LAUNCHER_ATTENTION_CLASS);
+            group.actor.add_style_class_name(LAUNCHER_ATTENTION_CLASS);
+            group.__launcherEntryUrgent = true;
+        } else if (!entry.urgent && group.__launcherEntryUrgent) {
+            this._restoreUrgency(group);
+        }
+    }
+
+    _restoreProgress(group) {
+        group.__launcherEntryProgress = false;
+        let total = 0;
+        let count = 0;
+        for (const win of (group.groupState.metaWindows || [])) {
+            const progress = Number(win.progress);
+            if (Number.isFinite(progress) && progress >= 1) {
+                total += progress;
+                count++;
+            }
+        }
+        group.progress = count === 0 ? 0 : total / count;
+        if (group.progress > 0)
+            group.progressOverlay.show();
+        else
+            group.progressOverlay.hide();
+        group.actor.queue_relayout();
+    }
+
+    _restoreUrgency(group) {
+        if (!group.__launcherEntryUrgentHadClass)
+            group.actor.remove_style_class_name(LAUNCHER_ATTENTION_CLASS);
+        group.__launcherEntryUrgent = false;
+        group.__launcherEntryUrgentHadClass = false;
+    }
+
+    _clearGroup(group) {
+        if (!group.__launcherEntryDesktopId)
+            return;
+        if (group.__launcherEntryBadge) {
+            group.__launcherEntryBadge = false;
+            if (typeof group.updateNotificationsBadge === 'function')
+                group.updateNotificationsBadge();
+            else
+                group.notificationsBadge.hide();
+        }
+        if (group.__launcherEntryProgress)
+            this._restoreProgress(group);
+        if (group.__launcherEntryUrgent)
+            this._restoreUrgency(group);
+        group.__launcherEntryDesktopId = null;
+    }
+}
+
 function workArea() {
     try {
         const workspace = global.workspace_manager.get_active_workspace();
@@ -2739,6 +3035,7 @@ class KeysharpExtensionCore {
 
 const KeysharpExtension = KeysharpExtensionCore;
 let extension = null;
+let launcherEntryBridge = null;
 
 function init(_metadata) {
 }
@@ -2746,9 +3043,15 @@ function init(_metadata) {
 function enable() {
     extension = new KeysharpExtension();
     extension.enable();
+    launcherEntryBridge = new CinnamonLauncherEntryBridge();
+    launcherEntryBridge.enable();
 }
 
 function disable() {
+    if (launcherEntryBridge !== null) {
+        launcherEntryBridge.disable();
+        launcherEntryBridge = null;
+    }
     if (extension !== null) {
         extension.disable();
         extension = null;

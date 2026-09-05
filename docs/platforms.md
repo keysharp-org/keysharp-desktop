@@ -42,6 +42,13 @@ KWin capture needs
 a `kwin_wayland` compositor: a KDE X11 session resolves to the X11 backend, which
 serves capture from the X server itself.
 
+The GNOME extension consumes the standard Unity `LauncherEntry` signal and maps
+its count, progress and urgent state onto the stock overview dash. Dash to Dock
+and Ubuntu Dock consume that protocol themselves. The Cinnamon extension maps
+the same state onto the grouped-window-list. Plasma's task manager also consumes
+the protocol natively, so the KWin provider does not duplicate it.
+This integration is application-wide and does not add a client ABI operation.
+
 On any other compositor - sway, Hyprland, COSMIC, niri, river and the rest -
 the service registers the generic backend. Its operation mask is assembled from
 the protocols the live compositor actually advertises:
