@@ -8,10 +8,21 @@
 
 #include <gio/gio.h>
 #include <glib-unix.h>
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 #define KSD_KWIN_BUS_NAME "io.github.keysharp.KWinProvider1"
 #define KSD_KWIN_BUS_PATH "/io/github/keysharp/KWinProvider"
+#define KSD_KWIN_COMPOSITOR_NAME "org.kde.KWin"
+#define KSD_KWIN_SCRIPTING_PATH "/Scripting"
+#define KSD_KWIN_SCRIPTING_INTERFACE "org.kde.kwin.Scripting"
+#define KSD_KWIN_SCRIPT_ID "io.github.keysharp.desktop.kwin"
+#define KSD_KWIN_COMPOSITOR_RECHECK_SECONDS 2u
+#ifndef KSD_KWIN_SCRIPT_PATH
+#define KSD_KWIN_SCRIPT_PATH \
+    "/usr/share/kwin/scripts/io.github.keysharp.desktop.kwin/contents/code/main.js"
+#endif
 
 /* Kept in step with interfaces/private/io.github.keysharp.KWinProvider1.xml,
  * which the XML gate parses and holds to four methods of one signature. This
@@ -44,9 +55,8 @@ static const char introspection[] =
 
 struct ksd_kwin_bus {
     ksd_kwin_host *host;
-    /* The unique name of the script, learned from the first call that carries
-     * the right generation, and required to match on every call after. Empty
-     * until then. */
+    /* The unique bus owner of org.kde.KWin. Every script call is pinned to it,
+     * so another process in the session cannot take the provider channel. */
     char peer[64];
     uid_t uid;
     GDBusNodeInfo *node;
@@ -66,30 +76,72 @@ struct ksd_kwin_bus {
      * the queue is that a cheap verb need not wait behind an enumeration. */
     int relay;
     guint relay_source;
+    guint compositor_source;
     struct {
         bool active;
         uint64_t request_id;
+        uint16_t opcode;
         char sequence[KSD_KWIN_SEQ_HEX + 1u];
     } inflight[KSD_KWIN_MAX_JOBS];
 };
 
+static bool compositor_owner(char peer[64])
+{
+    GError *error = NULL;
+    GDBusConnection *connection =
+        g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
+    GVariant *reply = NULL;
+    const char *owner = NULL;
+    bool valid = false;
+
+    if (connection != NULL) {
+        reply = g_dbus_connection_call_sync(connection,
+            "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetNameOwner",
+            g_variant_new("(s)", KSD_KWIN_COMPOSITOR_NAME),
+            G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 2000, NULL,
+            &error);
+    }
+    if (reply != NULL) {
+        g_variant_get(reply, "(&s)", &owner);
+        if (g_dbus_is_unique_name(owner) && strlen(owner) < 64u) {
+            memcpy(peer, owner, strlen(owner) + 1u);
+            valid = true;
+        }
+        g_variant_unref(reply);
+    }
+    g_clear_error(&error);
+    if (connection != NULL)
+        g_object_unref(connection);
+    return valid;
+}
+
 /* Writes one response frame back to the authority. */
 static void relay_answer(ksd_kwin_bus *bus, uint64_t request_id,
-                         uint32_t status, const uint8_t *body,
+                         uint16_t opcode, uint32_t status, const uint8_t *body,
                          uint32_t body_length)
 {
     ksd_frame frame;
     ksd_buffer packed;
     ksd_buffer payload;
+    ksd_buffer translated;
+
+    ksd_buffer_init(&translated, KSD_MAX_TEXT_BYTES + 4u);
+    if (status == KSD_STATUS_OK
+        && !ksd_kwin_response_payload(opcode, body, body_length,
+                                      &translated))
+        status = KSD_STATUS_INTERNAL;
 
     /* The status rides in the payload, not the header: a frame carries no
      * status field, and the rest of this service already answers with an
      * eight-byte status and detail prologue ahead of the tail. One shape. */
-    ksd_buffer_init(&payload, body_length + 8u);
+    ksd_buffer_init(&payload, translated.length + 8u);
     if (!ksd_buffer_u32(&payload, status) || !ksd_buffer_u32(&payload, 0u)
-        || (body_length != 0u
-            && !ksd_buffer_bytes(&payload, body, body_length))) {
+        || (status == KSD_STATUS_OK && translated.length != 0u
+            && !ksd_buffer_bytes(&payload, translated.data,
+                                 translated.length))) {
         ksd_buffer_clear(&payload);
+        ksd_buffer_clear(&translated);
         return;
     }
     memset(&frame, 0, sizeof(frame));
@@ -107,6 +159,7 @@ static void relay_answer(ksd_kwin_bus *bus, uint64_t request_id,
         (void)ksd_write_all(bus->relay, packed.data, packed.length);
     ksd_buffer_clear(&packed);
     ksd_buffer_clear(&payload);
+    ksd_buffer_clear(&translated);
 }
 
 /* Answers every relayed request whose job the script has now reported. Called
@@ -123,8 +176,8 @@ static void relay_drain(ksd_kwin_bus *bus)
         if (!ksd_kwin_host_result(bus->host, bus->inflight[index].sequence,
                                   &status, &body, &body_length))
             continue;
-        relay_answer(bus, bus->inflight[index].request_id, status, body,
-                     body_length);
+        relay_answer(bus, bus->inflight[index].request_id,
+                     bus->inflight[index].opcode, status, body, body_length);
         ksd_kwin_host_release(bus->host, bus->inflight[index].sequence);
         bus->inflight[index].active = false;
     }
@@ -219,31 +272,19 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
     g_variant_get(parameters, "(&s&s)", &generation, &envelope);
     ksd_buffer_init(&reply, 65536u);
 
-    /* Exactly one peer is ever legitimate on this interface, and until now the
-     * sender was discarded -- ksd_kwin_peer_allowed existed and was never
-     * applied, so any process on the session bus could have driven the
-     * channel. The first caller presenting the right generation is taken as
-     * the script; every later call must be the same connection.
-     *
-     * The generation is what makes that safe to learn rather than configure:
-     * it is 32 random hex digits this daemon issued and told nobody else, so
-     * a caller that has it has been through Hello on this run. */
-    if (sender != NULL && generation != NULL) {
-        if (bus->peer[0] == 0) {
-            if (g_strcmp0(generation,
-                          ksd_kwin_host_generation(bus->host)) == 0) {
-                g_strlcpy(bus->peer, sender, sizeof(bus->peer));
-                bus->uid = getuid();
-            }
-        } else if (!ksd_kwin_peer_allowed(bus->peer, sender, bus->uid,
-                                          bus->uid, generation,
-                                          ksd_kwin_host_generation(bus->host))) {
-            g_dbus_method_invocation_return_error_literal(invocation,
-                G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
-                "not the script this daemon is talking to");
-            ksd_buffer_clear(&reply);
-            return;
-        }
+    bool hello = g_strcmp0(method, "Hello") == 0;
+    bool allowed = sender != NULL && generation != NULL
+        && strcmp(bus->peer, sender) == 0
+        && (hello ? generation[0] == '\0'
+                  : ksd_kwin_peer_allowed(bus->peer, sender, bus->uid,
+                        bus->uid, ksd_kwin_host_generation(bus->host),
+                        generation));
+    if (!allowed) {
+        g_dbus_method_invocation_return_error_literal(invocation,
+            G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
+            "not the KWin compositor this daemon is serving");
+        ksd_buffer_clear(&reply);
+        return;
     }
     (void)connection;
 
@@ -330,6 +371,47 @@ static void on_bus_acquired(GDBusConnection *connection, const gchar *name,
     }
 }
 
+static bool scripting_call(GDBusConnection *connection, const char *method,
+                           GVariant *parameters)
+{
+    GError *error = NULL;
+    GVariant *reply = g_dbus_connection_call_sync(connection,
+        KSD_KWIN_COMPOSITOR_NAME, KSD_KWIN_SCRIPTING_PATH,
+        KSD_KWIN_SCRIPTING_INTERFACE, method, parameters, NULL,
+        G_DBUS_CALL_FLAGS_NONE, (gint)KSD_KWIN_SCRIPTING_PROBE_MS, NULL,
+        &error);
+    bool succeeded = reply != NULL;
+
+    if (reply != NULL)
+        g_variant_unref(reply);
+    if (error != NULL) {
+        g_printerr("keysharp-desktop daemon: KWin script %s failed: %s\n",
+                   method, error->message);
+        g_error_free(error);
+    }
+    return succeeded;
+}
+
+static void on_name_acquired(GDBusConnection *connection, const gchar *name,
+                             gpointer data)
+{
+    (void)name;
+    (void)data;
+    /* A loaded KWin script is not started again by Scripting.start(). It may
+     * have sent Hello before this daemon owned its name, or may still carry a
+     * generation from the previous daemon. Reloading after name acquisition
+     * gives it one deterministic handshake point and removes both races. */
+    bool unloaded = scripting_call(connection, "unloadScript",
+        g_variant_new("(s)", KSD_KWIN_SCRIPT_ID));
+    bool loaded = scripting_call(connection, "loadScript",
+        g_variant_new("(ss)", KSD_KWIN_SCRIPT_PATH, KSD_KWIN_SCRIPT_ID));
+    bool started = loaded && scripting_call(connection, "start", NULL);
+
+    if (!unloaded || !loaded || !started)
+        g_printerr("keysharp-desktop daemon: could not restart the KWin"
+                   " provider script; window operations may be unavailable\n");
+}
+
 static void on_name_lost(GDBusConnection *connection, const gchar *name,
                          gpointer data)
 {
@@ -354,8 +436,13 @@ ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay)
         return NULL;
     bus = g_new0(ksd_kwin_bus, 1);
     bus->host = host;
+    bus->uid = getuid();
     bus->authority = -1;
     bus->relay = relay;
+    if (!compositor_owner(bus->peer)) {
+        g_free(bus);
+        return NULL;
+    }
     bus->node = g_dbus_node_info_new_for_xml(introspection, &error);
     if (bus->node == NULL) {
         g_printerr("keysharp-desktop daemon: bad KWin introspection: %s\n",
@@ -370,9 +457,175 @@ ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay)
      * channel out from under a script mid-job. */
     bus->name_id = g_bus_own_name(G_BUS_TYPE_SESSION, KSD_KWIN_BUS_NAME,
                                   G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE,
-                                  on_bus_acquired, NULL, on_name_lost, bus,
-                                  NULL);
+                                  on_bus_acquired, on_name_acquired,
+                                  on_name_lost, bus, NULL);
     return bus;
+}
+
+/* The public socket protocol is binary, while the KWin script channel is a
+ * D-Bus string. Translate the small fixed request records at that boundary so
+ * a zero byte in a handle or coordinate cannot truncate a script job. */
+bool ksd_kwin_request_text(uint16_t opcode, const uint8_t *payload,
+                           uint32_t payload_length, char *text,
+                           size_t capacity, uint32_t *text_length)
+{
+    int written = -1;
+
+    if (text == NULL || capacity == 0u || text_length == NULL)
+        return false;
+    if (opcode == KSD_OP_WINDOW_HANDLES || opcode == KSD_OP_WINDOW_ACTIVE
+        || opcode == KSD_OP_CURSOR_POSITION || opcode == KSD_OP_WORK_AREA) {
+        if (payload_length != 0u)
+            return false;
+        text[0] = '\0';
+        *text_length = 0u;
+        return true;
+    }
+    if (payload == NULL)
+        return false;
+    if (opcode == KSD_OP_WINDOW_LIST) {
+        if (payload_length != 8u || ksd_decode_u32(payload) > 1u
+            || ksd_decode_u32(payload + 4u) != 0u)
+            return false;
+        written = snprintf(text, capacity, "%u", ksd_decode_u32(payload));
+    } else if (opcode == KSD_OP_WINDOW_FOCUS
+               || opcode == KSD_OP_WINDOW_RAISE
+               || opcode == KSD_OP_WINDOW_LOWER
+               || opcode == KSD_OP_WINDOW_CLOSE) {
+        if (payload_length != 8u || ksd_decode_u64(payload) == 0u)
+            return false;
+        written = snprintf(text, capacity, "%llu",
+            (unsigned long long)ksd_decode_u64(payload));
+    } else if (opcode == KSD_OP_WINDOW_MOVE_RESIZE) {
+        if (payload_length != 24u || ksd_decode_u64(payload) == 0u)
+            return false;
+        written = snprintf(text, capacity, "%llu %d %d %u %u",
+            (unsigned long long)ksd_decode_u64(payload),
+            (int32_t)ksd_decode_u32(payload + 8u),
+            (int32_t)ksd_decode_u32(payload + 12u),
+            ksd_decode_u32(payload + 16u),
+            ksd_decode_u32(payload + 20u));
+    } else if (opcode == KSD_OP_WINDOW_SET_STATE
+               || opcode == KSD_OP_WINDOW_SET_OPACITY
+               || opcode == KSD_OP_WINDOW_SET_ABOVE
+               || opcode == KSD_OP_WINDOW_SET_DECORATED
+               || opcode == KSD_OP_WINDOW_SET_SKIP_TASKBAR) {
+        uint32_t value;
+        uint32_t maximum;
+
+        if (payload_length != 16u || ksd_decode_u64(payload) == 0u
+            || ksd_decode_u32(payload + 12u) != 0u)
+            return false;
+        value = ksd_decode_u32(payload + 8u);
+        maximum = opcode == KSD_OP_WINDOW_SET_OPACITY ? 255u
+            : opcode == KSD_OP_WINDOW_SET_STATE ? 2u : 1u;
+        if (value > maximum)
+            return false;
+        written = snprintf(text, capacity, "%llu %u",
+            (unsigned long long)ksd_decode_u64(payload), value);
+    } else {
+        return false;
+    }
+    if (written < 0 || (size_t)written >= capacity)
+        return false;
+    *text_length = (uint32_t)written;
+    return true;
+}
+
+static bool parse_point(const uint8_t *body, uint32_t body_length,
+                        int32_t *x, int32_t *y)
+{
+    char text[128];
+    long long parsed_x;
+    long long parsed_y;
+    int consumed = 0;
+
+    if (body == NULL || body_length == 0u || body_length >= sizeof(text))
+        return false;
+    memcpy(text, body, body_length);
+    text[body_length] = '\0';
+    if (sscanf(text, "{\"x\":%lld,\"y\":%lld}%n", &parsed_x,
+               &parsed_y, &consumed) != 2
+        || consumed != (int)body_length
+        || parsed_x < INT32_MIN || parsed_x > INT32_MAX
+        || parsed_y < INT32_MIN || parsed_y > INT32_MAX)
+        return false;
+    *x = (int32_t)parsed_x;
+    *y = (int32_t)parsed_y;
+    return true;
+}
+
+static bool parse_area(const uint8_t *body, uint32_t body_length,
+                       int32_t *x, int32_t *y, int32_t *width,
+                       int32_t *height)
+{
+    char text[192];
+    long long parsed_x;
+    long long parsed_y;
+    long long parsed_width;
+    long long parsed_height;
+    int consumed = 0;
+
+    if (body == NULL || body_length == 0u || body_length >= sizeof(text))
+        return false;
+    memcpy(text, body, body_length);
+    text[body_length] = '\0';
+    if (sscanf(text,
+               "{\"x\":%lld,\"y\":%lld,\"width\":%lld,\"height\":%lld}%n",
+               &parsed_x, &parsed_y, &parsed_width, &parsed_height,
+               &consumed) != 4
+        || consumed != (int)body_length
+        || parsed_x < INT32_MIN || parsed_x > INT32_MAX
+        || parsed_y < INT32_MIN || parsed_y > INT32_MAX
+        || parsed_width <= 0 || parsed_width > INT32_MAX
+        || parsed_height <= 0 || parsed_height > INT32_MAX)
+        return false;
+    *x = (int32_t)parsed_x;
+    *y = (int32_t)parsed_y;
+    *width = (int32_t)parsed_width;
+    *height = (int32_t)parsed_height;
+    return true;
+}
+
+bool ksd_kwin_response_payload(uint16_t opcode, const uint8_t *body,
+                               uint32_t body_length, ksd_buffer *payload)
+{
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+
+    if (payload == NULL || (body == NULL && body_length != 0u))
+        return false;
+    if (opcode == KSD_OP_WINDOW_LIST || opcode == KSD_OP_WINDOW_HANDLES
+        || opcode == KSD_OP_WINDOW_ACTIVE) {
+        return body_length <= KSD_MAX_TEXT_BYTES
+            && ksd_utf8_valid(body, body_length, false)
+            && ksd_buffer_u32(payload, body_length)
+            && ksd_buffer_bytes(payload, body, body_length);
+    }
+    if (opcode == KSD_OP_CURSOR_POSITION) {
+        return parse_point(body, body_length, &x, &y)
+            && ksd_buffer_u32(payload, (uint32_t)x)
+            && ksd_buffer_u32(payload, (uint32_t)y);
+    }
+    if (opcode == KSD_OP_WORK_AREA) {
+        return parse_area(body, body_length, &x, &y, &width, &height)
+            && ksd_buffer_u32(payload, (uint32_t)x)
+            && ksd_buffer_u32(payload, (uint32_t)y)
+            && ksd_buffer_u32(payload, (uint32_t)width)
+            && ksd_buffer_u32(payload, (uint32_t)height);
+    }
+    if (opcode == KSD_OP_WINDOW_FOCUS || opcode == KSD_OP_WINDOW_RAISE
+        || opcode == KSD_OP_WINDOW_LOWER || opcode == KSD_OP_WINDOW_CLOSE
+        || opcode == KSD_OP_WINDOW_MOVE_RESIZE
+        || opcode == KSD_OP_WINDOW_SET_STATE
+        || opcode == KSD_OP_WINDOW_SET_OPACITY
+        || opcode == KSD_OP_WINDOW_SET_ABOVE
+        || opcode == KSD_OP_WINDOW_SET_DECORATED
+        || opcode == KSD_OP_WINDOW_SET_SKIP_TASKBAR)
+        return body_length == 0u;
+    return false;
 }
 
 /* One relayed request from the authority: queue it for the script, and wake
@@ -388,6 +641,8 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
     uint64_t request_id;
     uint16_t opcode;
     char sequence[KSD_KWIN_SEQ_HEX + 1u];
+    char text_body[160];
+    uint32_t text_length = 0u;
     size_t slot = KSD_KWIN_MAX_JOBS;
 
     (void)descriptor;
@@ -414,6 +669,13 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
             return G_SOURCE_REMOVE;
         }
     }
+    if (!ksd_kwin_request_text(opcode, body, payload_length, text_body,
+                               sizeof(text_body), &text_length)) {
+        relay_answer(bus, request_id, opcode, KSD_STATUS_INVALID_REQUEST,
+                     NULL, 0u);
+        g_free(body);
+        return G_SOURCE_CONTINUE;
+    }
     for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
         if (!bus->inflight[index].active) {
             slot = index;
@@ -423,17 +685,18 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
     /* Both refusals are BUSY rather than a failure: neither reached the
      * compositor, so the caller may retry safely. */
     if (slot == KSD_KWIN_MAX_JOBS
-        || !ksd_kwin_host_submit(bus->host, opcode, body,
-                                 payload_length,
+        || !ksd_kwin_host_submit(bus->host, opcode,
+                                 (const uint8_t *)text_body, text_length,
                                  (uint64_t)g_get_monotonic_time() / 1000u,
                                  sequence)) {
-        relay_answer(bus, request_id, KSD_STATUS_BUSY, NULL, 0u);
+        relay_answer(bus, request_id, opcode, KSD_STATUS_BUSY, NULL, 0u);
         g_free(body);
         return G_SOURCE_CONTINUE;
     }
     g_free(body);
     bus->inflight[slot].active = true;
     bus->inflight[slot].request_id = request_id;
+    bus->inflight[slot].opcode = opcode;
     memcpy(bus->inflight[slot].sequence, sequence, sizeof(sequence));
     /* The lane this job belongs to may have a poll parked on it. Releasing it
      * now is what makes a submitted job leave promptly instead of waiting out
@@ -457,12 +720,29 @@ static gboolean authority_readable(gint descriptor, GIOCondition condition,
     return G_SOURCE_REMOVE;
 }
 
+static gboolean compositor_current(gpointer data)
+{
+    ksd_kwin_bus *bus = data;
+    char owner[64] = { 0 };
+
+    if (compositor_owner(owner) && strcmp(owner, bus->peer) == 0)
+        return G_SOURCE_CONTINUE;
+    bus->compositor_source = 0u;
+    g_printerr("keysharp-desktop daemon: KWin compositor changed;"
+               " restarting the session backend\n");
+    if (bus->loop != NULL)
+        g_main_loop_quit(bus->loop);
+    return G_SOURCE_REMOVE;
+}
+
 int ksd_kwin_bus_run(ksd_kwin_bus *bus, int descriptor)
 {
     if (bus == NULL)
         return 1;
     bus->authority = descriptor;
     bus->loop = g_main_loop_new(NULL, FALSE);
+    bus->compositor_source = g_timeout_add_seconds(
+        KSD_KWIN_COMPOSITOR_RECHECK_SECONDS, compositor_current, bus);
     if (bus->relay >= 0)
         bus->relay_source = g_unix_fd_add(bus->relay,
             G_IO_IN | G_IO_HUP | G_IO_ERR, relay_readable, bus);
@@ -476,6 +756,8 @@ void ksd_kwin_bus_stop(ksd_kwin_bus *bus)
 {
     if (bus == NULL)
         return;
+    if (bus->compositor_source != 0u)
+        g_source_remove(bus->compositor_source);
     for (size_t slot = 0u; slot < KSD_KWIN_LANES; slot++) {
         if (bus->idle_source[slot] != 0u)
             g_source_remove(bus->idle_source[slot]);

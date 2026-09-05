@@ -277,6 +277,9 @@ foreach(required
         "ksd_backend_registration_magic"
         "registered_backend"
         "query_provider_pid(peer->uid, peer->gid, backend,"
+        "backend == KSD_BACKEND_KWIN"
+        "trusted_provider_process(backend, &provider_identity)"
+        "\"kwin_wayland\""
         "setresuid(uid, uid, uid)"
         "fexecve(4, arguments, environment)"
         "ksd_install_socket_path"
@@ -353,7 +356,9 @@ foreach(required
         "connect_backend(deadline)"
         "ksd_backend_session_unsupported()"
         "backend = KSD_BACKEND_GENERIC;"
-        "register_backend(descriptor, backend, deadline, provider_pair[1],")
+        "register_backend(descriptor, backend, deadline, provider_pair[1],"
+        "backend_is_current(backend)"
+        "KSD_BACKEND_RECHECK_MILLISECONDS")
     string(FIND "${session_backend}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
@@ -361,19 +366,46 @@ foreach(required
     endif()
 endforeach()
 
+file(READ "${SOURCE_DIR}/src/kwin_bus.c" kwin_bus)
+foreach(required
+        "GetNameOwner"
+        "KSD_KWIN_COMPOSITOR_NAME"
+        "strcmp(bus->peer, sender) == 0"
+        "compositor_owner(owner)"
+        "KSD_KWIN_COMPOSITOR_RECHECK_SECONDS"
+        "on_name_acquired"
+        "\"unloadScript\""
+        "\"loadScript\""
+        "KSD_KWIN_SCRIPT_PATH")
+    string(FIND "${kwin_bus}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "KWin compositor identity or lifetime gate is missing: ${required}")
+    endif()
+endforeach()
+
 file(READ "${SOURCE_DIR}/src/backend.c" backend_selection)
 foreach(required
-        "kwin_wayland_owner()"
         "ksd_backend_session_unsupported"
         "ksd_backend_provider_pid"
+        "name_has_owner(\"org.kde.KWin\")"
+        "ksd_session_is_wayland_process(getpid())"
         "org.gnome.Shell"
         "org.Cinnamon"
-        "backend == KSD_BACKEND_GENERIC"
-        "strcmp(basename, \"kwin_wayland\") == 0")
+        "backend == KSD_BACKEND_GENERIC")
     string(FIND "${backend_selection}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
             "KWin backend selection is not Wayland-gated: ${required}")
+    endif()
+endforeach()
+foreach(forbidden
+        "/proc/%u/exe"
+        "readlink(proc_path")
+    string(FIND "${backend_selection}" "${forbidden}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "the user daemon still inspects the protected KWin executable: ${forbidden}")
     endif()
 endforeach()
 file(READ "${SOURCE_DIR}/src/local_capture.c" local_capture)
@@ -382,6 +414,20 @@ string(FIND "${local_capture}" "strcmp(basename, \"kwin_wayland\") == 0"
 if(capture_executable_gate EQUAL -1)
     message(FATAL_ERROR
         "KWin capture no longer pins the kwin_wayland executable")
+endif()
+foreach(required
+        "getuid() != 0u || geteuid() != 0u"
+        "kwin_pid != trusted_kwin_pid")
+    string(FIND "${local_capture}" "${required}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR
+            "KWin capture executable trust boundary is missing: ${required}")
+    endif()
+endforeach()
+string(FIND "${local_capture}" "/cmdline" capture_cmdline_fallback)
+if(NOT capture_cmdline_fallback EQUAL -1)
+    message(FATAL_ERROR
+        "KWin capture must not trust the process-controlled command line")
 endif()
 
 file(READ "${SOURCE_DIR}/src/permission_domain.h" domain)
@@ -460,6 +506,11 @@ endif()
 # mistake that let this survive: the predicate was never wrong, the call site
 # used a different one.
 file(READ "${CMAKE_CURRENT_LIST_DIR}/../src/capture_worker.c" capture_worker)
+string(FIND "${capture_worker}" "resolve_trusted_kwin_pid" kwin_resolver)
+if(kwin_resolver EQUAL -1)
+    message(FATAL_ERROR
+        "the privileged capture worker no longer resolves the trusted KWin pid")
+endif()
 string(FIND "${capture_worker}"
     "|| !ksd_capture_worker_request_valid(request)" admits)
 if(admits EQUAL -1)

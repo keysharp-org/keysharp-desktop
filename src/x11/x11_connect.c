@@ -1,4 +1,5 @@
 #include "x11_connect.h"
+#include "x11_extended.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +87,7 @@ void ksd_x11_close(ksd_x11 *connection)
 {
     if (connection == NULL)
         return;
+    ksd_x11_keyboard_clear(connection);
     if (connection->connection != NULL)
         xcb_disconnect(connection->connection);
     free(connection);

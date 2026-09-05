@@ -42,9 +42,10 @@ connects. `NoNewPrivileges=` remains in force for the authority and the helper.
 
 `keysharp-desktop.service` runs `keysharp-desktop daemon` inside each graphical
 user session. It connects outbound and registers the session backend; it is
-not socket-activated and does not accept application traffic. It registers
-exactly once and then reaches a steady state: a session with no supported
-compositor registers the generic backend rather than retrying forever.
+not socket-activated and does not accept application traffic. It holds one
+registration at a time and restarts when the compositor identity changes. A
+session with no supported compositor registers the generic backend rather than
+retrying forever, then upgrades if a supported provider appears later.
 
 Install and removal scripts reload the dynamic-linker cache after adding or
 removing the SONAME library. They reload systemd, enable the system socket,
@@ -53,10 +54,10 @@ at their next login or with `systemctl --user daemon-reload`.
 
 ## Compositor scripts
 
-A compositor with no extension mechanism of its own is driven by a script
-installed read-only under `share/keysharp-desktop/`. The compositor opens that
-path itself, so the per-user daemon only names it and never materializes,
-copies, or rewrites it. The user unit therefore declares no `ReadWritePaths=`,
+KWin is driven by a script installed read-only under
+`share/kwin/scripts/io.github.keysharp.desktop.kwin/`. After acquiring its
+provider bus name, the per-user daemon asks KWin to reload that path; it never
+materializes, copies, or rewrites it. The user unit therefore declares no `ReadWritePaths=`,
 `RuntimeDirectory=`, `StateDirectory=`, or `BindPaths=`; `release-layout-test`
 fails if one appears in `data/keysharp-desktop.service.in` or in
 `nix/module.nix`. The unit cannot use user-manager filesystem namespacing:
@@ -82,7 +83,9 @@ The standalone uninstaller removes only this project's manifest. It retains
 `/var/lib/keysharp-permissions/v1` because other authorities may use the same
 grants.
 
-The Debian package provides `keysharp-desktop-client-abi-0` and obtains ELF
+The Debian package provides `keysharp-desktop-client-abi-0` with version `0.<minor>`
+derived from the public header, independent of the product release. Consumers can
+require an additive API with a versioned dependency. The package obtains ELF
 dependencies through `dpkg-shlibdeps`. Its preinstall guard rejects unmanaged
 `/usr/local` files that could shadow the packaged runtime or providers.
 

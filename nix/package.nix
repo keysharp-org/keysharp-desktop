@@ -6,6 +6,7 @@
   glib,
   polkit,
   xorg,
+  libxkbcommon,
   wayland,
   wayland-scanner,
   wayland-protocols,
@@ -31,6 +32,7 @@ stdenv.mkDerivation {
   buildInputs = [
     glib
     xorg.libxcb
+    libxkbcommon
     wayland
     wayland-protocols
   ];

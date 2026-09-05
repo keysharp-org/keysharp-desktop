@@ -2692,14 +2692,16 @@ export default class KeysharpExtension {
         // Windows on other workspaces still "exist" (enumeration/matching), but must not win
         // at-point hit-tests — global.get_window_actors() spans ALL workspaces.
         let onCurrentWorkspace = true;
+        let workspaceKnown = false;
         try {
             const ws = win.get_workspace();
             onCurrentWorkspace = win.is_on_all_workspaces()
                 || (ws !== null && ws === global.workspace_manager.get_active_workspace());
+            workspaceKnown = true;
         } catch (_e) {
         }
 
-        return {
+        const snapshot = {
             id:        String(win.get_stable_sequence()),
             title:     win.get_title()            ?? '',
             appId:     win.get_wm_class()         ?? win.get_wm_class_instance() ?? '',
@@ -2716,6 +2718,13 @@ export default class KeysharpExtension {
             transparency: this._windowOpacity(win),
             onCurrentWorkspace,
         };
+        snapshot.validFields = ['id', 'title', 'appId', 'frame', 'active',
+            'minimized', 'maximized', 'alwaysOnTop'];
+        if (snapshot.pid > 0) snapshot.validFields.push('pid');
+        if (buffer !== null) snapshot.validFields.push('buffer');
+        if (typeof win.decorated === 'boolean') snapshot.validFields.push('decorated');
+        if (workspaceKnown) snapshot.validFields.push('onCurrentWorkspace');
+        return snapshot;
     }
 
     // Current whole-window opacity, 0 (transparent)..255 (opaque), read back from the compositor actor.

@@ -4,20 +4,21 @@
 #include "operation_result.h"
 #include "wl_connect.h"
 
-/* Enumeration only, and it reports less than the other backends do.
- * ext-foreign-toplevel-list carries a title, an app id and an opaque
- * identifier, and nothing else: no geometry, no pid, no minimized flag, and no
- * activated flag -- which is why there is no active-window verb here. Those
- * fields are left out of the reply rather than filled with zeros, because a
- * zero would be read as a fact.
- *
- * Changing a window needs a different protocol than listing them, and the one
- * that can (wlr-foreign-toplevel-management) is not part of wayland-protocols.
- * So this backend can say what exists and not act on it. */
+/* ext-foreign-toplevel-list is the portable enumeration floor. Optional
+ * wlroots and COSMIC protocols add state, active-window lookup and the actions
+ * they advertise; COSMIC also adds geometry. Facts absent from the selected
+ * protocol are omitted rather than filled with zeros. */
 /* Handles only, carrying no properties and needing no grant. */
 void ksd_wayland_window_handles(ksd_wayland *connection,
                                 ksd_operation_result *result);
-void ksd_wayland_window_list(ksd_wayland *connection,
+void ksd_wayland_window_list(ksd_wayland *connection, bool include_hidden,
                              ksd_operation_result *result);
+void ksd_wayland_window_query(ksd_wayland *connection,
+    uint64_t handle, ksd_operation_result *result);
+void ksd_wayland_active_window(ksd_wayland *connection,
+                               ksd_operation_result *result);
+void ksd_wayland_window_action(ksd_wayland *connection, uint16_t opcode,
+                               uint64_t handle, uint32_t value,
+                               ksd_operation_result *result);
 
 #endif

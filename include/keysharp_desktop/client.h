@@ -25,10 +25,12 @@ extern "C" {
 /* Minor 2 tolerates a newer service: an unrecognized backend value and
  * unrecognized operation and scope bits no longer fail the connection. Minor 3
  * names KSD_BACKEND_GENERIC, the session whose compositor this service has no
- * backend for. Minor 4 names the brokered clipboard write, which needs no
- * grant; an older library has no symbol for its operation bit. See docs/integrating.md for exactly which
- * masks are narrowed and which are delivered verbatim. */
-#define KSD_CLIENT_ABI_MINOR 5u
+ * backend for. Minor 4 names the brokered clipboard write, minor 5 the
+ * ungated window-handle list, minor 6 the KWin skip-taskbar control, and minor
+ * 7 the whole-desktop capture used by screenshot portals. See
+ * docs/integrating.md for exactly which masks are narrowed and which are
+ * delivered verbatim. */
+#define KSD_CLIENT_ABI_MINOR 8u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -89,8 +91,8 @@ typedef uint32_t ksd_permission_scopes;
 typedef uint64_t ksd_operations;
 
 /* KSD_BACKEND_GENERIC is a session whose compositor this service has no
- * backend for. The connection, the consent path and the permission store all
- * work; available_operations is zero and every operation is unavailable.
+ * dedicated backend for. Its available operations are dynamically detected
+ * from compositor protocols, authenticated compositor IPC, and portals.
  * A newer service may report a backend this header does not name. The value is
  * delivered verbatim, is never KSD_BACKEND_NONE in that case, and
  * ksd_backend_name reports it as "unknown". Never infer what is supported from
@@ -139,6 +141,25 @@ typedef uint32_t ksd_backend;
  * returns titles and pids in the same reply, which makes the whole reply the
  * gated side. */
 #define KSD_OPERATION_WINDOW_HANDLES UINT64_C(0x0000000020000000)
+/* Hide a compositor-managed utility window from taskbar, pager and switcher.
+ * This is currently available on KWin. */
+#define KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR UINT64_C(0x0000000040000000)
+/* A complete logical desktop image. This is distinct from CAPTURE_AREA because
+ * screenshot portals return a whole desktop and cannot honor an arbitrary
+ * rectangle without client-side image decoding. */
+#define KSD_OPERATION_CAPTURE_DESKTOP UINT64_C(0x0000000080000000)
+#define KSD_OPERATION_WINDOW_QUERY UINT64_C(0x0000000100000000)
+#define KSD_OPERATION_WINDOW_CHILDREN UINT64_C(0x0000000200000000)
+#define KSD_OPERATION_WINDOW_AT_POINT UINT64_C(0x0000000400000000)
+#define KSD_OPERATION_DISPLAY_LIST UINT64_C(0x0000000800000000)
+#define KSD_OPERATION_KEYBOARD_STATE UINT64_C(0x0000001000000000)
+#define KSD_OPERATION_WINDOW_SET_TITLE UINT64_C(0x0000002000000000)
+#define KSD_OPERATION_WINDOW_SET_VISIBLE UINT64_C(0x0000004000000000)
+#define KSD_OPERATION_WINDOW_REDRAW UINT64_C(0x0000008000000000)
+#define KSD_OPERATION_WINDOW_CLICK UINT64_C(0x0000010000000000)
+#define KSD_OPERATION_WINDOW_BUTTON UINT64_C(0x0000020000000000)
+#define KSD_OPERATION_WINDOW_FOCUS_CHILD UINT64_C(0x0000040000000000)
+
 
 /* The mimetype ksd_clipboard_set_text writes. A caller that wants the same
  * bytes through ksd_clipboard_set_content must use this exact string; the
@@ -352,6 +373,10 @@ KSD_API ksd_status ksd_capture_area(ksd_connection *connection,
                             int32_t x, int32_t y,
                             uint32_t width, uint32_t height,
                             ksd_capture *capture, ksd_error *error);
+/* Captures the complete logical desktop. This separate operation is suitable
+ * for screenshot portals, which do not accept an arbitrary rectangle. */
+KSD_API ksd_status ksd_capture_desktop(ksd_connection *connection,
+                               ksd_capture *capture, ksd_error *error);
 KSD_API ksd_status ksd_capture_window(ksd_connection *connection,
                               const char *window_id,
                               uint32_t include_decoration,
@@ -378,6 +403,39 @@ KSD_API ksd_status ksd_window_list_json(ksd_connection *connection,
 KSD_API ksd_status ksd_window_active_json(ksd_connection *connection,
                                   ksd_string *json,
                                   ksd_error *error);
+
+/* Window snapshots include a validFields array. Missing fields have unknown
+ * values; callers must not interpret a placeholder as a compositor fact. */
+KSD_API ksd_status ksd_window_query_json(ksd_connection *connection,
+    uint64_t handle, ksd_string *json, ksd_error *error);
+KSD_API ksd_status ksd_window_children_json(ksd_connection *connection,
+    uint64_t parent, ksd_string *json, ksd_error *error);
+KSD_API ksd_status ksd_window_at_point_json(ksd_connection *connection,
+    int32_t x, int32_t y, uint32_t deepest, ksd_string *json, ksd_error *error);
+KSD_API ksd_status ksd_display_list_json(ksd_connection *connection,
+    ksd_string *json, ksd_error *error);
+KSD_API ksd_status ksd_keyboard_state_json(ksd_connection *connection,
+    ksd_string *json, ksd_error *error);
+/* Pass the previous mapRevision (up to 64 UTF-8 bytes) to omit an unchanged
+ * keymap. Retain the previous keymap when that field is absent in the reply. */
+KSD_API ksd_status ksd_keyboard_state_since_json(ksd_connection *connection,
+    const char *known_revision, ksd_string *json, ksd_error *error);
+KSD_API ksd_status ksd_window_set_title(ksd_connection *connection,
+    uint64_t handle, const char *title, ksd_error *error);
+KSD_API ksd_status ksd_window_set_visible(ksd_connection *connection,
+    uint64_t handle, uint32_t visible, ksd_error *error);
+KSD_API ksd_status ksd_window_redraw(ksd_connection *connection,
+    uint64_t handle, ksd_error *error);
+/* Coordinates are client-local; buttons 1..5 and click counts 1..100. */
+KSD_API ksd_status ksd_window_click(ksd_connection *connection,
+    uint64_t handle, int32_t x, int32_t y, uint32_t button,
+    uint32_t count, ksd_error *error);
+KSD_API ksd_status ksd_window_button(ksd_connection *connection,
+    uint64_t handle, int32_t x, int32_t y, uint32_t button,
+    uint32_t down, ksd_error *error);
+KSD_API ksd_status ksd_window_focus_child(ksd_connection *connection,
+    uint64_t handle, ksd_error *error);
+
 KSD_API ksd_status ksd_window_focus(ksd_connection *connection,
                             uint64_t handle,
                             ksd_error *error);
@@ -415,6 +473,9 @@ KSD_API ksd_status ksd_window_set_above(ksd_connection *connection,
 KSD_API ksd_status ksd_window_set_decorated(ksd_connection *connection,
                                     uint64_t handle,
                                     uint32_t decorated, ksd_error *error);
+KSD_API ksd_status ksd_window_set_skip_taskbar(ksd_connection *connection,
+                                    uint64_t handle,
+                                    uint32_t skip, ksd_error *error);
 KSD_API ksd_status ksd_window_reserve(ksd_connection *connection,
                               uint64_t cookie,
                               int32_t x, int32_t y, uint32_t ttl_ms,

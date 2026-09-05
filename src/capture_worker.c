@@ -7,7 +7,9 @@
 #include "wl_worker.h"
 #include "x11_connect.h"
 #include "x11_worker.h"
+#include "x11_watch.h"
 #include "transport.h"
+#include "kwin_relay.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,6 +17,7 @@
 #include <limits.h>
 #include <linux/memfd.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +46,7 @@
 #define KSD_CAPTURE_WORKER_MAX_GROUPS 256u
 #define KSD_CAPTURE_WORKER_ENV_LIMIT (64u * 1024u)
 #define KSD_CAPTURE_WORKER_TIMEOUT_MS 35000u
-#define KSD_CAPTURE_WORKER_MAX_REQUEST (8u + 128u)
+#define KSD_CAPTURE_WORKER_MAX_REQUEST KSD_MAX_REQUEST_PAYLOAD
 #define KSD_CAPTURE_WORKER_BOOTSTRAP_MAX \
     (KSD_CAPTURE_WORKER_HEADER_SIZE \
      + KSD_CAPTURE_WORKER_MAX_GROUPS * sizeof(uint32_t) \
@@ -509,16 +512,22 @@ static bool send_worker_response(int descriptor,
         } while (written < 0 && errno == EINTR);
         return written == (ssize_t)sizeof(message);
     }
-    int payload_fd = memfd_create("keysharp-desktop-capture",
-                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int payload_fd = result->payload_fd;
+    bool borrowed = payload_fd >= 0;
     int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
-    bool written = payload_fd >= 0 && result->tail != NULL
-        && result->tail_length != 0u
-        && result->tail_length <= KSD_MAX_CAPTURE_TAIL
-        && ksd_write_all(payload_fd, result->tail, result->tail_length)
-        && fcntl(payload_fd, F_ADD_SEALS, seals) == 0
+    bool valid = result->tail_length <= KSD_MAX_CAPTURE_TAIL
+        && ((borrowed && result->tail == NULL
+             && sealed_capture_file(payload_fd, result->tail_length))
+            || (!borrowed && result->tail != NULL));
+    if (!borrowed && valid)
+        payload_fd = memfd_create("keysharp-desktop-capture",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    bool written = valid && payload_fd >= 0
+        && (borrowed
+            || (ksd_write_all(payload_fd, result->tail, result->tail_length)
+                && fcntl(payload_fd, F_ADD_SEALS, seals) == 0))
         && ksd_send_with_fd(descriptor, message, sizeof(message), payload_fd);
-    if (payload_fd >= 0)
+    if (!borrowed && payload_fd >= 0)
         close(payload_fd);
     return written;
 }
@@ -574,6 +583,36 @@ bool ksd_capture_worker_test_round_trip(const ksd_operation_result *sent,
  * -- that signal is per-THREAD, so a worker forked from a connection thread
  * would be killed the moment that thread ended, which is the wrong lifetime
  * entirely. End-of-file on the socket is thread-agnostic and exact. */
+static void *reap_persistent_worker(void *value)
+{
+    pid_t worker = (pid_t)(intptr_t)value;
+    while (waitpid(worker, NULL, 0) < 0 && errno == EINTR) {
+    }
+    return NULL;
+}
+
+static void *watch_authority_connection(void *value)
+{
+    struct pollfd socket = {
+        .fd = (int)(intptr_t)value, .events = POLLRDHUP,
+    };
+    for (;;) {
+        int ready = poll(&socket, 1u, -1);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0 || (socket.revents & (POLLRDHUP | POLLHUP
+                                            | POLLERR | POLLNVAL)) != 0)
+            _exit(ready < 0 ? 1 : 0);
+    }
+}
+
+#ifdef KSD_CAPTURE_WORKER_TESTING
+void ksd_capture_worker_test_authority_watch(int descriptor)
+{
+    (void)watch_authority_connection((void *)(intptr_t)descriptor);
+}
+#endif
+
 int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
                              pid_t session_pid, uint32_t backend)
 {
@@ -585,6 +624,8 @@ int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
     int capture_pipe[2] = { -1, -1 };
     pid_t worker = -1;
     int kept = -1;
+    int child_socket = -1;
+    int child_executable = -1;
 
     if (identity == NULL
         || !capture_environment(identity, &environment)
@@ -593,13 +634,19 @@ int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
     executable = open(KSD_CAPTURE_WORKER_PATH,
                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (!trusted_self(executable)
-        || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0
+        || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0
+        || !set_socket_timeout(sockets[0], 5000u)
+        || !set_socket_timeout(sockets[1], 5000u)
         || !create_capture_pipe(capture_pipe))
+        goto done;
+    child_socket = fcntl(sockets[1], F_DUPFD_CLOEXEC, 10);
+    child_executable = fcntl(executable, F_DUPFD_CLOEXEC, 10);
+    if (child_socket < 0 || child_executable < 0)
         goto done;
     worker = fork();
     if (worker == 0) {
-        if (dup2(sockets[1], KSD_CAPTURE_WORKER_FD) < 0
-            || dup2(executable, 4) < 0)
+        if (dup2(child_socket, KSD_CAPTURE_WORKER_FD) < 0
+            || dup2(child_executable, 4) < 0)
             _exit(1);
         char *spawn_argv[] = { KSD_CAPTURE_WORKER_PATH, NULL };
 
@@ -614,10 +661,25 @@ int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
     if (!send_bootstrap(sockets[0], identity, gid, groups, group_count, NULL,
                         capture_pipe, session_pid, backend, true))
         goto done;
+    uint8_t ready = 0u;
+    if (!ksd_read_all(sockets[0], &ready, sizeof(ready)) || ready != 1u)
+        goto done;
+    pthread_t reaper;
+    if (pthread_create(&reaper, NULL, reap_persistent_worker,
+                        (void *)(intptr_t)worker) != 0)
+        goto done;
+    (void)pthread_detach(reaper);
+    worker = -1;
     kept = sockets[0];
     sockets[0] = -1;
 
 done:
+    if (worker > 0)
+        terminate_worker(worker);
+    if (child_socket >= 0)
+        close(child_socket);
+    if (child_executable >= 0)
+        close(child_executable);
     free(groups);
     if (executable >= 0)
         close(executable);
@@ -837,7 +899,52 @@ static bool drop_worker_privileges(uid_t uid, gid_t gid,
         && real_gid == gid && effective_gid == gid && saved_gid == gid;
 }
 
-static bool prepare_worker_root(void)
+static bool resolve_trusted_kwin_pid(uid_t uid, gid_t gid,
+                                    const gid_t *groups, size_t group_count,
+                                    pid_t *trusted_pid)
+{
+    int descriptors[2];
+    if (trusted_pid == NULL || pipe2(descriptors, O_CLOEXEC) != 0)
+        return false;
+    pid_t child = fork();
+    if (child == 0) {
+        close(descriptors[0]);
+        if (dup2(descriptors[1], 3) < 0
+            || close_range(4u, UINT_MAX, 0) != 0
+            || !drop_worker_privileges(uid, gid, groups, group_count))
+            _exit(1);
+        pid_t owner = 0;
+        if (!ksd_local_capture_kwin_owner_pid(uid, &owner))
+            _exit(1);
+        ssize_t written;
+        do {
+            written = write(3, &owner, sizeof(owner));
+        } while (written < 0 && errno == EINTR);
+        close(3);
+        _exit(written == (ssize_t)sizeof(owner) ? 0 : 1);
+    }
+    close(descriptors[1]);
+    if (child < 0) {
+        close(descriptors[0]);
+        return false;
+    }
+    pid_t owner = 0;
+    bool read_owner = ksd_read_all(descriptors[0], &owner, sizeof(owner));
+    close(descriptors[0]);
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    bool valid = read_owner && waited == child && WIFEXITED(status)
+        && WEXITSTATUS(status) == 0
+        && ksd_local_capture_kwin_process_trusted(uid, owner);
+    if (valid)
+        *trusted_pid = owner;
+    return valid;
+}
+
+static bool prepare_worker_root(bool persistent)
 {
     const struct rlimit no_core = { .rlim_cur = 0u, .rlim_max = 0u };
     const struct rlimit memory = {
@@ -850,13 +957,13 @@ static bool prepare_worker_root(void)
     };
     const struct rlimit open_files = { .rlim_cur = 64u, .rlim_max = 64u };
     const struct rlimit cpu = { .rlim_cur = 40u, .rlim_max = 40u };
-    return prctl(PR_SET_PDEATHSIG, SIGKILL) == 0
+    return prctl(PR_SET_PDEATHSIG, persistent ? 0 : SIGKILL) == 0
         && prctl(PR_SET_DUMPABLE, 0) == 0 && getppid() != 1
         && setrlimit(RLIMIT_CORE, &no_core) == 0
         && setrlimit(RLIMIT_AS, &memory) == 0
         && setrlimit(RLIMIT_FSIZE, &file_size) == 0
         && setrlimit(RLIMIT_NOFILE, &open_files) == 0
-        && setrlimit(RLIMIT_CPU, &cpu) == 0;
+        && (persistent || setrlimit(RLIMIT_CPU, &cpu) == 0);
 }
 
 static ssize_t receive_bootstrap(int descriptor, uint8_t *buffer,
@@ -899,6 +1006,33 @@ static ssize_t receive_bootstrap(int descriptor, uint8_t *buffer,
             fd_count++;
         }
     }
+    int socket_type = 0;
+    socklen_t socket_type_size = sizeof(socket_type);
+    if (count > 0 && getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &socket_type,
+                                &socket_type_size) == 0
+        && socket_type == SOCK_STREAM) {
+        if ((size_t)count < KSD_CAPTURE_WORKER_HEADER_SIZE) {
+            size_t missing = KSD_CAPTURE_WORKER_HEADER_SIZE - (size_t)count;
+            if (!ksd_read_all(descriptor, buffer + count, missing))
+                malformed = true;
+            else
+                count += (ssize_t)missing;
+        }
+        if (!malformed) {
+            uint64_t expected = KSD_CAPTURE_WORKER_HEADER_SIZE
+                + (uint64_t)ksd_decode_u32(buffer + 16u) * sizeof(uint32_t)
+                + ksd_decode_u32(buffer + 20u);
+            if (expected > capacity || expected < (uint64_t)count)
+                malformed = true;
+            else if (expected > (uint64_t)count) {
+                if (!ksd_read_all(descriptor, buffer + count,
+                                   (size_t)(expected - (uint64_t)count)))
+                    malformed = true;
+                else
+                    count = (ssize_t)expected;
+            }
+        }
+    }
     if (count <= 0 || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0
         || malformed || fd_count != 2u
         || !ksd_capture_pipe_valid(capture_pipe)) {
@@ -923,7 +1057,7 @@ typedef struct worker_bootstrap {
      * area capture is byte-identical whichever backend will serve it. */
     uint32_t backend;
     /* Whether to serve until the socket closes rather than exit after one
-     * request. Never set for a capture. */
+     * request. X11 and Wayland captures share the persistent display. */
     bool persistent;
 } worker_bootstrap;
 
@@ -937,7 +1071,7 @@ static bool parse_bootstrap_header(const uint8_t *bootstrap, size_t length,
     if (length < KSD_CAPTURE_WORKER_HEADER_SIZE
         || memcmp(bootstrap, worker_magic, sizeof(worker_magic)) != 0
         || ksd_decode_u16(bootstrap + 4u) != KSD_CAPTURE_WORKER_VERSION
-        || ksd_decode_u16(bootstrap + 6u) > KSD_BACKEND_GENERIC
+        || ksd_decode_u16(bootstrap + 6u) > KSD_BACKEND_X11
         || ksd_decode_u32(bootstrap + 28u) > 1u)
         return false;
     parsed->uid = (uid_t)ksd_decode_u32(bootstrap + 8u);
@@ -1014,7 +1148,14 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
             break;
         payload_length =
             ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
-        if (payload_length > KSD_CAPTURE_WORKER_MAX_REQUEST) {
+        if (payload_length > KSD_CAPTURE_WORKER_MAX_REQUEST
+            || memcmp(header, public_magic, sizeof(public_magic)) != 0
+            || ksd_decode_u16(header + KSD_FRAME_MAJOR_OFFSET)
+                != KSD_PROTOCOL_MAJOR
+            || ksd_decode_u16(header + KSD_FRAME_MINOR_OFFSET)
+                != KSD_PROTOCOL_MINOR
+            || ksd_decode_u16(header + KSD_FRAME_FLAGS_OFFSET) != 0u
+            || ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET) == 0u) {
             ok = false;
             break;
         }
@@ -1036,6 +1177,13 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
         request.payload_length = payload_length;
 
         ksd_result_init(&result);
+        bool capture = request.opcode == KSD_OP_CAPTURE_AREA
+            || request.opcode == KSD_OP_CAPTURE_WINDOW
+            || request.opcode == KSD_OP_CAPTURE_DESKTOP;
+        /* Display libraries can block inside a synchronous reply even after
+         * the authority closes our socket. The process deadline bounds that
+         * work without limiting an idle worker's lifetime. */
+        (void)alarm(capture ? 40u : 10u);
         if (backend == KSD_BACKEND_X11) {
             if (x11_connection == NULL) {
                 ksd_status status = ksd_x11_open_for_session(session_pid,
@@ -1046,6 +1194,16 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
                     ksd_result_error(&result, status, 0u,
                                      "could not open the X display for this "
                                      "session");
+            }
+            if (x11_connection != NULL
+                && request.opcode == KSD_OP_WINDOW_WATCH
+                && request.payload_length == 0u) {
+                ok = ksd_x11_watch_run(x11_connection, KSD_CAPTURE_WORKER_FD,
+                                       request.request_id);
+                (void)alarm(0u);
+                ksd_result_clear(&result);
+                free(body);
+                break;
             }
             if (x11_connection != NULL)
                 alive = ksd_x11_execute_on(x11_connection, &request, &result);
@@ -1065,6 +1223,7 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
                 alive = ksd_wayland_execute_on(wayland_connection, &request,
                                                &result);
         }
+        (void)alarm(0u);
         /* A dead connection is dropped so the NEXT request reopens. The
          * current answer still goes back: the caller asked one question and
          * gets one answer, rather than silence because the display chose that
@@ -1080,10 +1239,13 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
             }
         }
 
-        ksd_buffer_init(&payload, result.tail_length + 8u);
+        bool capture_fd = result.status == KSD_STATUS_OK
+            && result.payload_fd >= 0;
+        ksd_buffer_init(&payload, capture_fd ? 12u : result.tail_length + 8u);
         ok = ksd_buffer_u32(&payload, result.status)
             && ksd_buffer_u32(&payload, result.detail)
-            && (result.tail_length == 0u
+            && (capture_fd ? ksd_buffer_u32(&payload, result.tail_length)
+                : result.tail_length == 0u
                 || ksd_buffer_bytes(&payload, result.tail,
                                     result.tail_length));
         memset(&answer, 0, sizeof(answer));
@@ -1093,13 +1255,17 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
         answer.magic[3] = KSD_FRAME_MAGIC_3;
         answer.major = KSD_PROTOCOL_MAJOR;
         answer.minor = KSD_PROTOCOL_MINOR;
+        answer.flags = capture_fd ? KSD_RELAY_CAPTURE_FD : 0u;
         answer.request_id = request.request_id;
         answer.payload = payload.data;
         answer.payload_length = (uint32_t)payload.length;
         ksd_buffer_init(&packed, payload.length + KSD_FRAME_HEADER_SIZE + 16u);
         ok = ok && ksd_frame_pack(&answer, &packed)
-            && ksd_write_all(KSD_CAPTURE_WORKER_FD, packed.data,
-                             packed.length);
+            && (capture_fd
+                ? ksd_send_with_fd(KSD_CAPTURE_WORKER_FD, packed.data,
+                                    packed.length, result.payload_fd)
+                : ksd_write_all(KSD_CAPTURE_WORKER_FD, packed.data,
+                                 packed.length));
         ksd_buffer_clear(&packed);
         ksd_buffer_clear(&payload);
         ksd_result_clear(&result);
@@ -1139,7 +1305,7 @@ int ksd_capture_worker_main(int argc, char **argv)
     if (getuid() != geteuid() || getgid() != getegid()
         || !worker_peer_is_authority(KSD_CAPTURE_WORKER_FD))
         return 1;
-    if (close_range(4u, UINT_MAX, 0) != 0 || !prepare_worker_root())
+    if (close_range(4u, UINT_MAX, 0) != 0)
         return 1;
     ssize_t bootstrap_length = receive_bootstrap(KSD_CAPTURE_WORKER_FD,
                                                   bootstrap,
@@ -1148,12 +1314,14 @@ int ksd_capture_worker_main(int argc, char **argv)
     worker_bootstrap header;
     if (bootstrap_length < 0
         || !parse_bootstrap_header(bootstrap, (size_t)bootstrap_length,
-                                   &header))
+                                   &header)
+        || !prepare_worker_root(header.persistent))
         goto failed;
     uid_t uid = header.uid;
     gid_t gid = header.gid;
     uint32_t group_count = header.group_count;
     uint32_t frame_length = header.frame_length;
+    pid_t trusted_kwin_pid = 0;
     size_t groups_length = (size_t)group_count * sizeof(uint32_t);
     for (uint32_t index = 0u; index < group_count; index++) {
         uint32_t value = ksd_decode_u32(bootstrap
@@ -1162,6 +1330,10 @@ int ksd_capture_worker_main(int argc, char **argv)
         if ((uint64_t)groups[index] != value)
             goto failed;
     }
+    if (!header.persistent && header.backend == KSD_BACKEND_KWIN
+        && !resolve_trusted_kwin_pid(uid, gid, groups, group_count,
+                                    &trusted_kwin_pid))
+        goto failed;
     capture_spool = create_capture_spool();
     if (capture_spool < 0
         || !drop_worker_privileges(uid, gid, groups, group_count))
@@ -1176,6 +1348,19 @@ int ksd_capture_worker_main(int argc, char **argv)
         capture_pipe[0] = -1;
         capture_pipe[1] = -1;
         capture_spool = -1;
+        struct timeval unlimited = { 0 };
+        uint8_t ready = 1u;
+        pthread_t monitor;
+        /* A dedicated hangup observer stops blocked display-library calls as
+         * soon as their authority goes away. It never reads request bytes. */
+        if (pthread_create(&monitor, NULL, watch_authority_connection,
+                            (void *)(intptr_t)KSD_CAPTURE_WORKER_FD) != 0)
+            goto failed;
+        (void)pthread_detach(monitor);
+        if (setsockopt(KSD_CAPTURE_WORKER_FD, SOL_SOCKET, SO_RCVTIMEO,
+                        &unlimited, sizeof(unlimited)) != 0
+            || !ksd_write_all(KSD_CAPTURE_WORKER_FD, &ready, sizeof(ready)))
+            goto failed;
         bool served = serve_persistently(header.backend, header.session_pid);
         close(KSD_CAPTURE_WORKER_FD);
         return served ? 0 : 1;
@@ -1213,7 +1398,7 @@ int ksd_capture_worker_main(int argc, char **argv)
             ksd_wayland_execute(&request, header.session_pid, &result);
     } else {
         ksd_local_capture_execute(&request, capture_pipe[0], capture_pipe[1],
-                                  capture_spool, &result);
+                                  capture_spool, trusted_kwin_pid, &result);
     }
     capture_pipe[0] = -1;
     capture_pipe[1] = -1;

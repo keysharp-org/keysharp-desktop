@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Wire-compatible version-1 subset of cosmic-toplevel-management-unstable-v1.
+  Source: https://github.com/pop-os/cosmic-protocols
+-->
+<protocol name="cosmic_toplevel_management_unstable_v1">
+  <copyright>
+    Copyright © 2018 Ilia Bozhinov
+    Copyright © 2020 Isaac Freund
+    Copyright © 2022 wb9688
+    Copyright © 2024 Victoria Brekenfeld
+
+    Permission to use, copy, modify, distribute, and sell this software and
+    its documentation for any purpose is hereby granted without fee, provided
+    that the above copyright notice appear in all copies and that both that
+    copyright notice and this permission notice appear in supporting
+    documentation, and that the name of the copyright holders not be used in
+    advertising or publicity pertaining to distribution of the software
+    without specific, written prior permission. The copyright holders make no
+    representations about the suitability of this software for any purpose.
+    It is provided "as is" without express or implied warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+    INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+    EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+    CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+    DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+    TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
+    OF THIS SOFTWARE.
+  </copyright>
+
+  <interface name="zcosmic_toplevel_manager_v1" version="1">
+    <request name="destroy" type="destructor"/>
+    <enum name="capability">
+      <entry name="close" value="1"/>
+      <entry name="activate" value="2"/>
+      <entry name="maximize" value="3"/>
+      <entry name="minimize" value="4"/>
+      <entry name="fullscreen" value="5"/>
+    </enum>
+    <event name="capabilities">
+      <arg name="capabilities" type="array"/>
+    </event>
+    <request name="close">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="activate">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+      <arg name="seat" type="object" interface="wl_seat"/>
+    </request>
+    <request name="set_maximized">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="unset_maximized">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="set_minimized">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="unset_minimized">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="set_fullscreen">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+      <arg name="output" type="object" interface="wl_output"
+           allow-null="true"/>
+    </request>
+    <request name="unset_fullscreen">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+    </request>
+    <request name="set_rectangle">
+      <arg name="toplevel" type="object"
+           interface="zcosmic_toplevel_handle_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+  </interface>
+</protocol>

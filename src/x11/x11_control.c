@@ -238,6 +238,25 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
 {
     control_atoms atoms;
     CONTROL_PROLOGUE(connection, window, atoms, result)
+    uint32_t extents[4] = { 0u };
+    xcb_get_property_reply_t *frame = ksd_x11_property(c, window,
+        intern(c, "_NET_FRAME_EXTENTS"), XCB_ATOM_CARDINAL, 4u);
+    if (frame != NULL && frame->format == 32
+        && xcb_get_property_value_length(frame) >= (int)sizeof(extents))
+        memcpy(extents, xcb_get_property_value(frame), sizeof(extents));
+    free(frame);
+    for (size_t i = 0u; i < 4u; i++)
+        if (extents[i] > 32768u) extents[i] = 0u;
+    uint32_t horizontal = extents[0] + extents[1];
+    uint32_t vertical = extents[2] + extents[3];
+    if (width <= horizontal || height <= vertical) {
+        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
+                         "window bounds must leave a positive client area");
+        return;
+    }
+    /* The public rectangle includes decorations; X11 resize requests size the client. */
+    width -= horizontal;
+    height -= vertical;
     /* The flags word says which fields are meaningful and who is asking. The
      * low byte is the gravity, left at zero to mean the window's own; bits 8
      * to 11 mark x, y, width and height as supplied; bits 12 and 13 carry the

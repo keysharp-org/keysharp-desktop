@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 /* A Wayland connection to the session compositor, for the backend that has no
  * extension of its own: wlroots compositors, COSMIC, sway, Hyprland, niri and
@@ -24,6 +25,15 @@ typedef struct ksd_wayland ksd_wayland;
 typedef struct ksd_wayland_features {
     bool data_control;
     bool toplevel_list;
+    bool toplevel_control;
+    bool toplevel_active;
+    bool toplevel_focus;
+    bool toplevel_close;
+    bool toplevel_state;
+    bool screencopy;
+    bool absolute_pointer;
+    bool cursor_position;
+    bool keyboard_keymap;
 } ksd_wayland_features;
 
 /* display may be NULL, in which case WAYLAND_DISPLAY is used the way any
@@ -31,6 +41,8 @@ typedef struct ksd_wayland_features {
  * talk to, which is the ordinary case off a Wayland session and not an error
  * worth a diagnostic of its own. */
 ksd_status ksd_wayland_open(const char *display, ksd_wayland **connection);
+void ksd_wayland_set_session_pid(ksd_wayland *connection, pid_t session_pid);
+pid_t ksd_wayland_session_pid(const ksd_wayland *connection);
 void ksd_wayland_close(ksd_wayland *connection);
 ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection);
 

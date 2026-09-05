@@ -20,18 +20,18 @@ typedef struct session_environment {
     const char *display;
 } session_environment;
 
-/* Runs the resolver in a child with exactly the environment given, because
- * the rule it implements is about what the environment says and nothing else. */
-static ksd_backend child_resolve(const session_environment *session)
+/* Runs one session query in a child with exactly the environment given,
+ * because the rules it implements are about that environment and nothing
+ * else. */
+static int child_query(const session_environment *session, const char *query)
 {
     char bus[] = TEST_BUS_ADDRESS;
     char program[] = "backend-session-tests";
-    char mode[] = "resolve";
     char desktop[256];
     char session_type[256];
     char wayland_display[256];
     char display[256];
-    char *arguments[] = { program, mode, NULL };
+    char *arguments[] = { program, (char *)query, NULL };
     char *environment[6] = { bus, NULL, NULL, NULL, NULL, NULL };
     size_t slot = 1u;
     int status = 0;
@@ -59,7 +59,17 @@ static ksd_backend child_resolve(const session_environment *session)
     }
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) != 127);
-    return (ksd_backend)WEXITSTATUS(status);
+    return WEXITSTATUS(status);
+}
+
+static ksd_backend child_resolve(const session_environment *session)
+{
+    return (ksd_backend)child_query(session, "resolve");
+}
+
+static bool child_is_wayland(const session_environment *session)
+{
+    return child_query(session, "wayland") == 0;
 }
 
 static ksd_backend child_backend(const char *desktop)
@@ -84,19 +94,23 @@ static void check_session_type_table(void)
      * Wayland session an X11 one. */
     session_environment xwayland = { "GNOME", "wayland", "wayland-0", ":0" };
     assert(child_resolve(&xwayland) != KSD_BACKEND_X11);
+    assert(child_is_wayland(&xwayland));
 
     /* Same trap with the session type absent entirely. */
     session_environment untyped = { "GNOME", NULL, "wayland-0", ":0" };
     assert(child_resolve(&untyped) != KSD_BACKEND_X11);
+    assert(child_is_wayland(&untyped));
 
     /* A Wayland display present alongside an x11 session type is a session
      * that can reach Wayland, so it is not treated as X11 either. */
     session_environment stray = { "GNOME", "x11", "wayland-0", ":0" };
     assert(child_resolve(&stray) != KSD_BACKEND_X11);
+    assert(child_is_wayland(&stray));
 
     /* An empty WAYLAND_DISPLAY is not a Wayland display. */
     session_environment empty = { "GNOME", "x11", "", ":0" };
     assert(child_resolve(&empty) == KSD_BACKEND_X11);
+    assert(!child_is_wayland(&empty));
 
     /* Case is not significant in the session type. */
     session_environment upper = { "GNOME", "X11", NULL, ":0" };
@@ -138,8 +152,8 @@ static void check_registration_mask(void)
     assert(ksd_backend_registration_mask(KSD_BACKEND_X11, version, 0u,
                                          ~UINT64_C(0), &mask));
     assert(mask == ksd_backend_operations(KSD_BACKEND_X11));
-    assert((mask & (KSD_OPERATION_MOUSE_BUTTON
-                    | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE)) == 0u);
+    assert((mask & KSD_OPERATION_MOUSE_BUTTON) == 0u);
+    assert((mask & KSD_OPERATION_MOUSE_MOVE_ABSOLUTE) != 0u);
 
     /* The generic backend narrows like any other, and cannot be talked into
      * more than the shared protocols provide. */
@@ -275,6 +289,8 @@ int main(int argc, char **argv)
         return ksd_backend_session_unsupported()
             ? (int)KSD_BACKEND_GENERIC : (int)KSD_BACKEND_NONE;
     }
+    if (argc == 2 && strcmp(argv[1], "wayland") == 0)
+        return ksd_session_is_wayland_process(getpid()) ? 0 : 1;
     assert(argc == 1);
     assert(child_backend(NULL) == KSD_BACKEND_GENERIC);
     assert(child_backend("") == KSD_BACKEND_GENERIC);

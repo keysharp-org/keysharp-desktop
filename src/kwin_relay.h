@@ -23,6 +23,9 @@
  * that reader. */
 typedef struct ksd_kwin_relay ksd_kwin_relay;
 
+/* Private display-worker response; its body is status, detail, file length. */
+#define KSD_RELAY_CAPTURE_FD 0x8000u
+
 /* Takes ownership of descriptor. The returned relay carries one reference, the
  * registration's; retire it with ksd_kwin_relay_retire when that registration
  * ends. It is freed when the last reference goes.
@@ -41,6 +44,9 @@ void ksd_kwin_relay_acquire(ksd_kwin_relay *relay);
 
 /* Drops a reference, freeing at zero. */
 void ksd_kwin_relay_release(ksd_kwin_relay *relay);
+
+/* Transport failure is distinct from an unavailable compositor operation. */
+bool ksd_kwin_relay_is_broken(ksd_kwin_relay *relay);
 
 /* Ends the registration's use: wakes everyone waiting, refuses further calls,
  * and drops the registration's reference. Callers already inside a call keep

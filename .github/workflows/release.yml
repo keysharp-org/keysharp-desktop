@@ -52,8 +52,8 @@ jobs:
             echo "Checked-out source does not match refs/tags/$RELEASE_TAG." >&2
             exit 1
           fi
-          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13" \
-             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13" ]]; then
+          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "b8f31942dd2c286608d390634a9916bffce55ddf" \
+             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "b8f31942dd2c286608d390634a9916bffce55ddf" ]]; then
             echo "keysharp-permissions submodule is not at the reviewed pin." >&2
             exit 1
           fi
@@ -124,7 +124,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             cmake gcc pkg-config polkitd xvfb \
-            libglib2.0-dev libxcb1-dev libxcb-shm0-dev \
+            libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-composite0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
             libwayland-dev libwayland-bin wayland-protocols
 
       # ubuntu-24.04 ships wayland-protocols 1.34, and ext-data-control-v1 --
@@ -178,6 +179,7 @@ jobs:
           mkdir -p "$archive_root/payload"
           cp -a "$STAGE/usr" "$archive_root/payload/usr"
           install -m 0755 packaging/install-release.sh "$archive_root/install.sh"
+          install -m 0755 packaging/check-runtime.sh "$archive_root/check-runtime.sh"
           install -m 0755 uninstall.sh "$archive_root/uninstall.sh"
           tar --sort=name --mtime="@$(git log -1 --format=%ct)" \
             --owner=0 --group=0 --numeric-owner \

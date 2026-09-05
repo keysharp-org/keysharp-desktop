@@ -5,6 +5,9 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
+expected_client_abi_major=0
+expected_client_abi_minor=8
+
 skip_compatible=false
 
 usage() {
@@ -541,8 +544,8 @@ component_contract_matches() {
         | sed -n 's/^client_abi_major=\([0-9][0-9]*\)$/\1/p')
     abi_minor=$(printf '%s\n' "$contract" \
         | sed -n 's/^client_abi_minor=\([0-9][0-9]*\)$/\1/p')
-    [ "$abi_major" = 0 ] && [ -n "$abi_minor" ] \
-        && [ "$abi_minor" -ge 1 ]
+    [ "$abi_major" = "$expected_client_abi_major" ] && [ -n "$abi_minor" ] \
+        && [ "$abi_minor" -ge "$expected_client_abi_minor" ]
 }
 
 has_client_artifacts() {
@@ -680,6 +683,7 @@ if [ ! -x "$payload/bin/keysharp-desktop" ] \
     exit 1
 fi
 
+sh "$archive_root/check-runtime.sh" --install
 install -d -m 0755 /usr/local
 previous_library=$(portable_library_payload || true)
 install_staging=$(mktemp -d /usr/local/.keysharp-desktop-install.XXXXXX)

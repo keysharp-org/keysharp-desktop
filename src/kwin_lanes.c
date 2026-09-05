@@ -16,6 +16,7 @@ ksd_kwin_lane ksd_kwin_lane_for(uint16_t opcode)
         case KSD_OP_WINDOW_SET_OPACITY:
         case KSD_OP_WINDOW_SET_ABOVE:
         case KSD_OP_WINDOW_SET_DECORATED:
+        case KSD_OP_WINDOW_SET_SKIP_TASKBAR:
         case KSD_OP_CURSOR_POSITION:
         case KSD_OP_WORK_AREA:
             return KSD_KWIN_LANE_FAST;
@@ -51,6 +52,7 @@ ksd_kwin_cost ksd_kwin_script_cost(uint16_t opcode)
         case KSD_OP_WINDOW_SET_OPACITY:
         case KSD_OP_WINDOW_SET_ABOVE:
         case KSD_OP_WINDOW_SET_DECORATED:
+        case KSD_OP_WINDOW_SET_SKIP_TASKBAR:
         case KSD_OP_CURSOR_POSITION:
         case KSD_OP_WORK_AREA:
             return KSD_KWIN_COST_BOUNDED;

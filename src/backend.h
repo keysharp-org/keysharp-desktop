@@ -17,6 +17,10 @@ pid_t ksd_backend_provider_pid(ksd_backend backend);
  * X11. The session type must say x11 as a whole value and no Wayland display
  * may be present. */
 bool ksd_session_is_x11_process(pid_t pid);
+/* Whether the process belongs to a Wayland session. This is kept separate
+ * from the desktop name: KDE has both X11 and Wayland sessions, and only the
+ * latter can use the KWin backend. */
+bool ksd_session_is_wayland_process(pid_t pid);
 bool ksd_backend_session_unsupported(void);
 uint64_t ksd_backend_operations(ksd_backend backend);
 /* Which operations the X11 worker serves for a backend in a session type.

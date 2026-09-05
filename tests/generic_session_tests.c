@@ -30,6 +30,8 @@ int ksd_authority_test_generic_session(int descriptor,
 int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
 bool ksd_authority_test_backend_matches(uint32_t backend, pid_t pid);
 bool ksd_session_is_x11_process(pid_t pid);
+bool ksd_authority_test_scope_cache(ksp_store *store);
+bool ksd_authority_test_display_lanes(void);
 
 /* GENERIC is exempt from the session cross-check because it means "no
  * compositor this service knows". X11 must NOT be exempt the same way, or a
@@ -55,29 +57,37 @@ bool ksd_capture_tail_valid(const void *tail, uint32_t tail_length);
 /* The advertised mask and the provider dispatch drifted apart once, and
  * Cinnamon window capture was advertised, implemented and refused for as
  * long as they disagreed. Neither side may move without the other.
- * Exhaustive over every backend and both capture opcodes rather than a
+ * Exhaustive over every backend and all capture opcodes rather than a
  * literal check, so it survives edits to either side. */
 static void check_capture_mask_matches_dispatch(void)
 {
     static const uint16_t opcodes[] = {
         KSD_OP_CAPTURE_AREA, KSD_OP_CAPTURE_WINDOW,
+        KSD_OP_CAPTURE_DESKTOP,
     };
     static const uint64_t bits[] = {
         KSD_OPERATION_CAPTURE_AREA, KSD_OPERATION_CAPTURE_WINDOW,
+        KSD_OPERATION_CAPTURE_DESKTOP,
     };
 
-    for (uint32_t backend = 0u; backend <= KSD_BACKEND_GENERIC; backend++) {
+    for (uint32_t backend = 0u; backend <= KSD_BACKEND_X11; backend++) {
         uint64_t mask = ksd_backend_operations((ksd_backend)backend);
 
-        for (size_t index = 0u; index < 2u; index++) {
+        for (size_t index = 0u;
+             index < sizeof(opcodes) / sizeof(opcodes[0]); index++) {
             bool advertised = (mask & bits[index]) != 0u;
             /* Two routes serve a capture. GNOME and Cinnamon go through the
              * provider; KWin and X11 never do, and are dispatched to the
              * forked capture worker instead -- X11 answers there from the X
              * server itself. Either route counts as served, but something
              * must. */
-            bool served = backend == KSD_BACKEND_KWIN
-                || backend == KSD_BACKEND_X11
+            bool served = ((backend == KSD_BACKEND_KWIN
+                            || backend == KSD_BACKEND_X11)
+                           && (opcodes[index] == KSD_OP_CAPTURE_AREA
+                               || opcodes[index] == KSD_OP_CAPTURE_WINDOW))
+                || (backend == KSD_BACKEND_GENERIC
+                    && (opcodes[index] == KSD_OP_CAPTURE_AREA
+                        || opcodes[index] == KSD_OP_CAPTURE_DESKTOP))
                 || ksd_provider_capture_supported((ksd_backend)backend,
                                                   opcodes[index]);
 
@@ -212,6 +222,8 @@ static bool store_available(const char *persistent, const char *runtime)
     store_config.owner_uid = getuid();
     bool available = ksp_store_create(&store, &store_config) == 0
         && ksp_store_prepare(store) == 0;
+    if (available)
+        assert(ksd_authority_test_scope_cache(store));
     ksp_store_destroy(store);
     return available;
 }
@@ -393,6 +405,11 @@ static void check_worker_admits_each_backend(void)
     request.payload_length = sizeof(rect_payload);
     assert(ksd_capture_worker_request_valid(&request));
 
+    request.opcode = KSD_OP_CAPTURE_DESKTOP;
+    request.payload = NULL;
+    request.payload_length = 0u;
+    assert(ksd_capture_worker_request_valid(&request));
+
     /* And something the worker genuinely does not serve. */
     request.opcode = KSD_OP_WINDOW_RESERVE;
     request.payload = NULL;
@@ -431,6 +448,7 @@ int main(void)
         (void)remove_tree(root);
         return 77;
     }
+    assert(ksd_authority_test_display_lanes());
 
     struct timeval receive_timeout = { .tv_sec = 30, .tv_usec = 0 };
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);

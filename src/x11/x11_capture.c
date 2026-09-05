@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <xcb/shm.h>
+#include <xcb/composite.h>
 
 /* The pixels land at this offset inside the descriptor, behind the same
  * 20-byte header ksd_capture_tail_valid parses, so a consumer reads one shape
@@ -359,7 +360,35 @@ void ksd_x11_capture_window(ksd_x11 *connection, uint32_t window,
                          "that window has no area to capture");
         return;
     }
+    xcb_pixmap_t pixmap = XCB_PIXMAP_NONE;
+    bool redirected = false;
+    const xcb_query_extension_reply_t *composite = xcb_get_extension_data(c, &xcb_composite_id);
+    if (composite != NULL && composite->present) {
+        xcb_composite_query_version_reply_t *version = xcb_composite_query_version_reply(c,
+            xcb_composite_query_version(c, 0u, 4u), NULL);
+        if (version != NULL && (version->major_version > 0u || version->minor_version >= 2u)) {
+            pixmap = xcb_generate_id(c);
+            xcb_generic_error_t *error = xcb_request_check(c,
+                xcb_composite_name_window_pixmap_checked(c, drawable, pixmap));
+            if (error != NULL) {
+                free(error);
+                error = xcb_request_check(c, xcb_composite_redirect_window_checked(c,
+                    drawable, XCB_COMPOSITE_REDIRECT_AUTOMATIC));
+                redirected = error == NULL;
+                free(error);
+                error = redirected ? xcb_request_check(c,
+                    xcb_composite_name_window_pixmap_checked(c, drawable, pixmap)) : NULL;
+                if (!redirected || error != NULL) pixmap = XCB_PIXMAP_NONE;
+                free(error);
+            }
+        }
+        free(version);
+    }
+    if (pixmap != XCB_PIXMAP_NONE) target.drawable = pixmap;
     capture_drawable(connection, &target, geometry->depth, result);
+    if (pixmap != XCB_PIXMAP_NONE) xcb_free_pixmap(c, pixmap);
+    if (redirected) xcb_composite_unredirect_window(c, drawable, XCB_COMPOSITE_REDIRECT_AUTOMATIC);
+    xcb_flush(c);
     free(attributes);
     free(geometry);
 }

@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <xcb/xcb.h>
 
 #include "backend.h"
 #include "protocol.h"
@@ -31,6 +33,7 @@
 #define WORKER_FD 3
 
 bool ksd_capture_worker_test_serve(uint32_t backend, pid_t session_pid);
+void ksd_capture_worker_test_authority_watch(int descriptor);
 extern unsigned ksd_capture_worker_test_opens;
 
 /* Requests are written by hand rather than with the frame packer: the loop
@@ -170,13 +173,9 @@ static void check_connection_is_reused(void)
     assert(take_answer(far_end, &id, &status));
     assert(id == 22u && status == KSD_STATUS_OK);
     answers++;
-    /* The third cannot be served: the X server this runs against has no window
-     * manager, so there is no _NET_CLIENT_LIST to read. That is the valuable
-     * case rather than an awkward one -- an operation the display cannot serve
-     * must not be read as a display that has gone, and the count below is what
-     * says the loop kept the connection instead of dropping it to reconnect. */
+    /* Without EWMH, handle enumeration falls back to the root window tree. */
     assert(take_answer(far_end, &id, &status));
-    assert(id == 33u && status == KSD_STATUS_UNAVAILABLE);
+    assert(id == 33u && status == KSD_STATUS_OK);
     answers++;
     assert(!take_answer(far_end, &id, &status));
     assert(answers == 3u);
@@ -206,6 +205,9 @@ static void check_bad_request_does_not_end_the_loop(void)
     assert(serve_queued(far_end, near_end, KSD_BACKEND_X11, getpid()));
 
     assert(take_answer(far_end, &id, &status));
+    if (id != 1u || status != KSD_STATUS_INVALID_REQUEST)
+        fprintf(stderr, "invalid-request reply: id=%llu status=%u\n",
+                 (unsigned long long)id, status);
     assert(id == 1u && status == KSD_STATUS_INVALID_REQUEST);
     assert(take_answer(far_end, &id, &status));
     assert(id == 2u && status != KSD_STATUS_OK);
@@ -218,20 +220,49 @@ static void check_bad_request_does_not_end_the_loop(void)
     close(far_end);
 }
 
-/* A payload larger than the worker will ever be sent ends the loop with no
- * answer, rather than being trusted into a malloc of the sender's choosing.
- *
- * The body is genuinely sent, all of it. Declaring a huge length and sending
- * nothing would be refused whether the cap existed or not -- the read would
- * simply hit end-of-file -- so the cap would go untested and its removal would
- * not show up here. */
+/* An event subscription acknowledges through the same worker connection,
+ * then leaves the RPC loop and ends when the authority closes its side. */
+static void check_window_watch_transition(void)
+{
+    int reserved = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    assert(reserved == WORKER_FD);
+    xcb_connection_t *owner = xcb_connect(getenv("DISPLAY"), NULL);
+    close(reserved);
+    assert(xcb_connection_has_error(owner) == 0);
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(owner)).data;
+    const char name[] = "_NET_CLIENT_LIST";
+    xcb_intern_atom_reply_t *atom = xcb_intern_atom_reply(owner,
+        xcb_intern_atom(owner, 0u, sizeof(name) - 1u, name), NULL);
+    assert(atom != NULL);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, atom->atom,
+        XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    int far_end, near_end;
+    uint64_t id;
+    uint32_t status;
+    make_pair(&far_end, &near_end);
+    queue_request(far_end, KSD_OP_WINDOW_WATCH, 71u, NULL, 0u);
+    ksd_capture_worker_test_opens = 0u;
+    assert(serve_queued(far_end, near_end, KSD_BACKEND_X11, getpid()));
+    assert(take_answer(far_end, &id, &status));
+    assert(id == 71u && status == KSD_STATUS_OK);
+    assert(!take_answer(far_end, &id, &status));
+    assert(ksd_capture_worker_test_opens == 1u);
+    close(far_end);
+    xcb_delete_property(owner, screen->root, atom->atom);
+    free(atom);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    xcb_disconnect(owner);
+}
+
+/* Send the oversized body too, so its refusal cannot be an ordinary EOF. */
 static void check_oversized_payload_is_refused(void)
 {
     int far_end;
     int near_end;
     uint64_t id;
     uint32_t status;
-    uint8_t oversized[4096];
+    uint8_t oversized[KSD_MAX_REQUEST_PAYLOAD + 1u];
 
     memset(oversized, 0, sizeof(oversized));
     make_pair(&far_end, &near_end);
@@ -288,6 +319,25 @@ static void check_unreachable_display_is_answered(void)
     close(far_end);
 }
 
+static void check_authority_disconnect_stops_worker(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(sockets[0]);
+        alarm(2u);
+        ksd_capture_worker_test_authority_watch(sockets[1]);
+        _exit(1);
+    }
+    close(sockets[1]);
+    close(sockets[0]);
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 int main(void)
 {
     const char *display = getenv("KSD_TEST_DISPLAY");
@@ -318,9 +368,11 @@ int main(void)
     }
 
     check_immediate_eof_is_clean();
+    check_authority_disconnect_stops_worker();
     check_oversized_payload_is_refused();
     check_unreachable_display_is_answered();
     check_connection_is_reused();
     check_bad_request_does_not_end_the_loop();
+    check_window_watch_transition();
     return 0;
 }

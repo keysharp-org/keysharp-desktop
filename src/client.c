@@ -1432,6 +1432,13 @@ ksd_status ksd_capture_area(ksd_connection *connection, int32_t x, int32_t y,
                            payload, sizeof(payload), capture, error);
 }
 
+ksd_status ksd_capture_desktop(ksd_connection *connection,
+                               ksd_capture *capture, ksd_error *error)
+{
+    return request_capture(connection, KSD_OP_CAPTURE_DESKTOP, NULL, 0u,
+                           capture, error);
+}
+
 ksd_status ksd_capture_window(ksd_connection *connection,
                               const char *window_id,
                               uint32_t include_decoration,
@@ -1698,6 +1705,149 @@ ksd_status ksd_window_set_decorated(ksd_connection *connection,
 {
     return request_window_value(connection, KSD_OP_WINDOW_SET_DECORATED,
                                 handle, decorated, 1u, error);
+}
+
+ksd_status ksd_window_set_skip_taskbar(ksd_connection *connection,
+                                       uint64_t handle, uint32_t skip,
+                                       ksd_error *error)
+{
+    return request_window_value(connection, KSD_OP_WINDOW_SET_SKIP_TASKBAR,
+                                handle, skip, 1u, error);
+}
+
+static ksd_status request_window_json(ksd_connection *connection,
+    uint16_t opcode, uint64_t handle, ksd_string *json, ksd_error *error)
+{
+    uint8_t payload[8];
+    if (handle == 0u)
+        return invalid_argument(error, "invalid window handle");
+    ksd_encode_u64(payload, handle);
+    return request_string_result(connection, opcode, payload, sizeof(payload),
+                                   json, error);
+}
+
+ksd_status ksd_window_query_json(ksd_connection *connection,
+    uint64_t handle, ksd_string *json, ksd_error *error)
+{
+    return request_window_json(connection, KSD_OP_WINDOW_QUERY, handle,
+                               json, error);
+}
+
+ksd_status ksd_window_children_json(ksd_connection *connection,
+    uint64_t parent, ksd_string *json, ksd_error *error)
+{
+    return request_window_json(connection, KSD_OP_WINDOW_CHILDREN, parent,
+                               json, error);
+}
+
+ksd_status ksd_window_at_point_json(ksd_connection *connection,
+    int32_t x, int32_t y, uint32_t deepest, ksd_string *json, ksd_error *error)
+{
+    uint8_t payload[16] = { 0 };
+    if (deepest > 1u)
+        return invalid_argument(error, "invalid child-window selection");
+    ksd_encode_u32(payload, (uint32_t)x);
+    ksd_encode_u32(payload + 4u, (uint32_t)y);
+    ksd_encode_u32(payload + 8u, deepest);
+    return request_string_result(connection, KSD_OP_WINDOW_AT_POINT,
+                                   payload, sizeof(payload), json, error);
+}
+
+ksd_status ksd_display_list_json(ksd_connection *connection,
+    ksd_string *json, ksd_error *error)
+{
+    return request_string_result(connection, KSD_OP_DISPLAY_LIST, NULL, 0u,
+                                   json, error);
+}
+
+ksd_status ksd_keyboard_state_json(ksd_connection *connection,
+    ksd_string *json, ksd_error *error)
+{
+    return request_string_result(connection, KSD_OP_KEYBOARD_STATE, NULL, 0u,
+                                   json, error);
+}
+
+ksd_status ksd_keyboard_state_since_json(ksd_connection *connection,
+    const char *known_revision, ksd_string *json, ksd_error *error)
+{
+    uint8_t payload[68];
+    size_t length = known_revision == NULL ? 0u : strlen(known_revision);
+    if (known_revision == NULL || length > 64u
+        || !ksd_utf8_valid((const uint8_t *)known_revision, length, false))
+        return invalid_argument(error, "invalid keyboard keymap revision");
+    ksd_encode_u32(payload, (uint32_t)length);
+    memcpy(payload + 4u, known_revision, length);
+    return request_string_result(connection, KSD_OP_KEYBOARD_STATE, payload,
+        4u + (uint32_t)length, json, error);
+}
+
+ksd_status ksd_window_set_title(ksd_connection *connection,
+    uint64_t handle, const char *title, ksd_error *error)
+{
+    uint8_t payload[KSD_MAX_REQUEST_PAYLOAD];
+    size_t length = title == NULL ? 0u : strlen(title);
+    if (!valid_rpc(connection) || !valid_error(error) || handle == 0u
+        || title == NULL || length > sizeof(payload) - 12u
+        || !ksd_utf8_valid((const uint8_t *)title, length, false))
+        return invalid_argument(error, "invalid window title");
+    ksd_encode_u64(payload, handle);
+    ksd_encode_u32(payload + 8u, (uint32_t)length);
+    memcpy(payload + 12u, title, length);
+    return request_empty_result(connection, KSD_OP_WINDOW_SET_TITLE,
+                                  payload, 12u + (uint32_t)length, error);
+}
+
+ksd_status ksd_window_set_visible(ksd_connection *connection,
+    uint64_t handle, uint32_t visible, ksd_error *error)
+{
+    return request_window_value(connection, KSD_OP_WINDOW_SET_VISIBLE,
+                                 handle, visible, 1u, error);
+}
+
+ksd_status ksd_window_redraw(ksd_connection *connection,
+    uint64_t handle, ksd_error *error)
+{
+    return request_handle(connection, KSD_OP_WINDOW_REDRAW, handle, error);
+}
+
+ksd_status ksd_window_click(ksd_connection *connection,
+    uint64_t handle, int32_t x, int32_t y, uint32_t button,
+    uint32_t count, ksd_error *error)
+{
+    uint8_t payload[24];
+    if (!valid_rpc(connection) || !valid_error(error) || handle == 0u
+        || button < 1u || button > 5u || count < 1u || count > 100u)
+        return invalid_argument(error, "invalid window click");
+    ksd_encode_u64(payload, handle);
+    ksd_encode_u32(payload + 8u, (uint32_t)x);
+    ksd_encode_u32(payload + 12u, (uint32_t)y);
+    ksd_encode_u32(payload + 16u, button);
+    ksd_encode_u32(payload + 20u, count);
+    return request_empty_result(connection, KSD_OP_WINDOW_CLICK,
+                                  payload, sizeof(payload), error);
+}
+
+ksd_status ksd_window_button(ksd_connection *connection,
+    uint64_t handle, int32_t x, int32_t y, uint32_t button,
+    uint32_t down, ksd_error *error)
+{
+    uint8_t payload[24];
+    if (!valid_rpc(connection) || !valid_error(error) || handle == 0u
+        || button < 1u || button > 32u || down > 1u)
+        return invalid_argument(error, "invalid window button event");
+    ksd_encode_u64(payload, handle);
+    ksd_encode_u32(payload + 8u, (uint32_t)x);
+    ksd_encode_u32(payload + 12u, (uint32_t)y);
+    ksd_encode_u32(payload + 16u, button);
+    ksd_encode_u32(payload + 20u, down);
+    return request_empty_result(connection, KSD_OP_WINDOW_BUTTON,
+                                  payload, sizeof(payload), error);
+}
+
+ksd_status ksd_window_focus_child(ksd_connection *connection,
+    uint64_t handle, ksd_error *error)
+{
+    return request_handle(connection, KSD_OP_WINDOW_FOCUS_CHILD, handle, error);
 }
 
 ksd_status ksd_window_reserve(ksd_connection *connection, uint64_t cookie,

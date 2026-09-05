@@ -4,6 +4,7 @@
 #include "transport.h"
 
 #include "kwin_bus.h"
+#include "portal_capture.h"
 #include "wl_connect.h"
 #include "backend_protocol.h"
 #include "install_mode.h"
@@ -28,6 +29,7 @@
 
 #define KSD_BACKEND_STARTUP_RETRY_SECONDS 5
 #define KSD_BACKEND_STARTUP_ATTEMPTS 24u
+#define KSD_BACKEND_RECHECK_MILLISECONDS 2000
 
 /* An authority socket, and the directory holding it, must belong to the party
  * whose authority it claims to be -- otherwise anyone who could create it
@@ -230,7 +232,26 @@ static uint64_t probe_generic_operations(void)
         operations |= KSD_OPERATION_CLIPBOARD_MIMETYPES
             | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT;
     if (features.toplevel_list)
-        operations |= KSD_OPERATION_WINDOW_LIST;
+        operations |= KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES
+            | KSD_OPERATION_WINDOW_QUERY;
+    if (features.toplevel_active)
+        operations |= KSD_OPERATION_WINDOW_ACTIVE;
+    if (features.toplevel_focus)
+        operations |= KSD_OPERATION_WINDOW_FOCUS;
+    if (features.toplevel_close)
+        operations |= KSD_OPERATION_WINDOW_CLOSE;
+    if (features.toplevel_state)
+        operations |= KSD_OPERATION_WINDOW_SET_STATE;
+    if (features.screencopy)
+        operations |= KSD_OPERATION_CAPTURE_AREA;
+    if (ksd_portal_capture_available())
+        operations |= KSD_OPERATION_CAPTURE_DESKTOP;
+    if (features.absolute_pointer)
+        operations |= KSD_OPERATION_MOUSE_MOVE_ABSOLUTE;
+    if (features.cursor_position)
+        operations |= KSD_OPERATION_CURSOR_POSITION;
+    if (features.keyboard_keymap)
+        operations |= KSD_OPERATION_KEYBOARD_STATE;
     ksd_wayland_close(connection);
     return operations;
 }
@@ -267,12 +288,32 @@ static bool issue_generation(char out[KSD_KWIN_GENERATION_HEX + 1u])
     return true;
 }
 
+static bool backend_is_current(ksd_backend backend)
+{
+    ksd_backend current = ksd_backend_resolve();
+    return backend == KSD_BACKEND_GENERIC
+        ? current == KSD_BACKEND_NONE : current == backend;
+}
+
+static bool probe_keyboard_keymap(void)
+{
+    ksd_wayland *connection = NULL;
+    if (ksd_wayland_open(NULL, &connection) != KSD_STATUS_OK)
+        return false;
+    bool supported = ksd_wayland_supported(connection).keyboard_keymap;
+    ksd_wayland_close(connection);
+    return supported;
+}
+
 static bool register_backend(int descriptor, ksd_backend backend,
                              uint64_t deadline, int provider_fd,
                              uint64_t *accepted)
 {
     uint64_t requested = backend == KSD_BACKEND_GENERIC
         ? probe_generic_operations() : ksd_backend_operations(backend);
+    if (backend != KSD_BACKEND_GENERIC && backend != KSD_BACKEND_X11
+        && !probe_keyboard_keymap())
+        requested &= ~KSD_OPERATION_KEYBOARD_STATE;
     uint8_t message[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     uint8_t reply[KSD_BACKEND_REGISTRATION_SIZE] = { 0 };
     memcpy(message, ksd_backend_registration_magic,
@@ -445,10 +486,17 @@ int ksd_daemon_main(int argc, char **argv)
             .fd = descriptor,
             .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
         };
-        int ready = poll(&item, 1u, -1);
+        int ready = poll(&item, 1u, KSD_BACKEND_RECHECK_MILLISECONDS);
         if (ready < 0 && errno == EINTR)
             continue;
-        if (ready <= 0 || (item.revents
+        if (ready == 0) {
+            if (backend_is_current(backend))
+                continue;
+            fputs("keysharp-desktop daemon: compositor changed; restarting"
+                  " the session backend\n", stderr);
+            break;
+        }
+        if (ready < 0 || (item.revents
             & (POLLIN | POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
             break;
     }

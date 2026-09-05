@@ -120,19 +120,12 @@ typedef struct authority_state {
         /* Wraps provider_fd once the registration is accepted, so the many
          * connection threads can share one socket without serialising on it. */
         ksd_kwin_relay *relay;
-        /* The persistent display worker for this session, and the relay that
-         * drives it. Started on the first display request and kept, so the
-         * fork, exec, privilege drop and display connect are paid once for the
-         * session rather than once per query -- measured at 1.4 ms of process
-         * creation alone against 0.38 ms for a full forty-window enumeration.
-         *
-         * Keyed by the registration, not by the client, because the worker
-         * drops to a CLIENT's uid, gid and supplementary groups. Clients of one
-         * desktop share those in practice; one whose groups differ is served by
-         * a one-shot worker rather than by somebody else's. */
-        ksd_kwin_relay *display_relay;
-        uid_t display_uid;
-        gid_t display_gid;
+        /* Separate query and capture workers keep slow portal/capture work
+         * off the keyboard, pointer, and window request path. Both belong to
+         * this registration and retain only matching UID/GID credentials. */
+        ksd_kwin_relay *display_relay[2];
+        uid_t display_uid[2];
+        gid_t display_gid[2];
         ksp_identity identity;
         /* Captured from the compositor bus owner returned by the authority's
          * credential-dropped query. The private provider socket is pinned to
@@ -412,7 +405,9 @@ static bool trusted_backend_peer(const struct ucred *peer, uint32_t backend,
         && authority_status.st_ino == peer_status.st_ino
         && ksp_identity_capture(peer->pid, peer->uid, identity) == 0
         && (backend == KSD_BACKEND_GENERIC
-            || ksd_backend_resolve_process(peer->pid) == backend);
+            || (ksd_backend_resolve_process(peer->pid) == backend
+                && (backend != KSD_BACKEND_KWIN
+                    || ksd_session_is_wayland_process(peer->pid))));
 }
 
 static bool pipe_read_until(int descriptor, void *data, size_t length,
@@ -455,7 +450,8 @@ static pid_t query_provider_pid(uid_t uid, gid_t gid, uint32_t backend,
     bool already = uid == getuid() && uid == geteuid()
         && gid == getgid() && gid == getegid();
 
-    if ((backend != KSD_BACKEND_GNOME
+    if ((backend != KSD_BACKEND_KWIN
+         && backend != KSD_BACKEND_GNOME
          && backend != KSD_BACKEND_CINNAMON)
         || uid == 0u
         || snprintf(backend_text, sizeof(backend_text), "%u", backend) <= 0
@@ -532,6 +528,26 @@ done:
     if (executable >= 0)
         close(executable);
     return result;
+}
+
+static bool trusted_provider_process(uint32_t backend,
+                                     const ksp_identity *identity)
+{
+    const char *expected = backend == KSD_BACKEND_KWIN ? "kwin_wayland"
+        : backend == KSD_BACKEND_GNOME ? "gnome-shell"
+        : backend == KSD_BACKEND_CINNAMON ? "cinnamon" : NULL;
+    const char *basename;
+    struct stat status;
+
+    if (expected == NULL || identity == NULL || identity->pid <= 0
+        || identity->executable[0] == '\0'
+        || stat(identity->executable, &status) != 0
+        || !S_ISREG(status.st_mode) || status.st_uid != 0u
+        || (status.st_mode & (S_IWGRP | S_IWOTH)) != 0u)
+        return false;
+    basename = strrchr(identity->executable, '/');
+    basename = basename == NULL ? identity->executable : basename + 1u;
+    return strcmp(basename, expected) == 0;
 }
 
 static uint64_t registered_operations(authority_state *state, uid_t uid,
@@ -618,8 +634,9 @@ static void unregister_backend(authority_state *state, uid_t uid,
                 close(state->backends[index].provider_fd);
             /* Retiring closes the socket, which is what tells the worker to
              * exit: it serves until end-of-file and then goes. */
-            if (state->backends[index].display_relay != NULL)
-                ksd_kwin_relay_retire(state->backends[index].display_relay);
+            for (unsigned lane = 0u; lane < 2u; lane++)
+                if (state->backends[index].display_relay[lane] != NULL)
+                    ksd_kwin_relay_retire(state->backends[index].display_relay[lane]);
             memset(&state->backends[index], 0,
                    sizeof(state->backends[index]));
             state->backends[index].descriptor = -1;
@@ -683,7 +700,7 @@ static pid_t registered_provider_pid(authority_state *state, uid_t uid,
         return -1;
 
     ksp_identity verified;
-    if (ksp_identity_revalidate(&expected, &verified) != 0
+    if (ksp_identity_revalidate_cached(&expected, &verified) != 0
         || !same_identity(&expected, &verified))
         return -1;
 
@@ -748,12 +765,16 @@ static void forget_display_relay(authority_state *state,
     pthread_mutex_lock(&state->mutex);
     for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++) {
         if (!state->backends[index].active
-            || state->backends[index].uid != identity->uid
-            || state->backends[index].display_relay != relay)
+            || state->backends[index].uid != identity->uid)
             continue;
-        state->backends[index].display_relay = NULL;
-        taken = true;
-        break;
+        for (unsigned lane = 0u; lane < 2u; lane++) {
+            if (state->backends[index].display_relay[lane] == relay) {
+                state->backends[index].display_relay[lane] = NULL;
+                taken = true;
+            }
+        }
+        if (taken)
+            break;
     }
     pthread_mutex_unlock(&state->mutex);
     /* Only the thread that took it out of the slot retires it. Several callers
@@ -766,24 +787,29 @@ static void forget_display_relay(authority_state *state,
 static ksd_kwin_relay *display_relay_for(authority_state *state,
                                          const ksp_identity *identity,
                                          gid_t gid, pid_t session_pid,
-                                         uint32_t backend)
+                                         uint32_t backend, bool capture)
 {
+    unsigned lane = capture ? 1u : 0u;
     ksd_kwin_relay *relay = NULL;
     int socket_fd = -1;
     size_t slot = KSD_MAX_BACKEND_REGISTRATIONS;
+    ksp_identity registration = { 0 };
 
     pthread_mutex_lock(&state->mutex);
     for (size_t index = 0u; index < KSD_MAX_BACKEND_REGISTRATIONS; index++) {
         if (!state->backends[index].active
-            || state->backends[index].uid != identity->uid)
+            || state->backends[index].uid != identity->uid
+            || state->backends[index].backend != backend
+            || state->backends[index].identity.pid != session_pid)
             continue;
         slot = index;
-        if (state->backends[index].display_relay != NULL) {
+        registration = state->backends[index].identity;
+        if (state->backends[index].display_relay[lane] != NULL) {
             /* Only reusable by a client with the credentials the worker
              * already dropped to. */
-            if (state->backends[index].display_uid == identity->uid
-                && state->backends[index].display_gid == gid) {
-                relay = state->backends[index].display_relay;
+            if (state->backends[index].display_uid[lane] == identity->uid
+                && state->backends[index].display_gid[lane] == gid) {
+                relay = state->backends[index].display_relay[lane];
                 ksd_kwin_relay_acquire(relay);
             }
             pthread_mutex_unlock(&state->mutex);
@@ -798,7 +824,8 @@ static ksd_kwin_relay *display_relay_for(authority_state *state,
     /* Started outside the lock: a fork and an exec are far too long to hold a
      * mutex every other thread needs. Two threads racing here both spawn, and
      * the loser's worker is closed below rather than leaked. */
-    socket_fd = ksd_capture_worker_spawn(identity, gid, session_pid, backend);
+    socket_fd = ksd_capture_worker_spawn(identity, gid, session_pid,
+        backend == KSD_BACKEND_X11 ? KSD_BACKEND_X11 : KSD_BACKEND_GENERIC);
     if (socket_fd < 0)
         return NULL;
     relay = ksd_kwin_relay_create(socket_fd);
@@ -809,23 +836,24 @@ static ksd_kwin_relay *display_relay_for(authority_state *state,
 
     pthread_mutex_lock(&state->mutex);
     if (!state->backends[slot].active
-        || state->backends[slot].uid != identity->uid) {
+        || state->backends[slot].uid != identity->uid
+        || !same_identity(&state->backends[slot].identity, &registration)) {
         /* The registration went away while the worker was starting. */
         pthread_mutex_unlock(&state->mutex);
         ksd_kwin_relay_retire(relay);
         return NULL;
     }
-    if (state->backends[slot].display_relay != NULL) {
-        ksd_kwin_relay *winner = state->backends[slot].display_relay;
+    if (state->backends[slot].display_relay[lane] != NULL) {
+        ksd_kwin_relay *winner = state->backends[slot].display_relay[lane];
 
         ksd_kwin_relay_acquire(winner);
         pthread_mutex_unlock(&state->mutex);
         ksd_kwin_relay_retire(relay);
         return winner;
     }
-    state->backends[slot].display_relay = relay;
-    state->backends[slot].display_uid = identity->uid;
-    state->backends[slot].display_gid = gid;
+    state->backends[slot].display_relay[lane] = relay;
+    state->backends[slot].display_uid[lane] = identity->uid;
+    state->backends[slot].display_gid[lane] = gid;
     ksd_kwin_relay_acquire(relay);
     pthread_mutex_unlock(&state->mutex);
     return relay;
@@ -849,7 +877,7 @@ static uint32_t registered_backend(authority_state *state, uid_t uid)
     if (descriptor < 0 || backend == KSD_BACKEND_NONE)
         return KSD_BACKEND_NONE;
     ksp_identity verified;
-    if (ksp_identity_revalidate(&expected, &verified) != 0
+    if (ksp_identity_revalidate_cached(&expected, &verified) != 0
         || !same_identity(&expected, &verified)
         || !backend_matches_session(backend, expected.pid))
         return KSD_BACKEND_NONE;
@@ -978,13 +1006,15 @@ static void handle_backend_connection(authority_state *state, int descriptor,
         valid = false;
         rejection = "untrusted session daemon";
     }
-    if (valid && (backend == KSD_BACKEND_GNOME
+    if (valid && (backend == KSD_BACKEND_KWIN
+                  || backend == KSD_BACKEND_GNOME
                   || backend == KSD_BACKEND_CINNAMON)) {
         provider_pid = query_provider_pid(peer->uid, peer->gid, backend,
                                           deadline);
         if (provider_pid <= 0
             || ksp_identity_capture(provider_pid, peer->uid,
-                                    &provider_identity) != 0) {
+                                    &provider_identity) != 0
+            || !trusted_provider_process(backend, &provider_identity)) {
             valid = false;
             rejection = "untrusted provider process";
         }
@@ -1139,7 +1169,7 @@ static bool send_revoked(authority_session *session, uint32_t scopes)
 static bool session_identity_refresh(authority_session *session)
 {
     ksp_identity verified;
-    if (ksp_identity_revalidate(&session->identity, &verified) != 0
+    if (ksp_identity_revalidate_cached(&session->identity, &verified) != 0
         || !same_identity(&session->identity, &verified))
         return false;
     session->identity = verified;
@@ -1151,7 +1181,7 @@ static bool session_refresh(authority_session *session, bool force_identity,
                             bool notify, bool *generation_changed)
 {
     uint64_t generation;
-    uint32_t allowed = 0u;
+    uint32_t allowed = session->granted_scopes;
     uint32_t revoked;
     bool changed;
 
@@ -1166,7 +1196,7 @@ static bool session_refresh(authority_session *session, bool force_identity,
         if (!session_identity_refresh(session))
             goto failed;
     }
-    if (session->requested_scopes != 0u) {
+    if (generation != session->generation) {
         if (ksp_store_check_at_generation(session->state->store,
                 session->identity.uid, session->identity.hash,
                 session->requested_scopes, &allowed, &generation) != 0)
@@ -1227,6 +1257,70 @@ static bool capture_still_authorized(void *user_data)
             == KSP_SCOPE_SCREEN_CAPTURE;
 }
 
+static ksp_polkit_result user_consent(authority_session *session,
+                                       uint32_t scopes)
+{
+    char scope_names[256];
+    char display_path[KSP_PATH_CAPACITY];
+    char *program = g_find_program_in_path("zenity");
+    bool zenity = program != NULL;
+    GPid child = 0;
+    GError *error = NULL;
+    int status;
+
+    if (!zenity)
+        program = g_find_program_in_path("kdialog");
+    if (program == NULL || ksp_scopes_format(scopes, true, scope_names,
+                                             sizeof(scope_names)) != 0) {
+        g_free(program);
+        return KSP_POLKIT_UNAVAILABLE;
+    }
+    ksp_sanitize_display_text(session->identity.executable, display_path,
+                               sizeof(display_path));
+    char *message = g_strdup_printf(
+        "Always allow %s for %s?\n\nThis user installation stores your choice "
+        "in your account. Programs running as you can change it.",
+        scope_names, display_path);
+    char *escaped = zenity ? NULL : g_markup_escape_text(message, -1);
+    char *zenity_arguments[] = { program, "--question", "--no-markup",
+        "--title=Desktop permissions", "--ok-label=Always Allow",
+        "--cancel-label=Deny", "--text", message, NULL };
+    char *kdialog_arguments[] = { program, "--title", "Desktop permissions",
+        "--yes-label", "Always Allow", "--no-label", "Deny", "--yesno",
+        escaped, NULL };
+    bool started = g_spawn_async(NULL,
+        zenity ? zenity_arguments : kdialog_arguments, NULL,
+        G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL
+            | G_SPAWN_STDERR_TO_DEV_NULL,
+        NULL, NULL, &child, &error);
+    g_clear_error(&error);
+    g_free(escaped);
+    g_free(message);
+    g_free(program);
+    if (!started)
+        return KSP_POLKIT_UNAVAILABLE;
+    uint64_t deadline = monotonic_milliseconds() + 120000u;
+    for (;;) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            g_spawn_close_pid(child);
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0
+                ? KSP_POLKIT_GRANTED : KSP_POLKIT_DENIED;
+        }
+        bool cancelled = authority_disconnected(session);
+        if ((waited < 0 && errno != EINTR) || cancelled
+            || monotonic_milliseconds() >= deadline) {
+            (void)kill(child, SIGKILL);
+            while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
+            }
+            g_spawn_close_pid(child);
+            return cancelled ? KSP_POLKIT_CANCELLED : KSP_POLKIT_UNAVAILABLE;
+        }
+        struct timespec delay = { .tv_nsec = 100000000L };
+        (void)nanosleep(&delay, NULL);
+    }
+}
+
 static uint32_t authorize_scopes(authority_session *session,
                                  uint32_t requested, uint16_t auth_mode,
                                  uint32_t *granted)
@@ -1242,13 +1336,13 @@ static uint32_t authorize_scopes(authority_session *session,
         || (requested & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u
         || (auth_mode != KSD_AUTH_CHECK && auth_mode != KSD_AUTH_REQUEST))
         return KSD_STATUS_INVALID_REQUEST;
+    session->requested_scopes |= requested;
     if (ksp_store_check_at_generation(session->state->store,
-            session->identity.uid, session->identity.hash, requested,
+            session->identity.uid, session->identity.hash, session->requested_scopes,
             &allowed, &generation) != 0)
         return KSD_STATUS_INTERNAL;
-    session->requested_scopes |= requested;
     session->generation = generation;
-    session->granted_scopes |= allowed;
+    session->granted_scopes = allowed;
     if ((allowed & requested) == requested) {
         *granted = session->granted_scopes;
         return KSD_STATUS_OK;
@@ -1271,11 +1365,11 @@ static uint32_t authorize_scopes(authority_session *session,
     }
     session->identity = verified;
     if (ksp_store_check_at_generation(session->state->store,
-            session->identity.uid, session->identity.hash, requested,
+            session->identity.uid, session->identity.hash, session->requested_scopes,
             &allowed, &generation) != 0)
         goto done;
     session->generation = generation;
-    session->granted_scopes |= allowed;
+    session->granted_scopes = allowed;
     uint32_t missing = requested & ~allowed;
     if (missing == 0u) {
         status = KSD_STATUS_OK;
@@ -1289,8 +1383,10 @@ static uint32_t authorize_scopes(authority_session *session,
         .allowed_scopes = KSD_DESKTOP_MANAGED_SCOPES,
         .timeout_seconds = 120u,
     };
-    ksp_polkit_result decision = ksp_polkit_authorize(&polkit,
-        &session->identity, missing, authority_disconnected, session);
+    ksp_polkit_result decision = ksd_install_is_system()
+        ? ksp_polkit_authorize(&polkit, &session->identity, missing,
+                                authority_disconnected, session)
+        : user_consent(session, missing);
     if (decision != KSP_POLKIT_GRANTED) {
         status = decision == KSP_POLKIT_DENIED ? KSD_STATUS_DENIED
             : decision == KSP_POLKIT_CANCELLED
@@ -1311,10 +1407,10 @@ static uint32_t authorize_scopes(authority_session *session,
     }
     session->identity = verified;
     if (ksp_store_check_at_generation(session->state->store,
-            session->identity.uid, session->identity.hash, requested,
+            session->identity.uid, session->identity.hash, session->requested_scopes,
             &allowed, &session->generation) != 0)
         goto done;
-    session->granted_scopes |= allowed;
+    session->granted_scopes = allowed;
     status = (allowed & requested) == requested
         ? KSD_STATUS_OK : KSD_STATUS_REVOKED;
 
@@ -1553,6 +1649,57 @@ static bool watch_cancelled(void *user_data)
         || (session->granted_scopes & context->scope) != context->scope;
 }
 
+static bool start_x11_watch(authority_session *session,
+                            const ksd_frame *request, watch_context *context)
+{
+    pid_t session_pid = registered_backend_pid(session->state, session->identity.uid);
+    int worker_fd = ksd_capture_worker_spawn(&session->identity, session->gid,
+                                             session_pid, KSD_BACKEND_X11);
+    if (worker_fd < 0)
+        return forward_response(session, request, KSD_STATUS_UNAVAILABLE, 0u,
+                                 "could not start the X11 event worker", NULL, 0u, false);
+    ksd_frame reply = { 0 };
+    bool ready = ksd_frame_write(worker_fd, request)
+        && ksd_frame_read(worker_fd, public_magic, KSD_PROTOCOL_MAJOR,
+                           KSD_PROTOCOL_MINOR, 8u, false, &reply) > 0
+        && reply.flags == 0u && reply.opcode == 0u
+        && reply.request_id == request->request_id && reply.payload_length == 8u;
+    uint32_t status = ready ? ksd_decode_u32(reply.payload) : KSD_STATUS_UNAVAILABLE;
+    ksd_frame_clear(&reply);
+    if (status != KSD_STATUS_OK) {
+        close(worker_fd);
+        return forward_response(session, request, KSD_STATUS_UNAVAILABLE, 0u,
+                                 "X11 window events are unavailable", NULL, 0u, false);
+    }
+    bool ok = !watch_cancelled(context)
+        && forward_response(session, request, KSD_STATUS_OK, 0u, NULL, NULL, 0u, false);
+    while (ok && !watch_cancelled(context)) {
+        struct pollfd descriptors[2] = {
+            { .fd = worker_fd, .events = POLLIN | POLLHUP | POLLERR },
+            { .fd = session->client_fd, .events = POLLIN | POLLHUP | POLLERR },
+        };
+        int count = poll(descriptors, 2u, KSD_GENERATION_POLL_MS);
+        if (count < 0) { if (errno == EINTR) continue; break; }
+        if (descriptors[1].revents != 0) break;
+        if (descriptors[0].revents == 0) continue;
+        ksd_frame event = { 0 };
+        if (ksd_frame_read(worker_fd, public_magic, KSD_PROTOCOL_MAJOR,
+                             KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES + 8u,
+                             true, &event) <= 0) break;
+        ok = event.flags == KSD_FLAG_EVENT && event.opcode == KSD_OP_WINDOW_EVENT
+            && event.request_id == 0u && event.payload_length >= 8u
+            && ksd_decode_u16(event.payload) >= KSD_WINDOW_EVENT_CREATE
+            && ksd_decode_u16(event.payload) <= KSD_WINDOW_EVENT_ACTIVE_STATE
+            && ksd_decode_u16(event.payload + 2u) == 0u
+            && ksd_decode_u32(event.payload + 4u) == event.payload_length - 8u
+            && ksd_utf8_valid(event.payload + 8u, event.payload_length - 8u, false)
+            && watch_emit(event.opcode, event.payload, event.payload_length, context);
+        ksd_frame_clear(&event);
+    }
+    close(worker_fd);
+    return false;
+}
+
 static bool start_watch(authority_session *session,
                         const ksd_frame *request, uint32_t scope)
 {
@@ -1561,14 +1708,16 @@ static bool start_watch(authority_session *session,
         return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
                                 0u, "invalid event subscription",
                                 NULL, 0u, false);
-    if (!forward_response(session, request, KSD_STATUS_OK, 0u,
-                          NULL, NULL, 0u, false))
-        return false;
     watch_context context = {
         .session = session,
         .scope = scope,
         .backend = session->backend,
     };
+    if (session->backend == KSD_BACKEND_X11)
+        return start_x11_watch(session, request, &context);
+    if (!forward_response(session, request, KSD_STATUS_OK, 0u,
+                          NULL, NULL, 0u, false))
+        return false;
     char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
     pid_t provider_pid = registered_provider_pid(session->state,
         session->identity.uid, session->backend);
@@ -1788,12 +1937,15 @@ static bool execute_operation(authority_session *session,
                                 0u, "event streams only accept subscriptions",
                                 NULL, 0u, false);
     bool capture = request->opcode == KSD_OP_CAPTURE_AREA
-        || request->opcode == KSD_OP_CAPTURE_WINDOW;
+        || request->opcode == KSD_OP_CAPTURE_WINDOW
+        || request->opcode == KSD_OP_CAPTURE_DESKTOP;
     /* Rule F1. A KWin operation that reaches the script is held to four per
      * consumer, refused before the provider call rather than queued, because
      * BUSY that provably never reached the compositor is always safe to retry
      * and a queue entry would not be. */
-    bool kwin_script = session->backend == KSD_BACKEND_KWIN && !capture;
+    bool keyboard_worker = request->opcode == KSD_OP_KEYBOARD_STATE;
+    bool kwin_script = session->backend == KSD_BACKEND_KWIN && !capture
+        && !keyboard_worker;
     if (kwin_script
         && !reserve_kwin_slot(session->state, session->identity.pid))
         return forward_response(session, request, KSD_STATUS_BUSY, 0u,
@@ -1809,6 +1961,7 @@ static bool execute_operation(authority_session *session,
     uint64_t before = session->generation;
     uint32_t before_backend = session->backend;
     ksd_operation_result result;
+    ksd_result_init(&result);
     /* Three routes. KWin capture, every X11 verb, and every generic Wayland
      * verb run in the forked, privilege-dropped worker; everything else goes
      * to a compositor provider over the session bus. The generic backend has
@@ -1830,48 +1983,40 @@ static bool execute_operation(authority_session *session,
                                       now + KSD_KWIN_OP_DEADLINE_MS, &result);
             ksd_kwin_relay_release(relay);
         }
-    } else if (session->backend == KSD_BACKEND_KWIN
+    } else if (keyboard_worker || session->backend == KSD_BACKEND_KWIN
         || session->backend == KSD_BACKEND_X11
         || session->backend == KSD_BACKEND_GENERIC) {
         pid_t session_pid = registered_backend_pid(session->state,
                                                    session->identity.uid);
         ksd_kwin_relay *display = NULL;
 
-        /* Captures keep the one-shot worker. A capture is rare and expensive
-         * enough that per-request isolation is worth more than the setup it
-         * saves, and it needs the pipe and spool a persistent worker does not
-         * hold. Everything else goes to the session's worker, which has its
-         * display already open. */
-        if (!capture && session->backend != KSD_BACKEND_KWIN)
+        if (session->backend != KSD_BACKEND_KWIN || keyboard_worker)
             display = display_relay_for(session->state, &session->identity,
                                         session->gid, session_pid,
-                                        session->backend);
+                                        session->backend, capture);
         if (display != NULL) {
             uint64_t now = monotonic_milliseconds();
             bool gone;
 
             (void)ksd_kwin_relay_call(display, request,
-                                      now + KSD_DISPLAY_DEADLINE_MS, &result);
-            /* A worker that has gone is not a failed operation. Falling back
-             * to a one-shot worker answers the request the caller actually
-             * made, and dropping the dead one here is what makes the next
-             * request start a fresh persistent worker rather than find this
-             * corpse and fall back again. */
-            gone = result.status == KSD_STATUS_UNAVAILABLE;
+                now + (capture ? 35000u : KSD_DISPLAY_DEADLINE_MS), &result);
+            gone = ksd_kwin_relay_is_broken(display);
             if (gone) {
-                ksd_result_clear(&result);
                 forget_display_relay(session->state, &session->identity,
                                      display);
             }
             ksd_kwin_relay_release(display);
-            if (gone)
-                display = NULL;
         }
-        if (display == NULL)
+        else if (session->backend == KSD_BACKEND_KWIN && !keyboard_worker)
             ksd_capture_worker_execute(&session->identity, session->gid,
                                        request, capture_still_authorized,
                                        session, session_pid,
                                        session->backend, &result);
+        else {
+            ksd_result_init(&result);
+            ksd_result_error(&result, KSD_STATUS_UNAVAILABLE, 0u,
+                             "the display worker is unavailable");
+        }
     } else {
         pid_t provider_pid = registered_provider_pid(session->state,
             session->identity.uid, session->backend);
@@ -2349,6 +2494,82 @@ int ksd_authority_main(int argc, char **argv)
 }
 
 #ifdef KSD_AUTHORITY_TESTING
+bool ksd_authority_test_display_lanes(void)
+{
+    authority_state state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+    ksp_identity identity;
+    int query_sockets[2];
+    int capture_sockets[2];
+    if (ksp_identity_capture(getpid(), getuid(), &identity) != 0
+        || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, query_sockets)
+            != 0)
+        return false;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, capture_sockets)
+        != 0) {
+        close(query_sockets[0]);
+        close(query_sockets[1]);
+        return false;
+    }
+    state.backends[0].active = true;
+    state.backends[0].uid = getuid();
+    state.backends[0].backend = KSD_BACKEND_GNOME;
+    state.backends[0].identity = identity;
+    state.backends[0].descriptor = -1;
+    state.backends[0].provider_fd = -1;
+    state.backends[0].display_relay[0] = ksd_kwin_relay_create(query_sockets[0]);
+    state.backends[0].display_relay[1] = ksd_kwin_relay_create(capture_sockets[0]);
+    for (unsigned lane = 0u; lane < 2u; lane++) {
+        state.backends[0].display_uid[lane] = getuid();
+        state.backends[0].display_gid[lane] = getgid();
+    }
+    ksd_kwin_relay *query = display_relay_for(&state, &identity, getgid(),
+        getpid(), KSD_BACKEND_GNOME, false);
+    ksd_kwin_relay *capture = display_relay_for(&state, &identity, getgid(),
+        getpid(), KSD_BACKEND_GNOME, true);
+    bool ok = query != NULL && capture != NULL && query != capture;
+    if (query != NULL) {
+        forget_display_relay(&state, &identity, query);
+        ok = ok && state.backends[0].display_relay[0] == NULL
+            && state.backends[0].display_relay[1] == capture
+            && !ksd_kwin_relay_is_broken(capture);
+        ksd_kwin_relay_release(query);
+    }
+    unregister_backend(&state, getuid(), -1);
+    if (capture != NULL) {
+        ok = ok && ksd_kwin_relay_is_broken(capture);
+        ksd_kwin_relay_release(capture);
+    }
+    close(query_sockets[1]);
+    close(capture_sockets[1]);
+    pthread_mutex_destroy(&state.mutex);
+    return ok;
+}
+
+bool ksd_authority_test_scope_cache(ksp_store *store)
+{
+    authority_state state = { .store = store };
+    authority_session session = { .state = &state };
+    uint32_t scopes = KSP_SCOPE_WINDOW_MONITORING | KSP_SCOPE_WINDOW_CONTROL;
+    uint32_t granted = 0u;
+    uint64_t generation;
+    if (ksp_identity_capture(getpid(), getuid(), &session.identity) != 0
+        || ksp_store_generation(store, getuid(), &generation) != 0
+        || ksp_store_grant_if_generation(store, &session.identity, scopes,
+                                          generation) != 0
+        || authorize_scopes(&session, scopes, KSD_AUTH_CHECK, &granted)
+            != KSD_STATUS_OK || granted != scopes
+        || ksp_store_revoke(store, getuid(), session.identity.hash,
+                            KSP_SCOPE_WINDOW_CONTROL) != 0)
+        return false;
+    bool ok = authorize_scopes(&session, KSP_SCOPE_WINDOW_MONITORING,
+                                KSD_AUTH_CHECK, &granted) == KSD_STATUS_OK
+        && granted == KSP_SCOPE_WINDOW_MONITORING
+        && session_refresh(&session, false, false, NULL)
+        && session.granted_scopes == KSP_SCOPE_WINDOW_MONITORING;
+    return ksp_store_revoke(store, getuid(), session.identity.hash, scopes) == 0
+        && ok;
+}
+
 int ksd_authority_test_capture_budget(unsigned int uid, unsigned int pid,
                                       int reserve)
 {

@@ -23,7 +23,7 @@ Applications connect directly to `/run/keysharp-desktop/keysharp-desktop.sock`. 
 socket is mode 0666; authorization comes from kernel peer credentials and recorded
 grants, not from filesystem permissions on the socket.
 
-The public client ABI is 0.1. The wire protocol is private and is an implementation
+The public client ABI version is declared in `include/keysharp_desktop/client.h`. The wire protocol is private and is an implementation
 detail of that ABI.
 
 ## Relationship to Keysharp
@@ -86,8 +86,8 @@ sudo cmake --install build
 The install step finishes the system side: linker cache, permission store, enabling and
 starting `keysharp-desktop-authority.socket`, and `--global enable` of the per-user
 service. Configure with `-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF` to install files only,
-which is what packaging does. `sudo ./install.sh` wraps the same three commands, adds the
-distribution dependencies, and refreshes the invoking user's session — the one step
+which is what packaging does. `sudo ./install.sh` wraps configure, build and install,
+and refreshes the invoking user's session — the one step
 CMake cannot do, because it needs that user's bus.
 
 Use `-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path` to develop against a sibling
@@ -146,8 +146,7 @@ or any new backend, and do not delete them: nothing is removed and no ABI change
 - Provider JavaScript is validated in CI; keep the GNOME and Cinnamon extensions in step
   with the private provider interface.
 - Public API changes need `include/keysharp_desktop/client.h`, `docs/integrating.md`, and
-  the README's worked examples updated together. The README's C blocks are meant to
-  compile as written.
+  the complete C programs in `examples/` updated together.
 
 ## Traps worth knowing
 

@@ -9,6 +9,7 @@
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
+#include "x11_extended.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -72,7 +73,59 @@ bool ksd_x11_request_valid(const ksd_frame *request)
         case KSD_OP_WINDOW_HANDLES:
         case KSD_OP_CURSOR_POSITION:
         case KSD_OP_WORK_AREA:
+        case KSD_OP_DISPLAY_LIST:
             return request->payload_length == 0u;
+        case KSD_OP_KEYBOARD_STATE: {
+            uint32_t length;
+            const uint8_t *revision;
+            return request->payload_length == 0u
+                || (ksd_cursor_u32(&cursor, &length) && length <= 64u
+                    && ksd_cursor_bytes(&cursor, length, &revision)
+                    && ksd_cursor_finished(&cursor)
+                    && ksd_utf8_valid(revision, length, false));
+        }
+        case KSD_OP_WINDOW_AT_POINT: {
+            int32_t x, y;
+            uint32_t deepest, zero;
+            return ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && ksd_cursor_u32(&cursor, &deepest)
+                && ksd_cursor_u32(&cursor, &zero) && deepest <= 1u
+                && zero == 0u && ksd_cursor_finished(&cursor);
+        }
+        case KSD_OP_MOUSE_MOVE_ABSOLUTE: {
+            int32_t x, y;
+            return ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && x >= INT16_MIN && x <= INT16_MAX
+                && y >= INT16_MIN && y <= INT16_MAX
+                && ksd_cursor_finished(&cursor);
+        }
+        case KSD_OP_WINDOW_SET_TITLE: {
+            uint64_t handle;
+            uint32_t length;
+            const uint8_t *title;
+            return ksd_cursor_u64(&cursor, &handle) && handle_is_xid(handle)
+                && ksd_cursor_u32(&cursor, &length)
+                && length <= KSD_MAX_REQUEST_PAYLOAD - 12u
+                && ksd_cursor_bytes(&cursor, length, &title)
+                && ksd_cursor_finished(&cursor)
+                && ksd_utf8_valid(title, length, false);
+        }
+        case KSD_OP_WINDOW_CLICK:
+        case KSD_OP_WINDOW_BUTTON: {
+            uint64_t handle;
+            int32_t x, y;
+            uint32_t button, count;
+            return ksd_cursor_u64(&cursor, &handle) && handle_is_xid(handle)
+                && ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && x >= INT16_MIN && x <= INT16_MAX
+                && y >= INT16_MIN && y <= INT16_MAX
+                && ksd_cursor_u32(&cursor, &button) && button >= 1u
+                && button <= (request->opcode == KSD_OP_WINDOW_BUTTON ? 32u : 5u)
+                && ksd_cursor_u32(&cursor, &count)
+                && (request->opcode == KSD_OP_WINDOW_BUTTON ? count <= 1u
+                    : count >= 1u && count <= 100u)
+                && ksd_cursor_finished(&cursor);
+        }
         case KSD_OP_CAPTURE_AREA: {
             int32_t x;
             int32_t y;
@@ -102,7 +155,11 @@ bool ksd_x11_request_valid(const ksd_frame *request)
         case KSD_OP_WINDOW_RAISE:
         case KSD_OP_WINDOW_LOWER:
         case KSD_OP_WINDOW_CLOSE:
-        case KSD_OP_WINDOW_KILL: {
+        case KSD_OP_WINDOW_KILL:
+        case KSD_OP_WINDOW_QUERY:
+        case KSD_OP_WINDOW_CHILDREN:
+        case KSD_OP_WINDOW_FOCUS_CHILD:
+        case KSD_OP_WINDOW_REDRAW: {
             uint64_t handle;
             return ksd_cursor_u64(&cursor, &handle)
                 && ksd_cursor_finished(&cursor)
@@ -129,7 +186,8 @@ bool ksd_x11_request_valid(const ksd_frame *request)
         case KSD_OP_WINDOW_SET_STATE:
         case KSD_OP_WINDOW_SET_OPACITY:
         case KSD_OP_WINDOW_SET_ABOVE:
-        case KSD_OP_WINDOW_SET_DECORATED: {
+        case KSD_OP_WINDOW_SET_DECORATED:
+        case KSD_OP_WINDOW_SET_VISIBLE: {
             uint64_t handle;
             uint32_t value;
             uint32_t tail_reserved;
@@ -223,6 +281,69 @@ bool ksd_x11_execute_on(struct ksd_x11 *connection, const ksd_frame *request,
         return true;
     }
     switch (request->opcode) {
+        case KSD_OP_WINDOW_QUERY:
+            ksd_x11_window_query(connection,
+                (uint32_t)ksd_decode_u64(request->payload), result);
+            break;
+        case KSD_OP_WINDOW_CHILDREN:
+            ksd_x11_window_children(connection,
+                (uint32_t)ksd_decode_u64(request->payload), result);
+            break;
+        case KSD_OP_WINDOW_AT_POINT:
+            ksd_x11_window_at_point(connection,
+                (int32_t)ksd_decode_u32(request->payload),
+                (int32_t)ksd_decode_u32(request->payload + 4u),
+                ksd_decode_u32(request->payload + 8u) != 0u, result);
+            break;
+        case KSD_OP_DISPLAY_LIST:
+            ksd_x11_display_list(connection, result);
+            break;
+        case KSD_OP_KEYBOARD_STATE:
+            ksd_x11_keyboard_state_since(connection,
+                request->payload_length == 0u ? NULL : request->payload + 4u,
+                request->payload_length == 0u ? 0u
+                    : ksd_decode_u32(request->payload), result);
+            break;
+        case KSD_OP_WINDOW_SET_TITLE:
+            ksd_x11_window_set_title(connection,
+                (uint32_t)ksd_decode_u64(request->payload),
+                request->payload + 12u, ksd_decode_u32(request->payload + 8u),
+                result);
+            break;
+        case KSD_OP_WINDOW_SET_VISIBLE:
+            ksd_x11_window_set_visible(connection,
+                (uint32_t)ksd_decode_u64(request->payload),
+                ksd_decode_u32(request->payload + 8u) != 0u, result);
+            break;
+        case KSD_OP_WINDOW_REDRAW:
+            ksd_x11_window_redraw(connection,
+                (uint32_t)ksd_decode_u64(request->payload), result);
+            break;
+        case KSD_OP_WINDOW_CLICK:
+            ksd_x11_window_click(connection,
+                (uint32_t)ksd_decode_u64(request->payload),
+                (int32_t)ksd_decode_u32(request->payload + 8u),
+                (int32_t)ksd_decode_u32(request->payload + 12u),
+                ksd_decode_u32(request->payload + 16u),
+                ksd_decode_u32(request->payload + 20u), result);
+            break;
+        case KSD_OP_WINDOW_BUTTON:
+            ksd_x11_window_button(connection,
+                (uint32_t)ksd_decode_u64(request->payload),
+                (int32_t)ksd_decode_u32(request->payload + 8u),
+                (int32_t)ksd_decode_u32(request->payload + 12u),
+                ksd_decode_u32(request->payload + 16u),
+                ksd_decode_u32(request->payload + 20u) != 0u, result);
+            break;
+        case KSD_OP_WINDOW_FOCUS_CHILD:
+            ksd_x11_window_focus_child(connection,
+                (uint32_t)ksd_decode_u64(request->payload), result);
+            break;
+        case KSD_OP_MOUSE_MOVE_ABSOLUTE:
+            ksd_x11_mouse_move_absolute(connection,
+                (int32_t)ksd_decode_u32(request->payload),
+                (int32_t)ksd_decode_u32(request->payload + 4u), result);
+            break;
         case KSD_OP_WINDOW_LIST: {
             ksd_cursor cursor;
             uint32_t include_hidden = 0u;

@@ -6,13 +6,20 @@
 
 uint32_t ksd_operation_scope(uint16_t opcode)
 {
-    if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW)
+    if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW
+        || opcode == KSD_OP_CAPTURE_DESKTOP)
         return KSP_SCOPE_SCREEN_CAPTURE;
     if (opcode == KSD_OP_WINDOW_LIST || opcode == KSD_OP_WINDOW_ACTIVE
-        || opcode == KSD_OP_WINDOW_WATCH)
+        || opcode == KSD_OP_WINDOW_WATCH || opcode == KSD_OP_WINDOW_QUERY
+        || opcode == KSD_OP_WINDOW_CHILDREN
+        || opcode == KSD_OP_WINDOW_AT_POINT)
         return KSP_SCOPE_WINDOW_MONITORING;
-    if (opcode >= KSD_OP_WINDOW_FOCUS
-        && opcode <= KSD_OP_WINDOW_GET_RESERVED)
+    if ((opcode >= KSD_OP_WINDOW_FOCUS
+        && opcode <= KSD_OP_WINDOW_SET_SKIP_TASKBAR)
+        || opcode == KSD_OP_WINDOW_SET_TITLE
+        || opcode == KSD_OP_WINDOW_SET_VISIBLE
+        || opcode == KSD_OP_WINDOW_REDRAW || opcode == KSD_OP_WINDOW_CLICK
+        || opcode == KSD_OP_WINDOW_BUTTON || opcode == KSD_OP_WINDOW_FOCUS_CHILD)
         return KSP_SCOPE_WINDOW_CONTROL;
     if (opcode >= KSD_OP_CLIPBOARD_MIMETYPES
         && opcode <= KSD_OP_CLIPBOARD_WATCH)
@@ -30,7 +37,8 @@ bool ksd_operation_scope_free(uint16_t opcode)
      * is, who owns it or where. Reading any of that is WINDOW_MONITORING. */
     return opcode == KSD_OP_CURSOR_POSITION || opcode == KSD_OP_WORK_AREA
         || opcode == KSD_OP_CLIPBOARD_SET_CONTENT
-        || opcode == KSD_OP_WINDOW_HANDLES;
+        || opcode == KSD_OP_WINDOW_HANDLES
+        || opcode == KSD_OP_DISPLAY_LIST || opcode == KSD_OP_KEYBOARD_STATE;
 }
 
 bool ksd_operation_chunkable(uint16_t opcode)
@@ -51,6 +59,7 @@ uint64_t ksd_operation_bit(uint16_t opcode)
     switch (opcode) {
         case KSD_OP_CAPTURE_AREA: return KSD_OPERATION_CAPTURE_AREA;
         case KSD_OP_CAPTURE_WINDOW: return KSD_OPERATION_CAPTURE_WINDOW;
+        case KSD_OP_CAPTURE_DESKTOP: return KSD_OPERATION_CAPTURE_DESKTOP;
         case KSD_OP_WINDOW_LIST: return KSD_OPERATION_WINDOW_LIST;
         case KSD_OP_WINDOW_HANDLES: return KSD_OPERATION_WINDOW_HANDLES;
         case KSD_OP_WINDOW_ACTIVE: return KSD_OPERATION_WINDOW_ACTIVE;
@@ -76,6 +85,8 @@ uint64_t ksd_operation_bit(uint16_t opcode)
             return KSD_OPERATION_WINDOW_RESERVE;
         case KSD_OP_WINDOW_GET_RESERVED:
             return KSD_OPERATION_WINDOW_GET_RESERVED;
+        case KSD_OP_WINDOW_SET_SKIP_TASKBAR:
+            return KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR;
         case KSD_OP_CLIPBOARD_MIMETYPES:
             return KSD_OPERATION_CLIPBOARD_MIMETYPES;
         case KSD_OP_CLIPBOARD_CONTENT:
@@ -92,6 +103,17 @@ uint64_t ksd_operation_bit(uint16_t opcode)
         case KSD_OP_MOUSE_SCROLL: return KSD_OPERATION_MOUSE_SCROLL;
         case KSD_OP_CURSOR_POSITION: return KSD_OPERATION_CURSOR_POSITION;
         case KSD_OP_WORK_AREA: return KSD_OPERATION_WORK_AREA;
+        case KSD_OP_WINDOW_QUERY: return KSD_OPERATION_WINDOW_QUERY;
+        case KSD_OP_WINDOW_CHILDREN: return KSD_OPERATION_WINDOW_CHILDREN;
+        case KSD_OP_WINDOW_AT_POINT: return KSD_OPERATION_WINDOW_AT_POINT;
+        case KSD_OP_DISPLAY_LIST: return KSD_OPERATION_DISPLAY_LIST;
+        case KSD_OP_KEYBOARD_STATE: return KSD_OPERATION_KEYBOARD_STATE;
+        case KSD_OP_WINDOW_SET_TITLE: return KSD_OPERATION_WINDOW_SET_TITLE;
+        case KSD_OP_WINDOW_SET_VISIBLE: return KSD_OPERATION_WINDOW_SET_VISIBLE;
+        case KSD_OP_WINDOW_REDRAW: return KSD_OPERATION_WINDOW_REDRAW;
+        case KSD_OP_WINDOW_CLICK: return KSD_OPERATION_WINDOW_CLICK;
+        case KSD_OP_WINDOW_BUTTON: return KSD_OPERATION_WINDOW_BUTTON;
+        case KSD_OP_WINDOW_FOCUS_CHILD: return KSD_OPERATION_WINDOW_FOCUS_CHILD;
         default: return 0u;
     }
 }

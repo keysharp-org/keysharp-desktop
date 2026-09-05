@@ -55,9 +55,9 @@ static GDBusConnection *get_session_bus(GError **error)
     return session_bus;
 }
 
-static bool trusted_kwin_owner(GDBusConnection *connection,
-                               uint64_t deadline, char **destination,
-                               pid_t *owner_pid)
+static bool query_kwin_owner(GDBusConnection *connection,
+                             uint64_t deadline, uid_t expected_uid,
+                             char **destination, pid_t *owner_pid)
 {
     GError *error = NULL;
     GVariant *owner_reply = NULL;
@@ -66,9 +66,6 @@ static bool trusted_kwin_owner(GDBusConnection *connection,
     const char *owner = NULL;
     guint32 pid = 0u;
     guint32 uid = 0u;
-    char proc_path[64];
-    char executable[PATH_MAX + 1u];
-    struct stat status;
     bool valid = false;
 
     owner_reply = g_dbus_connection_call_sync(connection,
@@ -93,20 +90,8 @@ static bool trusted_kwin_owner(GDBusConnection *connection,
         goto done;
     g_variant_get(pid_reply, "(u)", &pid);
     g_variant_get(uid_reply, "(u)", &uid);
-    int length = snprintf(proc_path, sizeof(proc_path), "/proc/%u/exe", pid);
-    ssize_t executable_length = length > 0
-        && (size_t)length < sizeof(proc_path)
-        ? readlink(proc_path, executable, sizeof(executable) - 1u) : -1;
-    if (uid != (guint32)getuid() || pid == 0u || executable_length <= 0
-        || (size_t)executable_length >= sizeof(executable)
-        || stat(proc_path, &status) != 0 || !S_ISREG(status.st_mode)
-        || status.st_uid != 0u
-        || (status.st_mode & (S_IWGRP | S_IWOTH)) != 0)
-        goto done;
-    executable[executable_length] = '\0';
-    const char *basename = strrchr(executable, '/');
-    basename = basename == NULL ? executable : basename + 1u;
-    valid = strcmp(basename, "kwin_wayland") == 0;
+    valid = uid == (guint32)expected_uid && pid != 0u
+        && (uint64_t)(pid_t)pid == pid;
     if (valid) {
         *destination = g_strdup(owner);
         if (*destination == NULL)
@@ -125,6 +110,62 @@ done:
     if (error != NULL)
         g_error_free(error);
     return valid;
+}
+
+bool ksd_local_capture_kwin_owner_pid(uid_t expected_uid, pid_t *owner_pid)
+{
+    if (owner_pid == NULL)
+        return false;
+    GError *error = NULL;
+    GDBusConnection *connection = get_session_bus(&error);
+    char *destination = NULL;
+    pid_t pid = 0;
+    bool valid = connection != NULL && query_kwin_owner(connection,
+        monotonic_milliseconds() + 5000u, expected_uid, &destination, &pid);
+    g_free(destination);
+    if (error != NULL)
+        g_error_free(error);
+    if (valid)
+        *owner_pid = pid;
+    return valid;
+}
+
+bool ksd_local_capture_kwin_process_trusted(uid_t expected_uid, pid_t pid)
+{
+    char proc_path[64];
+    char executable[PATH_MAX + 1u];
+    struct stat process_status;
+    struct stat executable_status;
+    if (getuid() != 0u || geteuid() != 0u || pid <= 0)
+        return false;
+    int length = snprintf(proc_path, sizeof(proc_path), "/proc/%ld",
+                          (long)pid);
+    if (length <= 0 || (size_t)length >= sizeof(proc_path)
+        || stat(proc_path, &process_status) != 0
+        || !S_ISDIR(process_status.st_mode)
+        || process_status.st_uid != expected_uid)
+        return false;
+    length = snprintf(proc_path, sizeof(proc_path), "/proc/%ld/exe",
+                      (long)pid);
+    if (length <= 0 || (size_t)length >= sizeof(proc_path))
+        return false;
+    int descriptor = open(proc_path, O_PATH | O_CLOEXEC);
+    if (descriptor < 0 || fstat(descriptor, &executable_status) != 0) {
+        if (descriptor >= 0)
+            close(descriptor);
+        return false;
+    }
+    close(descriptor);
+    ssize_t executable_length = readlink(proc_path, executable, PATH_MAX);
+    if (executable_length <= 0 || executable_length > PATH_MAX
+        || !S_ISREG(executable_status.st_mode)
+        || executable_status.st_uid != 0u
+        || (executable_status.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        return false;
+    executable[executable_length] = '\0';
+    const char *basename = strrchr(executable, '/');
+    basename = basename == NULL ? executable : basename + 1u;
+    return strcmp(basename, "kwin_wayland") == 0;
 }
 
 static bool yama_ptracer_exception_available(void)
@@ -552,7 +593,8 @@ static int kwin_capture_child(bool window, bool include_decoration,
                               int32_t x, int32_t y,
                               uint32_t width, uint32_t height,
                               const char *handle, int image_write_fd,
-                              int metadata_fd, uint64_t deadline)
+                              int metadata_fd, uint64_t deadline,
+                              pid_t trusted_kwin_pid)
 {
     GError *error = NULL;
     GDBusConnection *connection = NULL;
@@ -572,8 +614,9 @@ static int kwin_capture_child(bool window, bool include_decoration,
 
     connection = get_session_bus(&error);
     if (connection == NULL
-        || !trusted_kwin_owner(connection, deadline, &kwin_destination,
-                               &kwin_pid))
+        || !query_kwin_owner(connection, deadline, getuid(),
+                             &kwin_destination, &kwin_pid)
+        || kwin_pid != trusted_kwin_pid)
         goto done;
     fd_list = g_unix_fd_list_new();
     int fd_handle = fd_list == NULL ? -1
@@ -722,7 +765,7 @@ static void terminate_capture_child(pid_t child)
 
 void ksd_local_capture_execute(const ksd_frame *request,
                                int capture_read_fd, int capture_write_fd,
-                               int capture_spool_fd,
+                               int capture_spool_fd, pid_t trusted_kwin_pid,
                                ksd_operation_result *result)
 {
     bool window;
@@ -754,6 +797,7 @@ void ksd_local_capture_execute(const ksd_frame *request,
     ksd_result_init(result);
     if (!ksd_capture_pipe_valid(capture_pipe)
         || !ksd_capture_spool_valid(spool_fd)
+        || trusted_kwin_pid <= 0
         || !parse_request(request, &window, &x, &y, &width, &height,
                        &include_decoration, handle)) {
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
@@ -781,7 +825,8 @@ void ksd_local_capture_execute(const ksd_frame *request,
             || !ksd_capture_child_endpoints_valid(3, 4))
             _exit(1);
         _exit(kwin_capture_child(window, include_decoration,
-            x, y, width, height, handle, 3, 4, deadline));
+            x, y, width, height, handle, 3, 4, deadline,
+            trusted_kwin_pid));
     }
     if (child < 0)
         goto failed;

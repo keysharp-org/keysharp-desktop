@@ -8,6 +8,8 @@
 #include "x11_connect_internal.h"
 #include "x11_display.h"
 #include "x11_query.h"
+#include "x11_extended.h"
+#include "x11_watch.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -15,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
@@ -86,11 +90,11 @@ static void check_window_list(ksd_x11 *connection)
 
     ksd_result_init(&result);
     ksd_x11_window_list(connection, false, &result);
-    /* With no window manager there is no _NET_CLIENT_LIST, and the honest
-     * answer is that the operation cannot be served here -- not an empty list,
-     * which would claim the session has no windows. */
-    assert(result.status == KSD_STATUS_UNAVAILABLE);
-    assert(result.tail == NULL);
+    assert(result.status == KSD_STATUS_OK);
+    uint32_t length;
+    const char *body = json_body(&result, &length);
+    assert(length == strlen("{\"ok\":true,\"windows\":[]}"));
+    assert(memcmp(body, "{\"ok\":true,\"windows\":[]}", length) == 0);
     ksd_result_clear(&result);
 }
 
@@ -104,10 +108,11 @@ static void check_window_handles(ksd_x11 *connection)
 
     ksd_result_init(&result);
     ksd_x11_window_handles(connection, &result);
-    /* No window manager, so no _NET_CLIENT_LIST, and the honest answer is the
-     * same one the window list gives: cannot be served here. */
-    assert(result.status == KSD_STATUS_UNAVAILABLE);
-    assert(result.tail == NULL);
+    assert(result.status == KSD_STATUS_OK);
+    uint32_t length;
+    const char *body = json_body(&result, &length);
+    assert(length == strlen("{\"ok\":true,\"handles\":[]}"));
+    assert(memcmp(body, "{\"ok\":true,\"handles\":[]}", length) == 0);
     ksd_result_clear(&result);
 }
 
@@ -745,6 +750,341 @@ static uint32_t property_u32(xcb_connection_t *c, xcb_window_t window,
     return value;
 }
 
+static void assert_json_has(const ksd_operation_result *result, const char *expected)
+{
+    uint32_t length;
+    assert(result->status == KSD_STATUS_OK);
+    const char *body = json_body(result, &length);
+    assert(memchr(body, 0, length) == NULL);
+    assert(memmem(body, length, expected, strlen(expected)) != NULL);
+}
+
+static void assert_window_id(const ksd_operation_result *result, xcb_window_t window)
+{
+    char expected[40];
+    assert(snprintf(expected, sizeof(expected), "\"id\":\"%u\"", window) > 0);
+    assert_json_has(result, expected);
+}
+
+static ksd_frame read_watch_frame(int descriptor)
+{
+    const uint8_t magic[] = { KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+                             KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3 };
+    struct pollfd ready = { .fd = descriptor, .events = POLLIN };
+    assert(poll(&ready, 1u, 3000) == 1);
+    assert((ready.revents & POLLIN) != 0);
+    ksd_frame frame = { 0 };
+    assert(ksd_frame_read(descriptor, magic, KSD_PROTOCOL_MAJOR,
+        KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES + 8u, false, &frame) == 1);
+    return frame;
+}
+
+static void expect_watch_event(int descriptor, uint16_t kind, xcb_window_t window,
+                                const char *expected)
+{
+    for (unsigned i = 0u; i < 12u; i++) {
+        ksd_frame frame = read_watch_frame(descriptor);
+        assert(frame.opcode == KSD_OP_WINDOW_EVENT && frame.flags == KSD_FLAG_EVENT
+            && frame.request_id == 0u && frame.payload_length >= 8u);
+        uint16_t actual = ksd_decode_u16(frame.payload);
+        assert(ksd_decode_u16(frame.payload + 2u) == 0u);
+        uint32_t length = ksd_decode_u32(frame.payload + 4u);
+        assert(length == frame.payload_length - 8u);
+        if (actual == kind) {
+            char *json = calloc((size_t)length + 1u, 1u);
+            assert(json != NULL);
+            memcpy(json, frame.payload + 8u, length);
+            char id[40];
+            assert(snprintf(id, sizeof(id), "\"id\":\"%u\"", window) > 0);
+            assert(strstr(json, id) != NULL);
+            assert(expected == NULL || strstr(json, expected) != NULL);
+            free(json);
+            ksd_frame_clear(&frame);
+            return;
+        }
+        /* X may report one geometry change both through the client and the
+         * root's substructure selection. */
+        assert(actual == KSD_WINDOW_EVENT_MOVE);
+        ksd_frame_clear(&frame);
+    }
+    assert(false);
+}
+
+static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
+                                xcb_screen_t *screen, const char *canonical)
+{
+    xcb_atom_t list = intern_in(owner, "_NET_CLIENT_LIST");
+    xcb_atom_t state = intern_in(owner, "_NET_WM_STATE");
+    xcb_atom_t hidden = intern_in(owner, "_NET_WM_STATE_HIDDEN");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list,
+        XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+        alarm(15u);
+        close(pair[0]);
+        close(xcb_get_file_descriptor(owner));
+        close(xcb_get_file_descriptor(connection->connection));
+        ksd_x11 *watch = NULL;
+        if (ksd_x11_open(canonical, NULL, &watch) != KSD_STATUS_OK) _exit(1);
+        bool ok = ksd_x11_watch_run(watch, pair[1], 42u);
+        ksd_x11_close(watch);
+        close(pair[1]);
+        _exit(ok ? 0 : 1);
+    }
+    close(pair[1]);
+    ksd_frame ready = read_watch_frame(pair[0]);
+    assert(ready.request_id == 42u && ready.payload_length == 8u
+        && ksd_decode_u32(ready.payload) == KSD_STATUS_OK);
+    ksd_frame_clear(&ready);
+    struct pollfd idle = { .fd = pair[0], .events = POLLIN };
+    assert(poll(&idle, 1u, 100) == 0);
+
+    xcb_window_t window = xcb_generate_id(owner);
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, window, screen->root, 30, 40,
+        100u, 80u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+    xcb_map_window(owner, window);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list,
+        XCB_ATOM_WINDOW, 32u, 1u, &window);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_CREATE, window, NULL);
+
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_NAME,
+        XCB_ATOM_STRING, 8u, 11u, "watch title");
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_TITLE, window, "\"title\":\"watch title\"");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root,
+        intern_in(owner, "_NET_ACTIVE_WINDOW"), XCB_ATOM_WINDOW, 32u, 1u, &window);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_ACTIVE, window, "\"active\":true");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, state,
+        XCB_ATOM_ATOM, 32u, 1u, &hidden);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_MINIMIZE, window, "\"minimized\":true");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, state,
+        XCB_ATOM_ATOM, 32u, 0u, NULL);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_RESTORE, window, "\"minimized\":false");
+    uint32_t geometry[] = { 65u, 70u };
+    xcb_configure_window(owner, window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, geometry);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_MOVE, window, "\"x\":65,\"y\":70");
+    xcb_destroy_window(owner, window);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list,
+        XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_CLOSE, window, NULL);
+    close(pair[0]);
+    int status = 0;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    xcb_delete_property(owner, screen->root, list);
+    xcb_delete_property(owner, screen->root, intern_in(owner, "_NET_ACTIVE_WINDOW"));
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+}
+
+static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
+                                     xcb_screen_t *screen)
+{
+    xcb_window_t frame = xcb_generate_id(owner);
+    xcb_window_t client = xcb_generate_id(owner);
+    xcb_window_t child = xcb_generate_id(owner);
+    uint32_t events = XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE
+        | XCB_EVENT_MASK_EXPOSURE;
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, frame, screen->root, 80, 90,
+        210u, 160u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, client, frame, 5, 20,
+        200u, 135u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, child, client, 8, 9,
+        50u, 30u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
+        XCB_CW_EVENT_MASK, &events);
+    xcb_atom_t wm_state = intern_in(owner, "WM_STATE");
+    uint32_t state[] = { 1u, 0u };
+    uint32_t extents[] = { 5u, 5u, 20u, 5u };
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, client, wm_state, wm_state,
+        32u, 2u, state);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, client,
+        intern_in(owner, "_NET_FRAME_EXTENTS"), XCB_ATOM_CARDINAL, 32u, 4u, extents);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, client, XCB_ATOM_WM_NAME,
+        XCB_ATOM_STRING, 8u, 4u, "caf\351");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, client, XCB_ATOM_WM_CLASS,
+        XCB_ATOM_STRING, 8u, 14u, "instance\0Class");
+    xcb_map_window(owner, frame);
+    xcb_map_window(owner, client);
+    xcb_map_window(owner, child);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+
+    ksd_operation_result result;
+    ksd_result_init(&result);
+    ksd_x11_window_query(connection, client, &result);
+    assert_window_id(&result, client);
+    assert_json_has(&result, "\"title\":\"caf\\u00e9\"");
+    assert_json_has(&result, "\"appId\":\"Class\"");
+    assert_json_has(&result, "\"frame\":{\"x\":80,\"y\":90,\"width\":210,\"height\":160}");
+    assert_json_has(&result, "\"client\":{\"x\":85,\"y\":110,\"width\":200,\"height\":135}");
+    char relationship[80];
+    assert(snprintf(relationship, sizeof(relationship),
+        "\"parent\":\"%u\",\"topLevel\":\"%u\"", frame, client) > 0);
+    assert_json_has(&result, relationship);
+    ksd_result_clear(&result);
+
+    ksd_result_init(&result);
+    ksd_x11_window_query(connection, child, &result);
+    assert_json_has(&result, "\"appId\":\"Class\"");
+    ksd_result_clear(&result);
+
+    /* A reparenting manager need not publish EWMH. The client is listed once,
+     * and focus on its child resolves to that same toplevel. */
+    ksd_result_init(&result);
+    ksd_x11_window_handles(connection, &result);
+    assert(snprintf(relationship, sizeof(relationship), "\"handles\":[\"%u\"]", client) > 0);
+    assert_json_has(&result, relationship);
+    ksd_result_clear(&result);
+    xcb_set_input_focus(owner, XCB_INPUT_FOCUS_POINTER_ROOT, child, XCB_CURRENT_TIME);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    ksd_result_init(&result);
+    ksd_x11_window_active(connection, &result);
+    assert_window_id(&result, client);
+    assert_json_has(&result, "\"active\":true");
+    ksd_result_clear(&result);
+
+    xcb_window_t popup = xcb_generate_id(owner);
+    uint32_t override_redirect = 1u;
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, popup, screen->root, 300, 100,
+        40u, 25u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
+        XCB_CW_OVERRIDE_REDIRECT, &override_redirect);
+    xcb_map_window(owner, popup);
+    xcb_atom_t clients_atom = intern_in(owner, "_NET_CLIENT_LIST");
+    xcb_atom_t stacking_atom = intern_in(owner, "_NET_CLIENT_LIST_STACKING");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root,
+        clients_atom, XCB_ATOM_WINDOW, 32u, 1u, &client);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    ksd_result_init(&result);
+    ksd_x11_window_handles(connection, &result);
+    assert(snprintf(relationship, sizeof(relationship), "\"handles\":[\"%u\",\"%u\"]", client, popup) > 0);
+    assert_json_has(&result, relationship);
+    ksd_result_clear(&result);
+
+    xcb_window_t stacking[] = { popup, client };
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root,
+        stacking_atom, XCB_ATOM_WINDOW, 32u, 2u, stacking);
+    xcb_unmap_window(owner, popup);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    ksd_result_init(&result);
+    ksd_x11_window_handles(connection, &result);
+    assert(snprintf(relationship, sizeof(relationship), "\"handles\":[\"%u\",\"%u\"]", popup, client) > 0);
+    assert_json_has(&result, relationship);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_list(connection, false, &result);
+    assert_window_id(&result, client);
+    uint32_t visible_length;
+    const char *visible_body = json_body(&result, &visible_length);
+    assert(snprintf(relationship, sizeof(relationship), "\"id\":\"%u\"", popup) > 0);
+    assert(memmem(visible_body, visible_length, relationship, strlen(relationship)) == NULL);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_list(connection, true, &result);
+    assert_window_id(&result, popup);
+    assert_window_id(&result, client);
+    ksd_result_clear(&result);
+    xcb_delete_property(owner, screen->root, clients_atom);
+    xcb_delete_property(owner, screen->root, stacking_atom);
+    xcb_set_input_focus(owner, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_CURRENT_TIME);
+    xcb_destroy_window(owner, popup);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+
+    ksd_result_init(&result);
+    ksd_x11_window_children(connection, client, &result);
+    assert(snprintf(relationship, sizeof(relationship), "\"handles\":[\"%u\"]", child) > 0);
+    assert_json_has(&result, relationship);
+    ksd_result_clear(&result);
+
+    ksd_result_init(&result);
+    ksd_x11_window_at_point(connection, 95, 121, true, &result);
+    assert_window_id(&result, child);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_at_point(connection, 95, 121, false, &result);
+    assert_window_id(&result, client);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_at_point(connection, 90, 95, false, &result);
+    assert_window_id(&result, client);
+    ksd_result_clear(&result);
+
+    const char replacement[] = "new \"title\"\\name";
+    ksd_result_init(&result);
+    ksd_x11_window_set_title(connection, client, (const uint8_t *)replacement,
+        (uint32_t)strlen(replacement), &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_query(connection, client, &result);
+    assert_json_has(&result, "\"title\":\"new \\\"title\\\"\\\\name\"");
+    ksd_result_clear(&result);
+
+    ksd_result_init(&result);
+    ksd_x11_window_set_visible(connection, child, false, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(owner,
+        xcb_get_window_attributes(owner, child), NULL);
+    assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_UNMAPPED);
+    free(attributes);
+    ksd_result_init(&result);
+    ksd_x11_window_set_visible(connection, child, true, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+
+    xcb_generic_event_t *event;
+    while ((event = xcb_poll_for_event(owner)) != NULL) free(event);
+    ksd_result_init(&result);
+    ksd_x11_window_click(connection, child, 3, 4, 1u, 2u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    unsigned presses = 0u, releases = 0u;
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    while ((event = xcb_poll_for_event(owner)) != NULL) {
+        uint8_t type = event->response_type & 0x7fu;
+        if (type == XCB_BUTTON_PRESS || type == XCB_BUTTON_RELEASE) {
+            xcb_button_press_event_t *button = (xcb_button_press_event_t *)event;
+            assert(button->event == child && button->detail == 1u);
+            assert(button->event_x == 3 && button->event_y == 4);
+            if (type == XCB_BUTTON_PRESS) presses++; else releases++;
+        }
+        free(event);
+    }
+    assert(presses == 2u && releases == 2u);
+
+    ksd_result_init(&result);
+    ksd_x11_mouse_move_absolute(connection, 40, 50, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_cursor_position(connection, &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(tail_u32(&result, 0u) == 40u && tail_u32(&result, 1u) == 50u);
+    ksd_result_clear(&result);
+
+    ksd_result_init(&result);
+    ksd_x11_display_list(connection, &result);
+    assert_json_has(&result, "\"width\":1279");
+    assert_json_has(&result, "\"height\":1024");
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_keyboard_state(connection, &result);
+    assert_json_has(&result, "\"keymap\":");
+    assert_json_has(&result, "xkb_keymap");
+    ksd_result_clear(&result);
+    xcb_destroy_window(owner, frame);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+}
+
 /* The control verbs are almost all requests to the window manager, so what
  * they can be held to on a bare server is that the right request goes out,
  * correctly formed and aimed at the right window. This selects for
@@ -864,6 +1204,22 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     assert(data[1] == 11u && data[2] == 22u);
     assert(data[3] == 33u && data[4] == 44u);
 
+    uint32_t frame_extents[] = { 5u, 7u, 20u, 3u };
+    xcb_change_property(wm, XCB_PROP_MODE_REPLACE, window,
+        intern_in(wm, "_NET_FRAME_EXTENTS"), XCB_ATOM_CARDINAL, 32u, 4u, frame_extents);
+    free(xcb_get_input_focus_reply(wm, xcb_get_input_focus(wm), NULL));
+    ksd_result_init(&result);
+    ksd_x11_window_move_resize(connection, window, 11, 22, 212u, 123u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    assert(next_client_message(wm, moveresize, data));
+    assert(data[1] == 11u && data[2] == 22u);
+    assert(data[3] == 200u && data[4] == 100u);
+    ksd_result_init(&result);
+    ksd_x11_window_move_resize(connection, window, 11, 22, 12u, 123u, &result);
+    assert(result.status == KSD_STATUS_INVALID_REQUEST);
+    ksd_result_clear(&result);
+
     /* Opacity and decoration are properties, not requests, so their effect is
      * directly readable with no manager involved. */
     ksd_result_init(&result);
@@ -966,6 +1322,8 @@ int main(void)
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(owner)).data;
     assert(screen != NULL);
     check_window_handles_with_manager(connection, owner, screen);
+    check_extended_windows(connection, owner, screen);
+    check_window_watch(connection, owner, screen, canonical);
     check_capture(connection, owner, screen);
     check_clipboard(connection, owner, canonical);
     check_control(connection, owner, screen, canonical);

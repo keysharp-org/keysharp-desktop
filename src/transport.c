@@ -1,6 +1,7 @@
 #include "transport.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <time.h>
 #include <fcntl.h>
@@ -149,36 +150,81 @@ static uint64_t transport_monotonic_ms(void)
 int ksd_receive_fd_until(int descriptor, void *data, size_t length,
                          uint64_t deadline_ms, int *received_fd)
 {
-    if (descriptor < 0 || received_fd == NULL) {
+    int first_fd = -1;
+    size_t fd_count = 0u;
+    size_t offset = 0u;
+    uint8_t *bytes = data;
+
+    if (descriptor < 0 || received_fd == NULL || data == NULL || length == 0u) {
         errno = EINVAL;
         return -1;
     }
     *received_fd = -1;
-    for (;;) {
+    while (offset < length) {
         struct pollfd item = { .fd = descriptor, .events = POLLIN };
         uint64_t now = transport_monotonic_ms();
-        int remaining;
-        int ready;
-
         if (now == 0u || now >= deadline_ms) {
             errno = ETIMEDOUT;
-            return -1;
+            goto failed;
         }
-        remaining = (int)(deadline_ms - now);
-        ready = poll(&item, 1u, remaining);
+        uint64_t remaining = deadline_ms - now;
+        int ready = poll(&item, 1u,
+            remaining > INT_MAX ? INT_MAX : (int)remaining);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready == 0) {
             errno = ETIMEDOUT;
-            return -1;
+            goto failed;
         }
         if (ready < 0)
-            return -1;
-        /* Readable. The receive below uses MSG_WAITALL, so a peer that sends a
-         * partial record still blocks -- but it has already proved it is
-         * talking, and the record is a fixed size the peer knows. */
-        return ksd_receive_optional_fd(descriptor, data, length, received_fd);
+            goto failed;
+        uint8_t control[CMSG_SPACE(sizeof(int) * 2u)] = { 0 };
+        struct iovec iov = { .iov_base = bytes + offset,
+                            .iov_len = length - offset };
+        struct msghdr message = { .msg_iov = &iov, .msg_iovlen = 1u,
+            .msg_control = control, .msg_controllen = sizeof(control) };
+        ssize_t count = recvmsg(descriptor, &message,
+                                MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN))
+            continue;
+        bool malformed = count <= 0
+            || (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0;
+        for (struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+             count > 0 && header != NULL;
+             header = CMSG_NXTHDR(&message, header)) {
+            if (header->cmsg_level != SOL_SOCKET
+                || header->cmsg_type != SCM_RIGHTS
+                || header->cmsg_len < CMSG_LEN(0u)) {
+                malformed = true;
+                continue;
+            }
+            size_t payload = header->cmsg_len - CMSG_LEN(0u);
+            if (payload % sizeof(int) != 0u) {
+                malformed = true;
+                continue;
+            }
+            for (size_t at = 0u; at < payload; at += sizeof(int)) {
+                int value;
+                memcpy(&value, CMSG_DATA(header) + at, sizeof(value));
+                if (fd_count++ == 0u)
+                    first_fd = value;
+                else
+                    close(value);
+            }
+        }
+        if (malformed || fd_count > 1u) {
+            errno = EPROTO;
+            goto failed;
+        }
+        offset += (size_t)count;
     }
+    *received_fd = first_fd;
+    return 0;
+
+failed:
+    if (first_fd >= 0)
+        close(first_fd);
+    return -1;
 }
 
 int ksd_make_parent_directories(const char *path, mode_t mode)

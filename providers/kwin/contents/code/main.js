@@ -36,15 +36,17 @@ var OP_WINDOW_SET_STATE = 0x2027;
 var OP_WINDOW_SET_OPACITY = 0x2028;
 var OP_WINDOW_SET_ABOVE = 0x2029;
 var OP_WINDOW_SET_DECORATED = 0x202a;
+var OP_WINDOW_SET_SKIP_TASKBAR = 0x202d;
 var OP_CURSOR_POSITION = 0x2050;
 var OP_WORK_AREA = 0x2051;
 
 /* Mirrors the status codes the wire uses. */
 var STATUS_OK = 0;
-var STATUS_INVALID_REQUEST = 2;
-var STATUS_UNSUPPORTED = 3;
-var STATUS_NOT_FOUND = 5;
-var STATUS_BUSY = 9;
+var STATUS_UNSUPPORTED = 2;
+var STATUS_INVALID_REQUEST = 3;
+var STATUS_BUSY = 5;
+var STATUS_NOT_FOUND = 6;
+var STATUS_INTERNAL = 255;
 
 var generation = "";
 var running = false;
@@ -64,13 +66,31 @@ var api = {
     signalRemoved: null
 };
 
+function sortedWindowList(list) {
+    var result = [];
+    var index;
+
+    for (index = 0; index < list.length; index++)
+        result.push(list[index]);
+    result.sort(function (left, right) {
+        return Number(left.stackingOrder || 0)
+            - Number(right.stackingOrder || 0);
+    });
+    return result;
+}
+
 function detectApi() {
     if (typeof workspace === "undefined" || workspace === null)
         return false;
-    if (typeof workspace.windowList === "function") {
+    if (workspace.stackingOrder
+            && workspace.stackingOrder.length !== undefined) {
+        api.windowList = function () { return workspace.stackingOrder; };
+    } else if (typeof workspace.windowList === "function") {
         api.windowList = function () { return workspace.windowList(); };
     } else if (typeof workspace.clientList === "function") {
-        api.windowList = function () { return workspace.clientList(); };
+        api.windowList = function () {
+            return sortedWindowList(workspace.clientList());
+        };
     } else {
         return false;
     }
@@ -211,15 +231,69 @@ function jsonString(value) {
         ? "" : String(value));
 }
 
-/*
- * The handle a caller passes back. internalId is a QUuid in braces; the daemon
- * folds it to 64 bits, and the braces are part of what it folds, so they are
- * left exactly as KWin gives them.
- */
+/* Stable public handles for KWin's native UUID identifiers. */
+var handleByNativeId = {};
+var nativeIdByHandle = {};
+var fallbackWindows = [];
+var fallbackHandles = [];
+var nextFallbackHandle = 4294967295;
+
+function fallbackWindowHandle(window) {
+    var index;
+
+    for (index = 0; index < fallbackWindows.length; index++) {
+        if (fallbackWindows[index] === window)
+            return fallbackHandles[index];
+    }
+    var handle = String(nextFallbackHandle);
+    while (nativeIdByHandle[handle] !== undefined && nextFallbackHandle > 1) {
+        nextFallbackHandle--;
+        handle = String(nextFallbackHandle);
+    }
+    fallbackWindows.push(window);
+    fallbackHandles.push(handle);
+    nativeIdByHandle[handle] = "fallback";
+    if (nextFallbackHandle > 1)
+        nextFallbackHandle--;
+    return handle;
+}
+
 function windowHandle(window) {
     if (window === null || window === undefined)
         return "";
-    return String(window.internalId);
+    var nativeId = window.internalId === undefined
+        || window.internalId === null ? "" : String(window.internalId);
+
+    if (nativeId.length === 0)
+        return fallbackWindowHandle(window);
+    var existing = handleByNativeId[nativeId];
+
+    if (existing !== undefined)
+        return existing;
+
+    /* The public control API takes a uint64. KWin's native identifier is a
+     * UUID, so give it a stable numeric token for this script lifetime. Keep
+     * old assignments reserved: reusing a closed window's token could make a
+     * delayed request act on an unrelated window. */
+    var hash = 5381;
+    var index;
+
+    for (index = 0; index < nativeId.length; index++) {
+        hash = ((hash * 33) ^ nativeId.charCodeAt(index)) >>> 0;
+    }
+    if (hash === 0)
+        hash = 1;
+    var handle = String(hash);
+    while (nativeIdByHandle[handle] !== undefined
+            && nativeIdByHandle[handle] !== nativeId) {
+        hash = (hash + 1) >>> 0;
+        if (hash === 0)
+            hash = 1;
+        handle = String(hash);
+    }
+    handleByNativeId[nativeId] = handle;
+    nativeIdByHandle[handle] = nativeId;
+    return handle;
 }
 
 function findWindow(handle) {
@@ -233,13 +307,83 @@ function findWindow(handle) {
     return null;
 }
 
+function isMaximized(window) {
+    if (window.maximizeMode !== undefined) {
+        var mode = Number(window.maximizeMode);
+
+        if (isFinite(mode))
+            return mode === 3;
+    }
+    if (window.maximized !== undefined)
+        return window.maximized === true;
+    if (typeof workspace.clientArea !== "function")
+        return false;
+    var area;
+
+    try {
+        area = workspace.clientArea(KWin.MaximizeArea, window);
+    } catch (error) {
+        return false;
+    }
+    if (area === null || area === undefined)
+        return false;
+    var geometry = window.frameGeometry || window.geometry;
+
+    return geometry !== null && geometry !== undefined
+        && Math.abs(Number(geometry.x) - Number(area.x)) <= 1
+        && Math.abs(Number(geometry.y) - Number(area.y)) <= 1
+        && Math.abs(Number(geometry.width) - Number(area.width)) <= 1
+        && Math.abs(Number(geometry.height) - Number(area.height)) <= 1;
+}
+
+function clearMaximize(window) {
+    if (typeof window.setMaximize !== "function")
+        return;
+    if (window.maximizeMode !== undefined) {
+        if (Number(window.maximizeMode) !== 0)
+            window.setMaximize(false, false);
+        return;
+    }
+    if (window.maximized === true)
+        window.setMaximize(false, false);
+}
+
+function raiseWindow(window) {
+    if (typeof workspace.raiseWindow === "function") {
+        workspace.raiseWindow(window);
+        return true;
+    }
+    if (typeof workspace.slotWindowRaise !== "function")
+        return false;
+
+    api.setActiveWindow(window);
+    workspace.slotWindowRaise();
+    return true;
+}
+
 function windowJson(window) {
     var geometry = window.frameGeometry || window.geometry
         || { x: 0, y: 0, width: 0, height: 0 };
 
-    return "{\"id\":" + jsonString(windowHandle(window))
+    var valid = ['id'];
+    if (window.caption !== undefined) valid.push('title');
+    if (window.internalId !== undefined) valid.push('captureId');
+    if (window.resourceClass || window.desktopFileName || window.resourceName) valid.push('appId');
+    if (window.pid > 0) valid.push('pid');
+    if (window.frameGeometry || window.geometry) valid.push('frame');
+    if (window.minimized !== undefined) valid.push('minimized');
+    if (window.maximizeMode !== undefined || window.maximized !== undefined) valid.push('maximized');
+    if (window.active !== undefined) valid.push('active');
+    if (window.hidden !== undefined && window.minimized !== undefined) valid.push('visible');
+    if (window.keepAbove !== undefined) valid.push('alwaysOnTop');
+    if (window.noBorder !== undefined) valid.push('decorated');
+    if (window.opacity !== undefined) valid.push('transparency');
+
+    return "{\"validFields\":" + JSON.stringify(valid) + ",\"id\":" + jsonString(windowHandle(window))
+        + ",\"captureId\":" + jsonString(window.internalId)
         + ",\"title\":" + jsonString(window.caption)
-        + ",\"class\":" + jsonString(window.resourceClass)
+        + ",\"appId\":" + jsonString(window.resourceClass
+            || window.desktopFileName || window.resourceName)
         + ",\"pid\":" + String(Math.max(0, Math.round(window.pid || 0)))
         + ",\"frame\":{\"x\":" + String(Math.round(geometry.x))
         + ",\"y\":" + String(Math.round(geometry.y))
@@ -250,6 +394,12 @@ function windowJson(window) {
         + ",\"width\":" + String(Math.round(geometry.width))
         + ",\"height\":" + String(Math.round(geometry.height))
         + "},\"minimized\":" + (window.minimized ? "true" : "false")
+        + ",\"active\":" + (window.active ? "true" : "false")
+        + ",\"maximized\":" + (isMaximized(window) ? "true" : "false")
+        + ",\"visible\":"
+        + (!(window.hidden || window.minimized) ? "true" : "false")
+        + ",\"alwaysOnTop\":" + (window.keepAbove ? "true" : "false")
+        + ",\"decorated\":" + (!window.noBorder ? "true" : "false")
         /* 0 to 255, the scale every backend of this service reports, not the
          * 0..1 KWin uses. Rounded rather than truncated so a fully opaque
          * window reports 255 and not 254. */
@@ -287,11 +437,15 @@ function executeJob(job) {
 
     switch (job.opcode) {
     case OP_WINDOW_LIST:
+        var includeHidden = job.body === "1";
         windows = api.windowList();
         body = "{\"ok\":true,\"windows\":[";
         var first = true;
         for (index = 0; index < windows.length; index++) {
             if (!isOrdinary(windows[index]))
+                continue;
+            if (!includeHidden
+                    && (windows[index].hidden || windows[index].minimized))
                 continue;
             if (!first)
                 body += ",";
@@ -338,7 +492,37 @@ function executeJob(job) {
         };
 
     case OP_WORK_AREA:
-        var area = workspace.workArea(0);
+        var area = null;
+        if (typeof workspace.clientArea === "function") {
+            try {
+                area = workspace.clientArea(KWin.MaximizeArea,
+                    workspace.activeScreen, workspace.currentDesktop);
+            } catch (error) {
+                area = null;
+            }
+            if (area === null || area === undefined) {
+                try {
+                    area = workspace.clientArea(KWin.PlacementArea,
+                        workspace.activeScreen, workspace.currentDesktop);
+                } catch (fallbackError) {
+                    area = null;
+                }
+            }
+            if (area === null || area === undefined) {
+                try {
+                    area = workspace.clientArea(KWin.MaximizeArea,
+                        api.activeWindow());
+                } catch (windowAreaError) {
+                    area = null;
+                }
+            }
+        }
+        if (area === null || area === undefined)
+            return {
+                sequence: job.sequence,
+                status: STATUS_UNSUPPORTED,
+                body: ""
+            };
         return {
             sequence: job.sequence,
             status: STATUS_OK,
@@ -359,12 +543,16 @@ function executeJob(job) {
 
     switch (job.opcode) {
     case OP_WINDOW_FOCUS:
+        window.minimized = false;
         api.setActiveWindow(window);
         return { sequence: job.sequence, status: STATUS_OK, body: "" };
 
     case OP_WINDOW_RAISE:
-        workspace.raiseWindow(window);
-        return { sequence: job.sequence, status: STATUS_OK, body: "" };
+        return {
+            sequence: job.sequence,
+            status: raiseWindow(window) ? STATUS_OK : STATUS_UNSUPPORTED,
+            body: ""
+        };
 
     case OP_WINDOW_LOWER:
         /* KWin exposes no lower. Sending the window behind every other one is
@@ -384,11 +572,17 @@ function executeJob(job) {
                 status: STATUS_INVALID_REQUEST,
                 body: ""
             };
+        clearMaximize(window);
+        var geometry = window.frameGeometry || window.geometry;
+        var requestedX = parseInt(fields[1], 10);
+        var requestedY = parseInt(fields[2], 10);
+        var requestedWidth = parseInt(fields[3], 10);
+        var requestedHeight = parseInt(fields[4], 10);
         window.frameGeometry = {
-            x: parseInt(fields[1], 10),
-            y: parseInt(fields[2], 10),
-            width: parseInt(fields[3], 10),
-            height: parseInt(fields[4], 10)
+            x: requestedX === -2147483648 ? geometry.x : requestedX,
+            y: requestedY === -2147483648 ? geometry.y : requestedY,
+            width: requestedWidth === 0 ? geometry.width : requestedWidth,
+            height: requestedHeight === 0 ? geometry.height : requestedHeight
         };
         return { sequence: job.sequence, status: STATUS_OK, body: "" };
 
@@ -397,6 +591,7 @@ function executeJob(job) {
         if (state === 1) {
             window.minimized = true;
         } else if (state === 2) {
+            window.minimized = false;
             window.setMaximize(true, true);
         } else {
             window.minimized = false;
@@ -415,6 +610,13 @@ function executeJob(job) {
 
     case OP_WINDOW_SET_DECORATED:
         window.noBorder = parseInt(job.body.split(" ")[1], 10) === 0;
+        return { sequence: job.sequence, status: STATUS_OK, body: "" };
+
+    case OP_WINDOW_SET_SKIP_TASKBAR:
+        var skipTaskbar = parseInt(job.body.split(" ")[1], 10) !== 0;
+        window.skipTaskbar = skipTaskbar;
+        window.skipPager = skipTaskbar;
+        window.skipSwitcher = skipTaskbar;
         return { sequence: job.sequence, status: STATUS_OK, body: "" };
 
     default:
@@ -459,8 +661,17 @@ function pollLane(lane, lost) {
             print("keysharp-desktop: unreadable poll reply, stopping");
             return;
         }
-        for (index = 0; index < jobs.length; index++)
-            results.push(executeJob(jobs[index]));
+        for (index = 0; index < jobs.length; index++) {
+            try {
+                results.push(executeJob(jobs[index]));
+            } catch (error) {
+                results.push({
+                    sequence: jobs[index].sequence,
+                    status: STATUS_INTERNAL,
+                    body: ""
+                });
+            }
+        }
         if (results.length === 0) {
             pollLane(lane, 0);
             return;

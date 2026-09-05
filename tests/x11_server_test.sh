@@ -6,9 +6,7 @@ set -eu
 # is visible in the ctest output and CI installs Xvfb so it is never taken
 # silently. A gate that passes when it did not run is not a gate.
 #
-# Readiness is decided by connecting, not by waiting for a socket file: Xvfb
-# serves over TCP when it cannot bind a UNIX listener, which happens whenever
-# /tmp/.X11-unix is not mode 1777, and the file would then never appear.
+# Readiness is decided by connecting, not by waiting for a socket file.
 
 binary=$1
 server=""
@@ -30,7 +28,7 @@ display=99
 while [ "$display" -lt 110 ]; do
     # An odd width, so the scanline pad is non-trivial and a stride computed
     # as width * 4 rather than read from the server shows up.
-    Xvfb ":${display}" -screen 0 1279x1024x24 >/dev/null 2>&1 &
+    Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>&1 &
     server=$!
     attempt=0
     while [ "$attempt" -lt 40 ]; do
@@ -43,6 +41,9 @@ while [ "$display" -lt 110 ]; do
             break
         fi
         if KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}"             KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
+            if ! kill -0 "$server" 2>/dev/null; then
+                break
+            fi
             # Deliberately not exec. Replacing the shell would drop the EXIT
             # trap with it, orphaning the server: every successful run leaked
             # one, and the next run then adopted it by the path above and

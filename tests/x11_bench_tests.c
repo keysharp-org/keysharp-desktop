@@ -4,6 +4,8 @@
 #include "x11_connect.h"
 #include "x11_display.h"
 #include "x11_query.h"
+#include "x11_extended.h"
+#include "x11_capture.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -27,6 +29,64 @@ static double milliseconds_since(const struct timespec *start)
         + (double)(now.tv_nsec - start->tv_nsec) / 1000000.0;
 }
 
+static void bench_keyboard(ksd_x11 *connection)
+{
+    ksd_operation_result result;
+    ksd_result_init(&result);
+    ksd_x11_keyboard_state(connection, &result);
+    assert(result.status == KSD_STATUS_OK && result.tail_length > 4u);
+    uint32_t full_bytes = result.tail_length;
+    char *json = calloc(result.tail_length, 1u);
+    assert(json != NULL);
+    memcpy(json, result.tail + 4u, result.tail_length - 4u);
+    const char field[] = "\"mapRevision\":\"";
+    const char *revision = strstr(json, field);
+    assert(revision != NULL && strlen(revision) >= sizeof(field) - 1u + 33u);
+    uint8_t token[32];
+    memcpy(token, revision + sizeof(field) - 1u, sizeof(token));
+    free(json);
+    ksd_result_clear(&result);
+
+    for (unsigned unchanged = 0u; unchanged <= 1u; unchanged++) {
+        struct timespec start;
+        uint64_t bytes = 0u;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (unsigned pass = 0u; pass < 1000u; pass++) {
+            ksd_result_init(&result);
+            ksd_x11_keyboard_state_since(connection, unchanged ? token : NULL,
+                unchanged ? sizeof(token) : 0u, &result);
+            assert(result.status == KSD_STATUS_OK);
+            if (unchanged) assert(result.tail_length < full_bytes);
+            bytes += result.tail_length;
+            ksd_result_clear(&result);
+        }
+        printf("keyboard_state %s: %.3f ms/call, %.0f reply bytes/call (1000 calls)\n",
+            unchanged ? "unchanged" : "full map", milliseconds_since(&start) / 1000.0,
+            (double)bytes / 1000.0);
+    }
+}
+
+static void bench_window(ksd_x11 *connection, xcb_window_t window)
+{
+    struct timespec start;
+    for (unsigned capture = 0u; capture <= 1u; capture++) {
+        uint64_t bytes = 0u;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (unsigned pass = 0u; pass < 1000u; pass++) {
+            ksd_operation_result result;
+            ksd_result_init(&result);
+            if (capture) ksd_x11_capture_window(connection, window, 0u, &result);
+            else ksd_x11_window_query(connection, window, &result);
+            assert(result.status == KSD_STATUS_OK);
+            bytes += result.tail_length;
+            ksd_result_clear(&result);
+        }
+        printf("%s on one persistent X connection: %.3f ms/call, %.0f reply bytes/call (1000 calls)\n",
+            capture ? "capture_window 200x100" : "window_query", milliseconds_since(&start) / 1000.0,
+            (double)bytes / 1000.0);
+    }
+}
+
 int main(void)
 {
     const char *display = getenv("KSD_TEST_DISPLAY");
@@ -45,6 +105,11 @@ int main(void)
         return 77;
     }
     assert(ksd_x11_display_parse(display, canonical, sizeof(canonical)));
+    if (getenv("KSD_TEST_PROBE") != NULL) {
+        if (ksd_x11_open(canonical, NULL, &connection) != KSD_STATUS_OK) return 1;
+        ksd_x11_close(connection);
+        return 0;
+    }
 
     /* A separate connection owns the windows, because the one under test must
      * see them the way any other client would. */
@@ -63,8 +128,11 @@ int main(void)
     assert(reply != NULL);
     utf8 = reply->atom;
     free(reply);
-    xcb_atom_t wm_name = xcb_intern_atom_reply(owner,
-        xcb_intern_atom(owner, 0, 12u, "_NET_WM_NAME"), NULL)->atom;
+    reply = xcb_intern_atom_reply(owner,
+        xcb_intern_atom(owner, 0, 12u, "_NET_WM_NAME"), NULL);
+    assert(reply != NULL);
+    xcb_atom_t wm_name = reply->atom;
+    free(reply);
 
     for (int index = 0; index < BENCH_WINDOWS; index++) {
         char title[64];
@@ -79,7 +147,7 @@ int main(void)
         xcb_change_property(owner, XCB_PROP_MODE_REPLACE, windows[index],
                             wm_name, utf8, 8, (uint32_t)written, title);
         xcb_change_property(owner, XCB_PROP_MODE_REPLACE, windows[index],
-                            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, 10u,
+                            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, 11u,
                             "bench\0Bench");
     }
     /* Stand in for a window manager, so the list has something to enumerate. */
@@ -100,7 +168,9 @@ int main(void)
      * 0 to 255 on every backend, because the providers report the actor
      * opacity on that scale and the consumer reads it as an integer. Emitting
      * a fraction here would parse as zero or throw, on X11 only. */
-    const char *body = (const char *)warm.tail + 4u;
+    char *body = calloc(warm.tail_length, 1u);
+    assert(body != NULL);
+    memcpy(body, warm.tail + 4u, warm.tail_length - 4u);
     assert(strstr(body, "\"transparency\":255") != NULL);
     assert(strstr(body, "\"transparency\":1.") == NULL);
     assert(strstr(body, "\"transparency\":0.") == NULL);
@@ -108,7 +178,8 @@ int main(void)
      * still pairing each reply with the window that asked for it. */
     assert(strstr(body, "\"title\":\"bench window 0\"") != NULL);
     assert(strstr(body, "\"title\":\"bench window 39\"") != NULL);
-    assert(strstr(body, "\"appId\":\"bench\"") != NULL);
+    assert(strstr(body, "\"appId\":\"Bench\"") != NULL);
+    free(body);
     ksd_result_clear(&warm);
 
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -123,6 +194,8 @@ int main(void)
 
     printf("window_list over %d windows: %.2f ms per call (%.3f ms per window)\n",
            BENCH_WINDOWS, elapsed, elapsed / (double)BENCH_WINDOWS);
+    bench_keyboard(connection);
+    bench_window(connection, windows[BENCH_WINDOWS - 1u]);
 
     ksd_x11_close(connection);
     xcb_disconnect(owner);

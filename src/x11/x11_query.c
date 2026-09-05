@@ -18,11 +18,11 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
         "_NET_WM_PID", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
         "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_MAXIMIZED_VERT",
         "_NET_WM_STATE_MAXIMIZED_HORZ", "_NET_FRAME_EXTENTS",
-        "_NET_WM_WINDOW_OPACITY", "UTF8_STRING",
+        "_NET_WM_WINDOW_OPACITY", "UTF8_STRING", "_NET_CLIENT_LIST_STACKING",
     };
     size_t count = sizeof(names) / sizeof(names[0]);
-    xcb_intern_atom_cookie_t cookies[15];
-    xcb_atom_t *fields[15];
+    xcb_intern_atom_cookie_t cookies[16];
+    xcb_atom_t *fields[16];
 
     fields[0] = &atoms->client_list;
     fields[1] = &atoms->active_window;
@@ -39,6 +39,7 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
     fields[12] = &atoms->frame_extents;
     fields[13] = &atoms->opacity;
     fields[14] = &atoms->utf8_string;
+    fields[15] = &atoms->client_list_stacking;
 
     /* only_if_exists. Interning with creation would add every EWMH name to the
      * atom table of a server that has no window manager, and would make a
@@ -117,7 +118,7 @@ bool ksd_x11_has_state(xcb_connection_t *c, const x11_atoms *atoms,
 }
 
 static bool append_json_string(ksd_buffer *out, const char *value,
-                               size_t length)
+                               size_t length, bool latin1)
 {
     if (!ksd_buffer_bytes(out, "\"", 1u))
         return false;
@@ -130,7 +131,7 @@ static bool append_json_string(ksd_buffer *out, const char *value,
             escaped[0] = '\\';
             escaped[1] = (char)byte;
             pieces = 2u;
-        } else if (byte < 32u || byte == 127u) {
+        } else if (byte < 32u || byte == 127u || (latin1 && byte >= 128u)) {
             int written = snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
             if (written != 6)
                 return false;
@@ -148,31 +149,8 @@ bool ksd_x11_append_text(ksd_buffer *out, xcb_connection_t *c,
                          xcb_window_t window, xcb_atom_t name,
                          xcb_atom_t type)
 {
-    xcb_get_property_reply_t *reply = ksd_x11_property(c, window, name, type,
-                                                       KSD_X11_MAX_TEXT / 4u);
-    bool ok;
-
-    if (reply == NULL)
-        return append_json_string(out, "", 0u);
-    int raw = xcb_get_property_value_length(reply);
-    const char *value = xcb_get_property_value(reply);
-    size_t length = raw > 0 ? (size_t)raw : 0u;
-
-    if (length > KSD_X11_MAX_TEXT)
-        length = KSD_X11_MAX_TEXT;
-    /* WM_CLASS is two NUL-separated strings. Stopping at the first NUL yields
-     * the instance name, which is what the providers report as the app id. */
-    for (size_t index = 0u; index < length; index++)
-        if (value[index] == 0) {
-            length = index;
-            break;
-        }
-    while (length != 0u
-        && !ksd_utf8_valid((const uint8_t *)value, length, false))
-        length--;
-    ok = append_json_string(out, value, length);
-    free(reply);
-    return ok;
+    return ksd_x11_append_text_reply(out, ksd_x11_property(c, window, name, type,
+                                                         KSD_X11_MAX_TEXT / 4u));
 }
 
 static void numeric_result(ksd_operation_result *result,
@@ -299,7 +277,7 @@ bool ksd_x11_append_text_reply(ksd_buffer *out, xcb_get_property_reply_t *reply)
     bool ok;
 
     if (reply == NULL)
-        return append_json_string(out, "", 0u);
+        return append_json_string(out, "", 0u, false);
 
     int raw = xcb_get_property_value_length(reply);
     const char *value = xcb_get_property_value(reply);
@@ -312,10 +290,18 @@ bool ksd_x11_append_text_reply(ksd_buffer *out, xcb_get_property_reply_t *reply)
             length = index;
             break;
         }
-    while (length != 0u
-        && !ksd_utf8_valid((const uint8_t *)value, length, false))
-        length--;
-    ok = append_json_string(out, value, length);
+    bool latin1 = reply->type == XCB_ATOM_STRING && reply->format == 8;
+    if (!latin1) {
+        /* Only a truncated final UTF-8 codepoint can be repaired by shortening. */
+        size_t shortened = 0u;
+        while (length != 0u && shortened < 3u
+            && !ksd_utf8_valid((const uint8_t *)value, length, false)) {
+            length--;
+            shortened++;
+        }
+        if (!ksd_utf8_valid((const uint8_t *)value, length, false)) length = 0u;
+    }
+    ok = append_json_string(out, value, length, latin1);
     free(reply);
     return ok;
 }

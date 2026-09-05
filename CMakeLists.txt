@@ -13,6 +13,9 @@ include(CMakePackageConfigHelpers)
 set(KEYSHARP_DESKTOP_CAPTURE_WORKER_PATH
     "${CMAKE_INSTALL_FULL_LIBEXECDIR}/keysharp-desktop-capture-worker"
     CACHE FILEPATH "root-only capture worker execution path")
+set(KEYSHARP_DESKTOP_KWIN_SCRIPT_PATH
+    "${CMAKE_INSTALL_FULL_DATADIR}/kwin/scripts/io.github.keysharp.desktop.kwin/contents/code/main.js"
+    CACHE FILEPATH "installed KWin provider script path")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -84,7 +87,9 @@ add_library(keysharp-desktop-common STATIC
 target_include_directories(keysharp-desktop-common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(keysharp-desktop-common PUBLIC _GNU_SOURCE _POSIX_C_SOURCE=200809L)
+target_compile_definitions(keysharp-desktop-common PUBLIC
+    _GNU_SOURCE _POSIX_C_SOURCE=200809L
+    KSD_KWIN_SCRIPT_PATH="${KEYSHARP_DESKTOP_KWIN_SCRIPT_PATH}")
 target_link_libraries(keysharp-desktop-common PUBLIC
     keysharp-desktop-wire KeysharpPermissions::permissions PkgConfig::GIO)
 
@@ -117,12 +122,16 @@ target_link_libraries(keysharp-desktop-capture PUBLIC
 # Linked into the worker executable and nothing else. The whole argument that
 # root never touches X rests on this one edge, so it is a separate target
 # rather than a few files added to an existing library.
-pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb>=1.14 xcb-shm>=1.14)
+pkg_check_modules(XCB REQUIRED IMPORTED_TARGET
+    xcb>=1.14 xcb-shm>=1.14 xcb-randr>=1.14 xcb-shape>=1.14 xcb-xkb>=1.14 xcb-composite>=1.14
+    xkbcommon xkbcommon-x11)
 add_library(keysharp-desktop-x11 STATIC
     src/x11/x11_display.c
     src/x11/x11_connect.c
     src/x11/x11_query.c
     src/x11/x11_windows.c
+    src/x11/x11_extended.c
+    src/x11/x11_watch.c
     src/x11/x11_capture.c
     src/x11/x11_clipboard.c
     src/x11/x11_control.c
@@ -136,20 +145,19 @@ target_compile_definitions(keysharp-desktop-x11 PUBLIC
 target_link_libraries(keysharp-desktop-x11 PUBLIC
     keysharp-desktop-wire PkgConfig::XCB)
 
-# The Wayland backend for compositors with no extension of their own. Its
-# protocol bindings are generated at build time by wayland-scanner from the
-# system XML rather than vendored, so the definitions can never drift from the
-# ones the compositor on this machine was built against.
+# The Wayland backend for compositors with no extension of their own. Standard
+# protocol bindings come from wayland-protocols; compositor-specific protocols
+# are pinned below because distributions do not package their XML consistently.
 pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client>=1.20)
+pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(WAYLAND_SCANNER REQUIRED wayland-scanner)
 pkg_get_variable(WAYLAND_SCANNER_BIN wayland-scanner wayland_scanner)
 
 # Distributions lag the protocol definitions badly -- Ubuntu 24.04 ships 1.34,
 # Debian 12 ships 1.31 -- and the package is data only, so demanding a
 # system-wide upgrade would be a heavy answer to a directory of XML. Pointing at
-# a newer checkout is still reading the definitions at build time rather than
-# vendoring them, which is what keeps them from drifting away from the protocol
-# the compositor actually implements.
+# a newer checkout supplies the standard definitions without requiring a
+# system-wide package upgrade.
 #
 # The version floor is therefore checked only when there is no override to
 # check instead. Demanding it first would make the escape hatch unreachable on
@@ -171,7 +179,10 @@ endif()
 set(KSD_WAYLAND_GENERATED)
 foreach(spec
         "staging/ext-data-control/ext-data-control-v1"
-        "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1")
+        "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1"
+        "staging/ext-image-capture-source/ext-image-capture-source-v1"
+        "staging/ext-image-copy-capture/ext-image-copy-capture-v1"
+        "unstable/xdg-output/xdg-output-unstable-v1")
     get_filename_component(stem "${spec}" NAME)
     set(xml "${WAYLAND_PROTOCOL_DIR}/${spec}.xml")
     if(NOT EXISTS "${xml}")
@@ -201,10 +212,112 @@ foreach(spec
     list(APPEND KSD_WAYLAND_SERVER_GENERATED "${server_header}")
 endforeach()
 
+# wlroots protocols are not part of wayland-protocols. Pin the unstable wire
+# definition with the implementation so builds do not depend on a distro
+# carrying a separate, rarely packaged XML collection.
+set(wlr_xml
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-foreign-toplevel-management-unstable-v1.xml")
+set(wlr_stem "wlr-foreign-toplevel-management-unstable-v1")
+set(wlr_header "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-client-protocol.h")
+set(wlr_source "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-protocol.c")
+set(wlr_server_header "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-server-protocol.h")
+add_custom_command(OUTPUT "${wlr_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${wlr_xml}" "${wlr_header}"
+    DEPENDS "${wlr_xml}" VERBATIM)
+add_custom_command(OUTPUT "${wlr_source}"
+    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${wlr_xml}" "${wlr_source}"
+    DEPENDS "${wlr_xml}" VERBATIM)
+add_custom_command(OUTPUT "${wlr_server_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${wlr_xml}" "${wlr_server_header}"
+    DEPENDS "${wlr_xml}" VERBATIM)
+list(APPEND KSD_WAYLAND_GENERATED "${wlr_header}" "${wlr_source}")
+list(APPEND KSD_WAYLAND_SERVER_GENERATED "${wlr_server_header}")
+
+set(screencopy_xml
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-screencopy-unstable-v1.xml")
+set(screencopy_stem "wlr-screencopy-unstable-v1")
+set(screencopy_header
+    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-client-protocol.h")
+set(screencopy_source
+    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-protocol.c")
+set(screencopy_server_header
+    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-server-protocol.h")
+add_custom_command(OUTPUT "${screencopy_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${screencopy_xml}"
+        "${screencopy_header}"
+    DEPENDS "${screencopy_xml}" VERBATIM)
+add_custom_command(OUTPUT "${screencopy_source}"
+    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${screencopy_xml}"
+        "${screencopy_source}"
+    DEPENDS "${screencopy_xml}" VERBATIM)
+add_custom_command(OUTPUT "${screencopy_server_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${screencopy_xml}"
+        "${screencopy_server_header}"
+    DEPENDS "${screencopy_xml}" VERBATIM)
+list(APPEND KSD_WAYLAND_GENERATED
+    "${screencopy_header}" "${screencopy_source}")
+list(APPEND KSD_WAYLAND_SERVER_GENERATED "${screencopy_server_header}")
+
+set(pointer_xml
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-virtual-pointer-unstable-v1.xml")
+set(pointer_stem "wlr-virtual-pointer-unstable-v1")
+set(pointer_header "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-client-protocol.h")
+set(pointer_source "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-protocol.c")
+set(pointer_server_header
+    "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-server-protocol.h")
+add_custom_command(OUTPUT "${pointer_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${pointer_xml}"
+        "${pointer_header}"
+    DEPENDS "${pointer_xml}" VERBATIM)
+add_custom_command(OUTPUT "${pointer_source}"
+    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${pointer_xml}"
+        "${pointer_source}"
+    DEPENDS "${pointer_xml}" VERBATIM)
+add_custom_command(OUTPUT "${pointer_server_header}"
+    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${pointer_xml}"
+        "${pointer_server_header}"
+    DEPENDS "${pointer_xml}" VERBATIM)
+list(APPEND KSD_WAYLAND_GENERATED "${pointer_header}" "${pointer_source}")
+list(APPEND KSD_WAYLAND_SERVER_GENERATED "${pointer_server_header}")
+
+# COSMIC's version-2 toplevel extension enriches the standard ext list with
+# state and geometry; its version-1 manager supplies the matching actions.
+# The vendored XML files are wire-compatible subsets so old distro scanners
+# can build them without pulling in unused workspace protocols.
+foreach(spec
+        "cosmic-toplevel-info-v2"
+        "cosmic-toplevel-management-v1")
+    set(xml "${CMAKE_CURRENT_SOURCE_DIR}/protocols/${spec}.xml")
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${spec}-client-protocol.h")
+    set(source "${CMAKE_CURRENT_BINARY_DIR}/${spec}-protocol.c")
+    set(server_header
+        "${CMAKE_CURRENT_BINARY_DIR}/${spec}-server-protocol.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} client-header "${xml}" "${header}"
+        DEPENDS "${xml}" VERBATIM)
+    add_custom_command(OUTPUT "${source}"
+        COMMAND ${WAYLAND_SCANNER_BIN} private-code "${xml}" "${source}"
+        DEPENDS "${xml}" VERBATIM)
+    add_custom_command(OUTPUT "${server_header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} server-header "${xml}"
+            "${server_header}"
+        DEPENDS "${xml}" VERBATIM)
+    list(APPEND KSD_WAYLAND_GENERATED "${header}" "${source}")
+    list(APPEND KSD_WAYLAND_SERVER_GENERATED "${server_header}")
+endforeach()
+
 add_library(keysharp-desktop-wayland STATIC
+    src/wayland/portal_capture.c
     src/wayland/wl_connect.c
+    src/wayland/wl_cosmic_windows.c
+    src/wayland/wl_hypr.c
+    src/wayland/wl_keyboard.c
     src/wayland/wl_clipboard.c
+    src/wayland/wl_capture.c
+    src/wayland/wl_outputs.c
+    src/wayland/wl_pointer.c
     src/wayland/wl_windows.c
+    src/wayland/wl_wlr_windows.c
     src/wayland/wl_worker.c
     ${KSD_WAYLAND_GENERATED})
 target_include_directories(keysharp-desktop-wayland PUBLIC
@@ -215,7 +328,7 @@ target_include_directories(keysharp-desktop-wayland PUBLIC
 target_compile_definitions(keysharp-desktop-wayland PUBLIC
     _GNU_SOURCE _POSIX_C_SOURCE=200809L)
 target_link_libraries(keysharp-desktop-wayland PUBLIC
-    keysharp-desktop-wire PkgConfig::WAYLAND)
+    keysharp-desktop-wire PkgConfig::WAYLAND PkgConfig::XKBCOMMON PkgConfig::GIO)
 
 
 add_executable(keysharp-desktop-capture-worker
@@ -232,7 +345,7 @@ target_compile_definitions(keysharp-desktop PRIVATE
 
 foreach(target keysharp-desktop-wire keysharp-desktop-client
                keysharp-desktop-common keysharp-desktop-capture
-               keysharp-desktop-x11
+               keysharp-desktop-x11 keysharp-desktop-wayland
                keysharp-desktop keysharp-desktop-capture-worker)
     # keysharp-desktop carries src/enable_extension.c, so it is covered here.
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -333,6 +446,8 @@ install(DIRECTORY providers/kwin/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/kwin/scripts/io.github.keysharp.desktop.kwin)
 install(FILES LICENSE README.md SECURITY.md PROVENANCE.md
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-desktop)
+install(DIRECTORY examples/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-desktop/examples)
 install(DIRECTORY docs/
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/keysharp-desktop/docs)
 if(CMAKE_INSTALL_PREFIX STREQUAL "/usr/local")
@@ -349,7 +464,9 @@ option(KEYSHARP_DESKTOP_SETUP_ON_INSTALL
     "refresh the linker cache and enable the services after a direct root install" ON)
 if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
     install(CODE "
-        if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
+        execute_process(COMMAND id -u OUTPUT_VARIABLE _install_uid
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(\"\$ENV{DESTDIR}\" STREQUAL \"\" AND _install_uid STREQUAL \"0\")
             find_program(_ldconfig ldconfig PATHS /sbin /usr/sbin NO_CACHE)
             if(_ldconfig)
                 execute_process(COMMAND \"\${_ldconfig}\")
@@ -604,6 +721,11 @@ if(BUILD_TESTING)
     add_test(NAME wayland-clipboard-tests COMMAND wayland-clipboard-tests)
     set_tests_properties(wayland-clipboard-tests PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(portal-capture-tests tests/portal_capture_tests.c)
+    target_link_libraries(portal-capture-tests PRIVATE
+        keysharp-desktop-wayland keysharp-desktop-common PkgConfig::GIO)
+    add_test(NAME portal-capture-tests COMMAND portal-capture-tests)
+
     add_executable(operation-scope-tests tests/operation_scope_tests.c)
     target_link_libraries(operation-scope-tests PRIVATE
         keysharp-desktop-common)
@@ -673,7 +795,7 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "client_abi_minor=5")
+        PASS_REGULAR_EXPRESSION "client_abi_minor=7")
     add_test(NAME unknown-command-rejected
         COMMAND keysharp-desktop unknown-command)
     set_tests_properties(unknown-command-rejected PROPERTIES WILL_FAIL TRUE)
@@ -726,7 +848,10 @@ set(CPACK_PACKAGE_FILE_NAME "keysharp-desktop-${PROJECT_VERSION}-${CMAKE_SYSTEM_
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libglib2.0-0 (>= 2.56) | libglib2.0-0t64, polkitd | policykit-1, systemd")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-0")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_desktop/client.h"
+    KEYSHARP_DESKTOP_ABI_MINOR_LINE REGEX "^#define KSD_CLIENT_ABI_MINOR ")
+string(REGEX MATCH "[0-9]+" KEYSHARP_DESKTOP_ABI_MINOR "${KEYSHARP_DESKTOP_ABI_MINOR_LINE}")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-0 (= 0.${KEYSHARP_DESKTOP_ABI_MINOR})")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_BREAKS "keysharp (<< 0.0.0.17)")
 set(CPACK_DEBIAN_PACKAGE_REPLACES "keysharp (<< 0.0.0.17)")

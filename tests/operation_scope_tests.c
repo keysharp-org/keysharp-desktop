@@ -37,10 +37,25 @@ typedef struct expected_operation {
 } expected_operation;
 
 static const expected_operation expected_operations[] = {
+    { KSD_OP_WINDOW_BUTTON, KSP_SCOPE_WINDOW_CONTROL,
+      KSD_OPERATION_WINDOW_BUTTON, false },
+    { KSD_OP_WINDOW_FOCUS_CHILD, KSP_SCOPE_WINDOW_CONTROL,
+      KSD_OPERATION_WINDOW_FOCUS_CHILD, false },
+    { KSD_OP_WINDOW_QUERY, KSP_SCOPE_WINDOW_MONITORING, KSD_OPERATION_WINDOW_QUERY, false },
+    { KSD_OP_WINDOW_CHILDREN, KSP_SCOPE_WINDOW_MONITORING, KSD_OPERATION_WINDOW_CHILDREN, false },
+    { KSD_OP_WINDOW_AT_POINT, KSP_SCOPE_WINDOW_MONITORING, KSD_OPERATION_WINDOW_AT_POINT, false },
+    { KSD_OP_DISPLAY_LIST, 0u, KSD_OPERATION_DISPLAY_LIST, false },
+    { KSD_OP_KEYBOARD_STATE, 0u, KSD_OPERATION_KEYBOARD_STATE, false },
+    { KSD_OP_WINDOW_SET_TITLE, KSP_SCOPE_WINDOW_CONTROL, KSD_OPERATION_WINDOW_SET_TITLE, false },
+    { KSD_OP_WINDOW_SET_VISIBLE, KSP_SCOPE_WINDOW_CONTROL, KSD_OPERATION_WINDOW_SET_VISIBLE, false },
+    { KSD_OP_WINDOW_REDRAW, KSP_SCOPE_WINDOW_CONTROL, KSD_OPERATION_WINDOW_REDRAW, false },
+    { KSD_OP_WINDOW_CLICK, KSP_SCOPE_WINDOW_CONTROL, KSD_OPERATION_WINDOW_CLICK, false },
     { KSD_OP_CAPTURE_AREA, KSP_SCOPE_SCREEN_CAPTURE,
       KSD_OPERATION_CAPTURE_AREA, false },
     { KSD_OP_CAPTURE_WINDOW, KSP_SCOPE_SCREEN_CAPTURE,
       KSD_OPERATION_CAPTURE_WINDOW, false },
+    { KSD_OP_CAPTURE_DESKTOP, KSP_SCOPE_SCREEN_CAPTURE,
+      KSD_OPERATION_CAPTURE_DESKTOP, false },
     { KSD_OP_WINDOW_LIST, KSP_SCOPE_WINDOW_MONITORING,
       KSD_OPERATION_WINDOW_LIST, false },
     { KSD_OP_WINDOW_ACTIVE, KSP_SCOPE_WINDOW_MONITORING,
@@ -74,6 +89,8 @@ static const expected_operation expected_operations[] = {
       KSD_OPERATION_WINDOW_SET_ABOVE, false },
     { KSD_OP_WINDOW_SET_DECORATED, KSP_SCOPE_WINDOW_CONTROL,
       KSD_OPERATION_WINDOW_SET_DECORATED, false },
+    { KSD_OP_WINDOW_SET_SKIP_TASKBAR, KSP_SCOPE_WINDOW_CONTROL,
+      KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR, false },
     { KSD_OP_WINDOW_RESERVE, KSP_SCOPE_WINDOW_CONTROL,
       KSD_OPERATION_WINDOW_RESERVE, false },
     { KSD_OP_WINDOW_GET_RESERVED, KSP_SCOPE_WINDOW_CONTROL,
@@ -100,7 +117,7 @@ static const expected_operation expected_operations[] = {
     { KSD_OP_WORK_AREA, 0u, KSD_OPERATION_WORK_AREA, false },
 };
 
-#define EXPECTED_OPERATION_COUNT 30u
+#define EXPECTED_OPERATION_COUNT 43u
 #define EXPECTED_OPERATION_ROWS \
     (sizeof(expected_operations) / sizeof(expected_operations[0]))
 
@@ -159,6 +176,8 @@ int main(void)
              * exists without saying anything about it. */
             assert(entry->opcode == KSD_OP_CURSOR_POSITION
                    || entry->opcode == KSD_OP_WORK_AREA
+                   || entry->opcode == KSD_OP_DISPLAY_LIST
+                   || entry->opcode == KSD_OP_KEYBOARD_STATE
                    || entry->opcode == KSD_OP_CLIPBOARD_SET_CONTENT
                    || entry->opcode == KSD_OP_WINDOW_HANDLES);
             assert(ksd_operation_scope_free(entry->opcode));
@@ -185,7 +204,9 @@ int main(void)
 
     uint64_t reachable = ksd_backend_operations(KSD_BACKEND_KWIN)
         | ksd_backend_operations(KSD_BACKEND_GNOME)
-        | ksd_backend_operations(KSD_BACKEND_CINNAMON);
+        | ksd_backend_operations(KSD_BACKEND_CINNAMON)
+        | ksd_backend_operations(KSD_BACKEND_GENERIC)
+        | ksd_backend_operations(KSD_BACKEND_X11);
     assert(reachable == classified);
     assert(ksd_backend_operations(KSD_BACKEND_NONE) == 0u);
     uint64_t in_memory_capture = KSD_OPERATION_CAPTURE_AREA
@@ -202,6 +223,7 @@ int main(void)
      * it, which is the defect this project has now made twice. */
     assert(ksd_backend_operations(KSD_BACKEND_KWIN)
            == (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW
+               | KSD_OPERATION_KEYBOARD_STATE
                | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
                | KSD_OPERATION_WINDOW_HANDLES
                | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
@@ -211,6 +233,7 @@ int main(void)
                | KSD_OPERATION_WINDOW_SET_OPACITY
                | KSD_OPERATION_WINDOW_SET_ABOVE
                | KSD_OPERATION_WINDOW_SET_DECORATED
+               | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR
                | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA));
     /* LOWER stays out on purpose: KWin exposes raise and no lower, and the
      * script answers UNSUPPORTED rather than approximating it by sending the
@@ -226,24 +249,29 @@ int main(void)
         if (bit == 0u
             || (ksd_backend_operations(KSD_BACKEND_KWIN) & bit) == 0u)
             continue;
-        if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW)
+        if (opcode == KSD_OP_CAPTURE_AREA || opcode == KSD_OP_CAPTURE_WINDOW
+            || opcode == KSD_OP_KEYBOARD_STATE)
             continue;
         assert(ksd_kwin_lane_for((uint16_t)opcode) != KSD_KWIN_LANE_NONE);
     }
 
-    /* X11 serves the coordinate group and both captures, and nothing that
-     * needs a compositor: no clipboard, no window control, no input. Pinned as
-     * an exact mask rather than a list of present bits, so a verb added to the
-     * backend without an implementation behind it fails here. */
     /* The generic Wayland ceiling: what the shared protocols make possible
      * for a client on the OUTSIDE of a compositor. Any given compositor
      * implements some subset, and the daemon narrows this at registration. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC)
-           == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES
+           == (KSD_OPERATION_CAPTURE_AREA
+               | KSD_OPERATION_WINDOW_QUERY
+               | KSD_OPERATION_KEYBOARD_STATE
+               | KSD_OPERATION_CAPTURE_DESKTOP
+               | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE
+               | KSD_OPERATION_CURSOR_POSITION
+               | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES
+               | KSD_OPERATION_WINDOW_ACTIVE | KSD_OPERATION_WINDOW_FOCUS
+               | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_SET_STATE
                | KSD_OPERATION_CLIPBOARD_MIMETYPES
                | KSD_OPERATION_CLIPBOARD_CONTENT
                | KSD_OPERATION_CLIPBOARD_TEXT));
-    /* The nine that are IMPOSSIBLE here, not merely unwritten, each because no
+    /* The operations that are impossible here, not merely unwritten, each because no
      * Wayland protocol provides it: no client may restack another client's
      * window, set its geometry, set its opacity, keep it above, change its
      * decoration, learn a pid to signal, or correlate a toplevel to the
@@ -256,16 +284,20 @@ int main(void)
                | KSD_OPERATION_WINDOW_SET_OPACITY
                | KSD_OPERATION_WINDOW_SET_ABOVE
                | KSD_OPERATION_WINDOW_SET_DECORATED
+               | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR
                | KSD_OPERATION_WINDOW_RESERVE
                | KSD_OPERATION_WINDOW_GET_RESERVED)) == 0u);
-    /* And active-window, which this protocol cannot answer: nothing in
-     * ext-foreign-toplevel-list says which window has focus. */
-    assert((ksd_backend_operations(KSD_BACKEND_GENERIC)
-            & KSD_OPERATION_WINDOW_ACTIVE) == 0u);
     assert(ksd_backend_operations(KSD_BACKEND_X11)
            == ksd_backend_x11_route(KSD_BACKEND_X11, true));
     assert(ksd_backend_operations(KSD_BACKEND_X11)
            == (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
+               | KSD_OPERATION_WINDOW_WATCH
+               | KSD_OPERATION_WINDOW_QUERY | KSD_OPERATION_WINDOW_CHILDREN
+               | KSD_OPERATION_WINDOW_AT_POINT | KSD_OPERATION_DISPLAY_LIST
+               | KSD_OPERATION_KEYBOARD_STATE | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE
+               | KSD_OPERATION_WINDOW_SET_TITLE | KSD_OPERATION_WINDOW_SET_VISIBLE
+               | KSD_OPERATION_WINDOW_REDRAW | KSD_OPERATION_WINDOW_CLICK
+               | KSD_OPERATION_WINDOW_BUTTON | KSD_OPERATION_WINDOW_FOCUS_CHILD
                | KSD_OPERATION_WINDOW_HANDLES
                | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA
                | KSD_OPERATION_CAPTURE_AREA
@@ -282,14 +314,14 @@ int main(void)
                | KSD_OPERATION_WINDOW_SET_ABOVE
                | KSD_OPERATION_WINDOW_SET_DECORATED));
     /* Still absent, and each for its own reason rather than merely being
-     * unwritten. WATCH needs an event stream this worker has no way to hold
-     * open; the reservations are a compositor-side table; MOVE_RESIZE_XID is
+     * unwritten. The reservations are a compositor-side table; MOVE_RESIZE_XID is
      * the same verb as MOVE_RESIZE here, since an X11 handle already is an
      * XID; and input belongs to keysharp-input. */
     assert((ksd_backend_operations(KSD_BACKEND_X11)
-            & (KSD_OPERATION_WINDOW_WATCH | KSD_OPERATION_WINDOW_RESERVE
+            & (KSD_OPERATION_WINDOW_RESERVE
                | KSD_OPERATION_WINDOW_GET_RESERVED
                | KSD_OPERATION_WINDOW_MOVE_RESIZE_XID
+               | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR
                | KSD_OPERATION_CLIPBOARD_WATCH
                | KSD_OPERATION_MOUSE_BUTTON)) == 0u);
     /* Reading the clipboard is served; writing it is not, and must not be

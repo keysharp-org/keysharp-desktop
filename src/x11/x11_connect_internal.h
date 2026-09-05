@@ -8,6 +8,7 @@
 struct ksd_x11 {
     xcb_connection_t *connection;
     xcb_screen_t *screen;
+    struct ksd_x11_keyboard_cache *keyboard;
 };
 
 #endif

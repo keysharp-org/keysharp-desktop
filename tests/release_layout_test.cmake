@@ -11,6 +11,13 @@ file(READ "${SOURCE_DIR}/data/keysharp-desktop.service.in" broker_unit)
 file(READ "${SOURCE_DIR}/packaging/debian/postrm" debian_postrm)
 file(READ "${SOURCE_DIR}/nix/module.nix" nix_module)
 
+execute_process(
+    COMMAND sh "${SOURCE_DIR}/tests/installer_abi_tests.sh" "${SOURCE_DIR}"
+    RESULT_VARIABLE installer_abi_result)
+if(NOT installer_abi_result EQUAL 0)
+    message(FATAL_ERROR "portable installer ABI contract check failed")
+endif()
+
 foreach(required
         "--skip-if-compatible"
         "payload/usr/local"
@@ -232,7 +239,7 @@ foreach(required
 endforeach()
 foreach(workflow_source ci_workflow release_workflow)
     foreach(required
-            "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13"
+            "b8f31942dd2c286608d390634a9916bffce55ddf"
             "git rev-parse HEAD:third_party/keysharp-permissions"
             "libkeysharp-desktop.so.0")
         string(FIND "${${workflow_source}}" "${required}" found)
@@ -243,7 +250,7 @@ foreach(workflow_source ci_workflow release_workflow)
 endforeach()
 foreach(required
         "inputs.keysharp-permissions"
-        "ee3f2b8a14e2ff1778ca6c1d11cbf7846def2c13"
+        "b8f31942dd2c286608d390634a9916bffce55ddf"
         "flake = false")
     file(READ "${SOURCE_DIR}/flake.nix" flake_source)
     string(FIND "${flake_source}" "${required}" found)
@@ -382,7 +389,7 @@ endif()
 foreach(required
         "CPACK_DEBIAN_PACKAGE_BREAKS \"keysharp (<< 0.0.0.17)\""
         "CPACK_DEBIAN_PACKAGE_REPLACES \"keysharp (<< 0.0.0.17)\""
-        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-client-abi-0\""
+        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-client-abi-0 (= 0."
         "CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON"
         "16986957+Descolada@users.noreply.github.com")
     string(FIND "${cmake_source}" "${required}" found)

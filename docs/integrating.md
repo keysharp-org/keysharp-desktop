@@ -32,7 +32,8 @@ ksd_status status = ksd_connect(&options, &connection, &service, &error);
 
 A null `socket_path` uses `KSD_DEFAULT_SOCKET_PATH`. A custom absolute path is
 useful for tests. `KSD_AUTH_CHECK` never prompts; `KSD_AUTH_REQUEST` may use
-polkit. A zero-scope connection reports the backend and available operations
+polkit in a system installation, or a local consent dialog in a user installation.
+A zero-scope connection reports the backend and available operations
 without reading the permission store.
 
 Requested, listed, and revoked scopes are the six desktop scopes plus shared
@@ -52,19 +53,27 @@ request across frames itself. Writing
 `ksd_clipboard_set_text` does; every other mimetype is passed through as
 opaque bytes.
 
-InputControl is one shared grant, not one grant per service. An application that
+In a system installation, InputControl is one shared grant. An application that
 holds it for `keysharp-input` holds it here too, so `ksd_mouse_*` raises no
 second prompt, and revoking it through this service also stops that
 application's `keysharp-input` synthesis. AudioCapture and CameraCapture are reserved:
 they are requested, granted, listed, and revoked like any other scope, but no
 operation requires them yet.
 
+Grants remember an executable identity and the requested scopes. Request all
+scopes your application needs together to present one consent decision. Asking
+for another scope later may require another prompt. A user-installed authority
+has a private grant store; its consent does not authorize the system input
+service. See [application identity](app-identity.md) for interpreter, update,
+and runtime-integrity limits.
+
 Check `service.available_operations` before every optional operation. The
 mask is backend-dependent. Cursor position and work area are available through
-the GNOME and Cinnamon providers but not through KWin.
+the GNOME, Cinnamon, KWin, and X11 backends.
 
 `ksd_capture_window` takes the `id` field of the window JSON as its
-`window_id`. It returns the window's own pixels, so a client-side-decorated
+`window_id`, except on KWin where it takes the optional `captureId` field. It
+returns the window's own pixels, so a client-side-decorated
 window carries alpha in its corners, while `ksd_capture_area` returns the
 opaque composited stage. Compare colours within one path, never across both.
 `include_decoration` adds the margin the compositor draws outside the visible
@@ -72,21 +81,84 @@ window -- shadow and invisible border on GNOME, where server-side decoration is
 already inside the visible frame rect. A window that no longer exists, or that
 the compositor cannot paint, reports `KSD_STATUS_UNAVAILABLE` on both backends.
 
-## Unsupported compositors
+`ksd_capture_desktop` returns the complete logical desktop. It is a separate
+operation because screenshot portals capture a desktop or monitor, not an
+arbitrary rectangle. It was added in client ABI minor 7. Check
+`KSD_OPERATION_CAPTURE_DESKTOP` before calling it; a client that needs a
+rectangle may decode and crop the returned image itself. Always inspect
+`ksd_capture.format`: captures may be PNG or premultiplied BGRA pixels depending
+on the backend and operation.
 
-A session whose compositor this service has no backend for reports
-`KSD_BACKEND_GENERIC` and an `available_operations` of zero. It is a working
-connection, not an error: `ksd_connect` succeeds, `ksd_authorize` still prompts
-through polkit and still records a durable grant, and `ksd_permissions_list`
-and `ksd_permissions_revoke` still work. Every typed operation returns
-`KSD_STATUS_UNAVAILABLE`. Treat it the way the operation mask already tells you
-to: check `available_operations` and offer only what is there.
+X11 and generic Wayland operations reuse credential-dropped workers and their
+display connections for the registered session. Queries and captures use
+separate workers, so a slow capture does not hold up keyboard, pointer, or
+window queries on another client connection. Captures cross the authority as
+sealed descriptors. KWin capture uses
+a short-lived isolated worker. Screenshot-portal desktop capture includes a
+portal request and PNG file/decode costs; it is not a continuous capture stream.
+There is no PipeWire streaming API in this release.
+
+## Window, display, and keyboard queries
+
+Client ABI minor 8 adds a single-window snapshot, parent/top-level relationships,
+child enumeration, point hit-testing, monitor topology, keyboard keymaps/state,
+and X11 title, visibility, redraw, child focus, and client-directed button calls.
+Check each operation bit; support is independent of the ABI version.
+
+`ksd_window_query_json` returns `{"ok":true,"window":{...}}` for one handle.
+Generic Wayland uses its cached toplevel table and serializes only that window;
+it does not build a complete window list for this call.
+X11 snapshots contain decimal `parent` and `topLevel` handles.
+`ksd_window_children_json` returns `{"ok":true,"handles":["..."]}` in X11
+stacking order, bottom to top. `ksd_window_at_point_json` returns the same
+snapshot envelope; its `deepest` argument selects the deepest child, and X11
+hit-testing respects input shapes. Missing windows return `NOT_FOUND`.
+
+`ksd_display_list_json` returns `{"ok":true,"displays":[...]}`. Each display
+has `name`, `output`, `x`, `y`, `width`, `height`, `primary`, `physicalWidth`,
+`physicalHeight`, `refreshRate`, and `orientation`. Coordinates and dimensions
+describe the X11 desktop; physical dimensions are millimetres and refresh rate
+is hertz.
+
+`ksd_keyboard_state_json` returns a UTF-8 XKB `keymap`, layout names in
+`layouts`, and an opaque `mapRevision`. On X11 it also returns `group`,
+`depressed`, `latched`, `locked`, `capsLock`, `numLock`, and `scrollLock`.
+The masks are XKB modifier masks; layout group is zero-based. Inspect
+`validFields` before consuming optional state. All Wayland backends use the
+compositor's ordinary keyboard interface for keymaps and layout names,
+including sessions with GNOME, Cinnamon, and KWin window providers. They omit
+global group and modifier state:
+an unfocused Wayland client cannot observe those values reliably.
+
+Pass the last `mapRevision` to `ksd_keyboard_state_since_json` on subsequent
+queries. An unchanged map is omitted, so retain your previous keymap. Map
+notifications invalidate the worker's cache; this API uses queries rather than
+a public keyboard subscription. Use a dedicated connection and your own polling
+cadence for state notifications. Display and keyboard queries require no scope.
+
+`ksd_window_click` sends complete clicks using X11 button numbers 1 through 5.
+`ksd_window_button` sends one press or release using numbers 1 through 32.
+Coordinates are local to the client window. Applications may ignore these
+synthetic X11 events. `ksd_window_focus_child` sets
+focus on a child window, while `ksd_window_focus` requests window-manager
+activation. These calls require WindowControl, including on X11.
+
+## Generic Wayland compositors
+
+A Wayland session without a dedicated provider reports
+`KSD_BACKEND_GENERIC`. It is a working, dynamically probed backend:
+`available_operations` contains only the operations supported by the
+compositor's advertised portable, wlroots, COSMIC, or authenticated Hyprland
+interfaces and by the desktop screenshot portal. It can legitimately be zero.
+Check the mask and offer only what is there; an unavailable typed operation
+returns `KSD_STATUS_UNAVAILABLE`.
 
 The service registers the generic backend when the session names no desktop it
 has a backend for. On GNOME, Cinnamon and KDE it waits about two minutes for a
 provider to appear first, so a shell extension enabled during login is not
-missed. An extension enabled after that is picked up at the next login, or
-after `systemctl --user restart keysharp-desktop.service`.
+missed. It re-checks the compositor while registered and restarts its backend
+when the provider or desktop changes, including when a shell extension is
+enabled after startup.
 
 ## Forward compatibility
 
@@ -100,8 +172,7 @@ closed and invalidate the connection. Enumerated values do not:
   `ksd_backend_name` reports it as `unknown`. Never infer support from the
   backend value; read `available_operations`, which the service computes.
   `KSD_BACKEND_GENERIC` is named from `ksd_client_abi_minor() >= 3`; an older
-  library reports that same session as `unknown` with the same zero operation
-  mask, so the difference misleads no caller.
+  library reports that same session as `unknown` with the same operation mask.
 - `available_operations` may carry bits this header does not name. They are
   delivered verbatim and match no `KSD_OPERATION_*` test.
 - `service.granted_scopes` and the mask from `ksd_authorize` are narrowed to
@@ -124,6 +195,8 @@ Permission-list entries are borrowed only during the visitor call.
 
 Move/resize uses `INT32_MIN` for an unchanged X or Y coordinate and zero for
 an unchanged width or height. A request that changes nothing is invalid.
+`ksd_window_set_skip_taskbar` changes the KWin taskbar, pager, and switcher
+hints together; check its operation bit because other backends do not offer it.
 
 Status values distinguish denial, unavailable backend support, invalid input,
 resource limits, timeout, cancellation, revocation, and internal failure. An
@@ -188,6 +261,20 @@ the documented fields they need and ignore unknown fields. Common fields are
 `id`, `title`, `appId`, `pid`, `frame`, `client`, `active`, `minimized`,
 `maximized`, `visible`, `alwaysOnTop`, `decorated`, and
 `onCurrentWorkspace`. Rectangles contain `x`, `y`, `width`, and `height`.
+KWin also supplies `captureId`, its opaque ScreenShot2 identifier; use `id`
+for control operations and `captureId` only with window capture.
+
+Snapshots may include `validFields`, the fields known for that specific window.
+An omitted field is unknown; zero, false, or an empty legacy placeholder does
+not prove that the compositor reported that value. Older providers may omit
+the validity array, so treat them as the legacy schema and check field presence.
+Frame and client rectangles can differ; do not infer client bounds from frame
+bounds when `client` is not valid. Numeric generic Wayland handles are opaque,
+connection-lifetime identifiers and must be refreshed after a worker or
+compositor reconnect. They are randomized so an old handle does not alias the
+first window on a replacement connection. On the portable foreign-toplevel
+backend, `compositorId` retains the compositor's original string identifier;
+pass the numeric `id` to queries and controls.
 
 See `client.h` for the complete ABI and [SECURITY.md](../SECURITY.md) for the
 trust model.

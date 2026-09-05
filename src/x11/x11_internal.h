@@ -18,6 +18,7 @@
  * absent rather than an error. */
 typedef struct x11_atoms {
     xcb_atom_t client_list;
+    xcb_atom_t client_list_stacking;
     xcb_atom_t active_window;
     xcb_atom_t work_area;
     xcb_atom_t current_desktop;

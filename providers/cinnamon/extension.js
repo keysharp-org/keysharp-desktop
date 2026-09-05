@@ -2361,16 +2361,18 @@ class KeysharpExtension {
         // Windows on other workspaces still "exist" (enumeration/matching), but must not win
         // at-point hit-tests — global.get_window_actors() spans ALL workspaces.
         let onCurrentWorkspace = true;
+        let workspaceKnown = false;
         try {
             const active = global.workspace_manager
                 ? global.workspace_manager.get_active_workspace()
                 : global.screen.get_active_workspace();
             onCurrentWorkspace = win.is_on_all_workspaces()
                 || (win.get_workspace() !== null && win.get_workspace() === active);
+            workspaceKnown = true;
         } catch (_e) {
         }
 
-        return {
+        const snapshot = {
             id: String(win.get_stable_sequence()),
             title: win.get_title() || '',
             appId: win.get_wm_class() || win.get_wm_class_instance() || '',
@@ -2392,6 +2394,15 @@ class KeysharpExtension {
             decorated: win.decorated !== false,
             transparency: Math.max(0, Math.min(255, Math.round(Number(opacity))))
         };
+        snapshot.validFields = ['id', 'title', 'appId', 'frame', 'active',
+            'minimized', 'maximized', 'alwaysOnTop'];
+        if (snapshot.pid > 0) snapshot.validFields.push('pid');
+        if (buffer !== null) snapshot.validFields.push('buffer');
+        if (typeof win.decorated === 'boolean') snapshot.validFields.push('decorated');
+        if (workspaceKnown) snapshot.validFields.push('onCurrentWorkspace');
+        if (workspace >= 0) snapshot.validFields.push('workspace');
+        if (monitor >= 0) snapshot.validFields.push('monitor');
+        return snapshot;
     }
 
     _findWindow(handle) {

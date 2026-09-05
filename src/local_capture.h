@@ -4,10 +4,14 @@
 #include "operation_result.h"
 #include "protocol_io.h"
 
+#include <sys/types.h>
+
 void ksd_local_capture_execute(const ksd_frame *request,
                                int capture_read_fd, int capture_write_fd,
-                               int capture_spool_fd,
+                               int capture_spool_fd, pid_t trusted_kwin_pid,
                                ksd_operation_result *result);
+bool ksd_local_capture_kwin_owner_pid(uid_t expected_uid, pid_t *owner_pid);
+bool ksd_local_capture_kwin_process_trusted(uid_t expected_uid, pid_t pid);
 bool ksd_local_capture_request_valid(const ksd_frame *request);
 bool ksd_capture_tail_valid(const void *tail, uint32_t tail_length);
 bool ksd_capture_pipe_valid(const int descriptors[2]);

@@ -4,12 +4,14 @@
 #include "transport.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* One per connection thread is the ceiling, the same bound the worker pool
@@ -24,6 +26,8 @@ typedef struct relay_pending {
     uint32_t detail;
     uint8_t *tail;
     uint32_t tail_length;
+    int payload_fd;
+    uint16_t opcode;
 } relay_pending;
 
 struct ksd_kwin_relay {
@@ -63,6 +67,8 @@ ksd_kwin_relay *ksd_kwin_relay_create(int descriptor)
     relay->descriptor = descriptor;
     relay->next_request_id = 1u;
     relay->refs = 1u;
+    for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++)
+        relay->pending[index].payload_fd = -1;
     if (pthread_mutex_init(&relay->mutex, NULL) != 0
         || pthread_mutex_init(&relay->write_mutex, NULL) != 0
         || pthread_cond_init(&relay->changed, NULL) != 0) {
@@ -94,8 +100,11 @@ void ksd_kwin_relay_release(ksd_kwin_relay *relay)
         return;
     /* Nobody else can reach it now, so the teardown needs no lock of its own
      * and destroying the mutexes is safe. */
-    for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++)
+    for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++) {
         free(relay->pending[index].tail);
+        if (relay->pending[index].payload_fd >= 0)
+            close(relay->pending[index].payload_fd);
+    }
     if (relay->descriptor >= 0)
         close(relay->descriptor);
     pthread_mutex_destroy(&relay->mutex);
@@ -180,27 +189,35 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
     uint8_t *body = NULL;
     ksd_frame frame;
     bool matched = false;
+    int payload_fd = -1;
     int ready = wait_readable(relay->descriptor, deadline_ms);
 
     if (ready == 0)
         return true;
     if (ready < 0)
         return false;
-    if (!read_all_until(relay->descriptor, header, sizeof(header),
-                        deadline_ms))
+    if (ksd_receive_fd_until(relay->descriptor, header, sizeof(header),
+                              deadline_ms, &payload_fd) != 0)
         return false;
     uint32_t payload_length =
         ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
     /* Every answer carries the eight-byte status and detail prologue, so one
      * shorter than that is not an answer this daemon wrote. */
-    if (payload_length < 8u || payload_length > KSD_MAX_TEXT_BYTES + 8u)
-        return false;
+    uint16_t flags = ksd_decode_u16(header + KSD_FRAME_FLAGS_OFFSET);
+    bool file_response = flags == KSD_RELAY_CAPTURE_FD;
+    if (memcmp(header, "KSDP", 4u) != 0
+        || ksd_decode_u16(header + KSD_FRAME_MAJOR_OFFSET) != KSD_PROTOCOL_MAJOR
+        || ksd_decode_u16(header + KSD_FRAME_MINOR_OFFSET) != KSD_PROTOCOL_MINOR
+        || (flags != 0u && !file_response)
+        || file_response != (payload_fd >= 0)
+        || payload_length < 8u || payload_length > KSD_MAX_TEXT_BYTES + 8u
+        || (file_response && payload_length != 12u))
+        goto malformed;
     if (payload_length != 0u) {
         body = malloc(payload_length);
         if (body == NULL || !read_all_until(relay->descriptor, body,
                                             payload_length, deadline_ms)) {
-            free(body);
-            return false;
+            goto malformed;
         }
     }
     memset(&frame, 0, sizeof(frame));
@@ -208,6 +225,18 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
     uint32_t status = ksd_decode_u32(body);
     uint32_t detail = ksd_decode_u32(body + 4u);
     uint32_t tail_length = payload_length - 8u;
+    if (file_response) {
+        struct stat info;
+        int required = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+        int seals = fcntl(payload_fd, F_GET_SEALS);
+        tail_length = ksd_decode_u32(body + 8u);
+        if (status != KSD_STATUS_OK || tail_length < 20u
+            || tail_length > KSD_MAX_CAPTURE_TAIL
+            || fstat(payload_fd, &info) != 0 || !S_ISREG(info.st_mode)
+            || info.st_size != (off_t)tail_length || seals < 0
+            || (seals & required) != required)
+            goto malformed;
+    }
 
     pthread_mutex_lock(&relay->mutex);
     for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++) {
@@ -218,15 +247,27 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
             continue;
         slot->status = status;
         slot->detail = detail;
+        if (file_response) {
+            if (slot->opcode != KSD_OP_CAPTURE_AREA
+                && slot->opcode != KSD_OP_CAPTURE_WINDOW
+                && slot->opcode != KSD_OP_CAPTURE_DESKTOP) {
+                pthread_mutex_unlock(&relay->mutex);
+                goto malformed;
+            }
+            slot->payload_fd = payload_fd;
+            slot->tail_length = tail_length;
+            payload_fd = -1;
+        }
         /* The prologue is dropped here rather than carried further: what the
          * caller wants is the tail, and every reader past this point would
          * otherwise have to know to skip eight bytes. */
-        if (tail_length != 0u) {
+        if (!file_response && tail_length != 0u) {
             slot->tail = malloc(tail_length);
             if (slot->tail != NULL) {
                 memcpy(slot->tail, body + 8u, tail_length);
                 slot->tail_length = tail_length;
-            }
+            } else
+                slot->status = KSD_STATUS_RESOURCE_EXHAUSTED;
         }
         slot->done = true;
         matched = true;
@@ -237,8 +278,26 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
      * request that has already timed out, and holding it would grow without
      * bound on a daemon that answers late every time. */
     free(body);
+    if (payload_fd >= 0)
+        close(payload_fd);
     (void)matched;
     return true;
+
+malformed:
+    free(body);
+    if (payload_fd >= 0)
+        close(payload_fd);
+    return false;
+}
+
+bool ksd_kwin_relay_is_broken(ksd_kwin_relay *relay)
+{
+    if (relay == NULL)
+        return true;
+    pthread_mutex_lock(&relay->mutex);
+    bool broken = relay->broken;
+    pthread_mutex_unlock(&relay->mutex);
+    return broken;
 }
 
 bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
@@ -248,6 +307,7 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
     relay_pending *slot = NULL;
     uint64_t request_id;
     bool sent;
+    bool attempted = false;
     bool answered = false;
 
     if (relay == NULL || request == NULL || result == NULL)
@@ -275,6 +335,8 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
         return true;
     }
     memset(slot, 0, sizeof(*slot));
+    slot->payload_fd = -1;
+    slot->opcode = request->opcode;
     slot->active = true;
     request_id = relay->next_request_id++;
     slot->request_id = request_id;
@@ -290,12 +352,18 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
     sent = ksd_frame_pack(&outgoing, &packed);
     if (sent) {
         pthread_mutex_lock(&relay->write_mutex);
+        attempted = true;
         sent = ksd_write_all(relay->descriptor, packed.data, packed.length);
         pthread_mutex_unlock(&relay->write_mutex);
     }
     ksd_buffer_clear(&packed);
 
     pthread_mutex_lock(&relay->mutex);
+    if (attempted && !sent) {
+        relay->broken = true;
+        (void)shutdown(relay->descriptor, SHUT_RDWR);
+        pthread_cond_broadcast(&relay->changed);
+    }
     while (sent && !slot->done && !relay->broken) {
         uint64_t now = relay_monotonic_ms();
         struct timespec until;
@@ -331,7 +399,11 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
         pthread_cond_timedwait(&relay->changed, &relay->mutex, &until);
     }
     if (slot->done) {
-        if (slot->status == KSD_STATUS_OK && slot->tail_length != 0u) {
+        if (slot->status == KSD_STATUS_OK && slot->payload_fd >= 0) {
+            answered = ksd_result_take_fd(result, slot->payload_fd,
+                                           slot->tail_length);
+            slot->payload_fd = -1;
+        } else if (slot->status == KSD_STATUS_OK && slot->tail_length != 0u) {
             answered = ksd_result_take(result, slot->tail, slot->tail_length);
             if (answered)
                 slot->tail = NULL;
@@ -344,13 +416,16 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
         }
     }
     free(slot->tail);
+    if (slot->payload_fd >= 0)
+        close(slot->payload_fd);
     memset(slot, 0, sizeof(*slot));
+    slot->payload_fd = -1;
     pthread_cond_broadcast(&relay->changed);
     pthread_mutex_unlock(&relay->mutex);
 
     if (answered)
         return true;
-    if (!sent) {
+    if (!sent && !attempted) {
         /* Never written, so it provably never reached the compositor. */
         ksd_result_error(result, KSD_STATUS_BUSY, 0u,
                          "could not reach the compositor");

@@ -1,9 +1,15 @@
 #include "wl_internal.h"
+#include "wl_outputs.h"
+#include "wl_pointer.h"
+#include "wl_hypr.h"
+#include "wl_cosmic_windows.h"
+#include "wl_keyboard.h"
 
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,20 +43,71 @@ static void registry_global(void *data, struct wl_registry *registry,
          * registry event: a listener added after the round trip that carried
          * this binding would miss every window that already existed. */
         ksd_wayland_toplevels_attach(connection);
+    } else if (strcmp(interface,
+                      zwlr_foreign_toplevel_manager_v1_interface.name) == 0
+               && connection->toplevel_manager == NULL) {
+        uint32_t bind_version = version < 3u ? version : 3u;
+        connection->toplevel_manager = wl_registry_bind(registry, name,
+            &zwlr_foreign_toplevel_manager_v1_interface, bind_version);
+        ksd_wayland_wlr_toplevels_attach(connection);
+    } else if (strcmp(interface, zcosmic_toplevel_info_v1_interface.name)
+                   == 0) {
+        ksd_wayland_cosmic_bind_info(connection, registry, name, version);
+    } else if (strcmp(interface, zcosmic_toplevel_manager_v1_interface.name)
+                   == 0) {
+        ksd_wayland_cosmic_bind_manager(connection, registry, name, version);
+    } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name)
+                   == 0
+               && connection->screencopy_manager == NULL) {
+        connection->screencopy_version = version < 3u ? version : 3u;
+        connection->screencopy_manager = wl_registry_bind(registry, name,
+            &zwlr_screencopy_manager_v1_interface,
+            connection->screencopy_version);
+    } else if (strcmp(interface,
+                      ext_output_image_capture_source_manager_v1_interface.name)
+                   == 0 && connection->output_source_manager == NULL) {
+        connection->output_source_manager = wl_registry_bind(
+            registry, name,
+            &ext_output_image_capture_source_manager_v1_interface, 1u);
+    } else if (strcmp(interface,
+                      ext_image_copy_capture_manager_v1_interface.name) == 0
+               && connection->image_copy_manager == NULL) {
+        connection->image_copy_manager = wl_registry_bind(
+            registry, name, &ext_image_copy_capture_manager_v1_interface,
+            1u);
+    } else if (strcmp(interface,
+                      zwlr_virtual_pointer_manager_v1_interface.name) == 0
+               && connection->pointer_manager == NULL) {
+        uint32_t bind_version = version < 2u ? version : 2u;
+        connection->pointer_manager = wl_registry_bind(registry, name,
+            &zwlr_virtual_pointer_manager_v1_interface, bind_version);
+    } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0
+               && connection->xdg_output_manager == NULL) {
+        uint32_t bind_version = version < 3u ? version : 3u;
+        connection->xdg_output_manager = wl_registry_bind(registry, name,
+            &zxdg_output_manager_v1_interface, bind_version);
+        ksd_wayland_outputs_bind_xdg(connection);
+    } else if (strcmp(interface, wl_shm_interface.name) == 0
+               && connection->shm == NULL) {
+        connection->shm = wl_registry_bind(registry, name, &wl_shm_interface,
+                                           1u);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        ksd_wayland_output_add(connection, registry, name, version);
     } else if (strcmp(interface, wl_seat_interface.name) == 0
                && connection->seat == NULL) {
         connection->seat_name = name;
         connection->seat = wl_registry_bind(registry, name,
                                             &wl_seat_interface, 1u);
+        if (connection->seat != NULL)
+            ksd_wayland_keyboard_attach(connection);
     }
 }
 
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    (void)data;
+    ksd_wayland_output_remove(data, name);
     (void)registry;
-    (void)name;
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -77,6 +134,50 @@ static void sync_done(void *data, struct wl_callback *callback,
 static const struct wl_callback_listener sync_listener = {
     .done = sync_done,
 };
+
+bool ksd_wayland_dispatch_until(ksd_wayland *connection,
+                                bool (*complete)(void *), void *data,
+                                int timeout_ms)
+{
+    int64_t deadline;
+
+    if (connection == NULL || connection->display == NULL || complete == NULL
+        || timeout_ms <= 0)
+        return false;
+    deadline = monotonic_ms() + timeout_ms;
+    while (!complete(data)) {
+        struct pollfd item = {
+            .fd = wl_display_get_fd(connection->display),
+            .events = POLLIN,
+        };
+        int remaining = (int)(deadline - monotonic_ms());
+        int ready;
+
+        if (remaining <= 0)
+            return false;
+        while (wl_display_prepare_read(connection->display) != 0) {
+            if (wl_display_dispatch_pending(connection->display) < 0)
+                return false;
+            if (complete(data))
+                return true;
+        }
+        if (wl_display_flush(connection->display) < 0 && errno != EAGAIN) {
+            wl_display_cancel_read(connection->display);
+            return false;
+        }
+        ready = poll(&item, 1u, remaining);
+        if (ready <= 0) {
+            wl_display_cancel_read(connection->display);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            return false;
+        }
+        if (wl_display_read_events(connection->display) < 0
+            || wl_display_dispatch_pending(connection->display) < 0)
+            return false;
+    }
+    return true;
+}
 
 /* wl_display_sync answers once everything sent before it has been processed,
  * which is what a round trip means. Written out rather than calling
@@ -199,6 +300,30 @@ bool ksd_wayland_drain(int descriptor, int timeout_ms, uint8_t **data,
     return true;
 }
 
+uint64_t ksd_wayland_new_handle(const ksd_wayland *connection)
+{
+    for (unsigned attempt = 0u; attempt < 16u; attempt++) {
+        uint64_t value;
+        ssize_t count;
+        do {
+            count = getrandom(&value, sizeof(value), 0);
+        } while (count < 0 && errno == EINTR);
+        if (count != (ssize_t)sizeof(value))
+            return 0u;
+        value &= INT64_MAX;
+        bool duplicate = value == 0u;
+        for (const ksd_wl_toplevel *item = connection->toplevels;
+             !duplicate && item != NULL; item = item->next)
+            duplicate = item->id == value;
+        for (const ksd_wlr_toplevel *item = connection->wlr_toplevels;
+             !duplicate && item != NULL; item = item->next)
+            duplicate = item->id == value;
+        if (!duplicate)
+            return value;
+    }
+    return 0u;
+}
+
 ksd_status ksd_wayland_open(const char *display, ksd_wayland **out)
 {
     ksd_wayland *connection;
@@ -209,6 +334,7 @@ ksd_status ksd_wayland_open(const char *display, ksd_wayland **out)
     connection = calloc(1u, sizeof(*connection));
     if (connection == NULL)
         return KSD_STATUS_INTERNAL;
+    connection->session_pid = getpid();
     /* NULL means WAYLAND_DISPLAY, which is how every Wayland client finds its
      * compositor. The name is never taken from the calling client: the same
      * rule the X11 backend follows, for the same reason. */
@@ -229,10 +355,13 @@ ksd_status ksd_wayland_open(const char *display, ksd_wayland **out)
      * second lets anything those globals in turn advertise arrive before the
      * caller is told what this compositor supports. */
     if (!ksd_wayland_roundtrip(connection, 2000)
-        || !ksd_wayland_roundtrip(connection, 2000)) {
+        || !ksd_wayland_roundtrip(connection, 2000)
+        || (connection->keyboard != NULL && connection->keymap == NULL
+            && !ksd_wayland_roundtrip(connection, 2000))) {
         ksd_wayland_close(connection);
         return KSD_STATUS_UNAVAILABLE;
     }
+    ksd_wayland_pointer_create(connection);
     *out = connection;
     return KSD_STATUS_OK;
 }
@@ -243,9 +372,28 @@ void ksd_wayland_close(ksd_wayland *connection)
         return;
     if (connection->data_control != NULL)
         ext_data_control_manager_v1_destroy(connection->data_control);
+    ksd_wayland_outputs_clear(connection);
+    if (connection->xdg_output_manager != NULL)
+        zxdg_output_manager_v1_destroy(connection->xdg_output_manager);
+    if (connection->screencopy_manager != NULL)
+        zwlr_screencopy_manager_v1_destroy(connection->screencopy_manager);
+    if (connection->image_copy_manager != NULL)
+        ext_image_copy_capture_manager_v1_destroy(
+            connection->image_copy_manager);
+    if (connection->output_source_manager != NULL)
+        ext_output_image_capture_source_manager_v1_destroy(
+            connection->output_source_manager);
+    if (connection->shm != NULL)
+        wl_shm_destroy(connection->shm);
+    ksd_wayland_pointer_clear(connection);
     ksd_wayland_toplevels_clear(connection);
+    ksd_wayland_cosmic_clear(connection);
     if (connection->toplevel_list != NULL)
         ext_foreign_toplevel_list_v1_destroy(connection->toplevel_list);
+    ksd_wayland_wlr_toplevels_clear(connection);
+    if (connection->toplevel_manager != NULL)
+        zwlr_foreign_toplevel_manager_v1_destroy(connection->toplevel_manager);
+    ksd_wayland_keyboard_clear(connection);
     if (connection->seat != NULL)
         wl_seat_destroy(connection->seat);
     if (connection->registry != NULL)
@@ -255,9 +403,20 @@ void ksd_wayland_close(ksd_wayland *connection)
     free(connection);
 }
 
+void ksd_wayland_set_session_pid(ksd_wayland *connection, pid_t session_pid)
+{
+    if (connection != NULL && session_pid > 0)
+        connection->session_pid = session_pid;
+}
+
+pid_t ksd_wayland_session_pid(const ksd_wayland *connection)
+{
+    return connection == NULL ? 0 : connection->session_pid;
+}
+
 ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
 {
-    ksd_wayland_features features = { false, false };
+    ksd_wayland_features features = { 0 };
 
     if (connection == NULL)
         return features;
@@ -265,7 +424,30 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
      * for a seat, and a compositor with no seat has no selection to read. */
     features.data_control = connection->data_control != NULL
         && connection->seat != NULL;
-    features.toplevel_list = connection->toplevel_list != NULL;
+    features.toplevel_list = connection->toplevel_list != NULL
+        || connection->toplevel_manager != NULL;
+    features.toplevel_control = connection->toplevel_manager != NULL
+        && connection->seat != NULL;
+    features.toplevel_active = connection->toplevel_manager != NULL
+        || ksd_wayland_cosmic_can_list(connection);
+    features.toplevel_focus = features.toplevel_control
+        || ksd_wayland_cosmic_can_focus(connection);
+    features.toplevel_close = connection->toplevel_manager != NULL
+        || ksd_wayland_cosmic_can_close(connection);
+    features.toplevel_state = connection->toplevel_manager != NULL
+        || ksd_wayland_cosmic_can_set_state(connection);
+    features.toplevel_control = features.toplevel_focus
+        && features.toplevel_close && features.toplevel_state;
+    features.screencopy = connection->shm != NULL
+        && connection->outputs != NULL
+        && (connection->screencopy_manager != NULL
+            || (connection->output_source_manager != NULL
+                && connection->image_copy_manager != NULL));
+    bool hypr = ksd_wayland_hypr_available(connection->session_pid);
+    features.absolute_pointer = (connection->virtual_pointer != NULL
+        && connection->outputs != NULL) || hypr;
+    features.cursor_position = hypr;
+    features.keyboard_keymap = connection->keymap != NULL;
     return features;
 }
 

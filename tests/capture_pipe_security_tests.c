@@ -331,13 +331,13 @@ static void check_bootstrap_header_parse(void)
     /* Every backend the service knows is accepted, and nothing past it. A
      * value out of range would select no route at all and the request would be
      * refused for a reason that names the wrong thing. */
-    for (uint16_t backend = 0u; backend <= KSD_BACKEND_GENERIC; backend++) {
+    for (uint16_t backend = 0u; backend <= KSD_BACKEND_X11; backend++) {
         encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
         ksd_encode_u16(header + 6u, backend);
         assert(ksd_capture_worker_test_parse_header(header, total));
     }
     encode_bootstrap(header, 4u, 0u, (uint32_t)frame_length, 4321u);
-    ksd_encode_u16(header + 6u, (uint16_t)(KSD_BACKEND_GENERIC + 1u));
+    ksd_encode_u16(header + 6u, (uint16_t)(KSD_BACKEND_X11 + 1u));
     assert(!ksd_capture_worker_test_parse_header(header, total));
 
     /* No pid means no authenticated party to take a display from. */
@@ -387,6 +387,42 @@ static void check_scalar_ok_round_trip(void)
     ksd_result_clear(&sent);
     ksd_result_clear(&received);
 
+    /* A display backend already writes capture pixels into its own sealed
+     * memfd. The worker forwards that descriptor directly; copying it into a
+     * second memfd would double peak capture memory and used to reject this
+     * otherwise valid result outright. */
+    uint8_t capture[24] = { 0 };
+    ksd_encode_u16(capture, KSD_CAPTURE_FORMAT_BGRA8_PREMULTIPLIED);
+    ksd_encode_u32(capture + 4u, 1u);
+    ksd_encode_u32(capture + 8u, 1u);
+    ksd_encode_u32(capture + 12u, 4u);
+    ksd_encode_u32(capture + 16u, 4u);
+    capture[20u] = 1u;
+    capture[21u] = 2u;
+    capture[22u] = 3u;
+    capture[23u] = 0xffu;
+    int capture_fd = memfd_create("capture-worker-forward-test",
+                                  MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+    assert(capture_fd >= 0);
+    assert(write(capture_fd, capture, sizeof(capture))
+           == (ssize_t)sizeof(capture));
+    assert(fcntl(capture_fd, F_ADD_SEALS, seals) == 0);
+    ksd_result_init(&sent);
+    ksd_result_init(&received);
+    assert(ksd_result_take_fd(&sent, capture_fd, sizeof(capture)));
+    assert(ksd_capture_worker_test_round_trip(&sent, &received));
+    assert(received.status == KSD_STATUS_OK && received.tail == NULL);
+    assert(received.payload_fd >= 0 && received.tail_length == sizeof(capture));
+    uint8_t returned[sizeof(capture)];
+    assert(pread(received.payload_fd, returned, sizeof(returned), 0)
+           == (ssize_t)sizeof(returned));
+    assert(memcmp(returned, capture, sizeof(capture)) == 0);
+    assert(pread(sent.payload_fd, returned, sizeof(returned), 0)
+           == (ssize_t)sizeof(returned));
+    ksd_result_clear(&sent);
+    ksd_result_clear(&received);
+
     /* An error still round-trips its diagnostic and carries no descriptor. */
     ksd_result_init(&sent);
     ksd_result_init(&received);
@@ -406,6 +442,8 @@ static void check_scalar_ok_round_trip(void)
 
 int main(void)
 {
+    assert(!ksd_local_capture_kwin_process_trusted(getuid(), getpid()));
+
     uint8_t boundary[20] = { 0 };
     ksd_encode_u16(boundary, KSD_CAPTURE_FORMAT_PNG);
     ksd_encode_u32(boundary + 4u, 1u);

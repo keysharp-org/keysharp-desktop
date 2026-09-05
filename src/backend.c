@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 static GDBusConnection *get_session_bus(void)
@@ -89,6 +88,8 @@ done:
 
 pid_t ksd_backend_provider_pid(ksd_backend backend)
 {
+    if (backend == KSD_BACKEND_KWIN)
+        return name_owner_pid("org.kde.KWin");
     if (backend == KSD_BACKEND_GNOME)
         return name_owner_pid("org.gnome.Shell");
     if (backend == KSD_BACKEND_CINNAMON)
@@ -104,7 +105,8 @@ int ksd_session_query_main(int argc, char **argv)
     errno = 0;
     unsigned long value = strtoul(argv[1], &end, 10);
     if (errno != 0 || end == argv[1] || *end != '\0'
-        || (value != KSD_BACKEND_GNOME
+        || (value != KSD_BACKEND_KWIN
+            && value != KSD_BACKEND_GNOME
             && value != KSD_BACKEND_CINNAMON)
         || getuid() == 0u || getuid() != geteuid()
         || getgid() != getegid())
@@ -115,79 +117,6 @@ int ksd_session_query_main(int argc, char **argv)
     uint8_t encoded[8];
     ksd_encode_u64(encoded, (uint64_t)pid);
     return ksd_write_all(3, encoded, sizeof(encoded)) ? 0 : 1;
-}
-
-static bool kwin_wayland_owner(void)
-{
-    GDBusConnection *connection = get_session_bus();
-    GError *error = NULL;
-    GVariant *owner_reply = NULL;
-    GVariant *pid_reply = NULL;
-    const char *owner = NULL;
-    guint32 pid = 0u;
-    char proc_path[64];
-    char executable[PATH_MAX + 1u];
-    struct stat status;
-    bool wayland = false;
-
-    if (connection == NULL)
-        return false;
-    owner_reply = g_dbus_connection_call_sync(connection,
-        "org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus", "GetNameOwner",
-        g_variant_new("(s)", "org.kde.KWin"), G_VARIANT_TYPE("(s)"),
-        G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
-    if (owner_reply == NULL)
-        goto done;
-    g_variant_get(owner_reply, "(&s)", &owner);
-    pid_reply = g_dbus_connection_call_sync(connection,
-        "org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus", "GetConnectionUnixProcessID",
-        g_variant_new("(s)", owner), G_VARIANT_TYPE("(u)"),
-        G_DBUS_CALL_FLAGS_NONE, 2000, NULL, &error);
-    if (pid_reply == NULL)
-        goto done;
-    g_variant_get(pid_reply, "(u)", &pid);
-    int length = snprintf(proc_path, sizeof(proc_path), "/proc/%u/exe", pid);
-    ssize_t executable_length = pid != 0u && length > 0
-        && (size_t)length < sizeof(proc_path)
-        ? readlink(proc_path, executable, sizeof(executable) - 1u) : -1;
-    if (executable_length <= 0
-        || (size_t)executable_length >= sizeof(executable)
-        || stat(proc_path, &status) != 0 || !S_ISREG(status.st_mode)
-        || status.st_uid != 0u
-        || (status.st_mode & (S_IWGRP | S_IWOTH)) != 0)
-        goto done;
-    executable[executable_length] = '\0';
-    const char *basename = strrchr(executable, '/');
-    basename = basename == NULL ? executable : basename + 1u;
-    wayland = strcmp(basename, "kwin_wayland") == 0;
-
-done:
-    if (pid_reply != NULL)
-        g_variant_unref(pid_reply);
-    if (owner_reply != NULL)
-        g_variant_unref(owner_reply);
-    if (error != NULL)
-        g_error_free(error);
-    g_object_unref(connection);
-    return wayland;
-}
-
-ksd_backend ksd_backend_resolve(void)
-{
-    if (kwin_wayland_owner())
-        return KSD_BACKEND_KWIN;
-    if (name_has_owner("io.github.keysharp.GnomeShell"))
-        return KSD_BACKEND_GNOME;
-    if (name_has_owner("io.github.keysharp.CinnamonShell"))
-        return KSD_BACKEND_CINNAMON;
-    /* Last, for now. A provider that is present still answers, so an existing
-     * GNOME-on-X11 or Cinnamon-on-X11 user keeps exactly what they had; this
-     * only replaces the generic backend on an X11 session with no provider. */
-    if (ksd_session_is_x11_process(getpid()))
-        return KSD_BACKEND_X11;
-    return KSD_BACKEND_NONE;
 }
 
 typedef struct session_facts {
@@ -274,6 +203,8 @@ ksd_backend ksd_backend_resolve_process(pid_t pid)
     session_facts facts;
     if (!read_session_facts(pid, &facts))
         return KSD_BACKEND_NONE;
+    if (facts.session_type_x11 && !facts.wayland_display)
+        return KSD_BACKEND_X11;
     return facts.compositor;
 }
 
@@ -284,6 +215,31 @@ bool ksd_session_is_x11_process(pid_t pid)
      * session, so consulting it would call those sessions X11. */
     return read_session_facts(pid, &facts)
         && facts.session_type_x11 && !facts.wayland_display;
+}
+
+bool ksd_session_is_wayland_process(pid_t pid)
+{
+    session_facts facts;
+    return read_session_facts(pid, &facts) && facts.wayland_display;
+}
+
+ksd_backend ksd_backend_resolve(void)
+{
+    if (ksd_session_is_x11_process(getpid()))
+        return KSD_BACKEND_X11;
+    /* KWin makes /proc/<pid>/exe unreadable after it hardens itself. The
+     * session daemon therefore establishes only that the canonical bus name
+     * exists in a KDE Wayland session. The root authority resolves that name
+     * independently and pins the provider's executable identity. */
+    if (ksd_backend_resolve_process(getpid()) == KSD_BACKEND_KWIN
+        && ksd_session_is_wayland_process(getpid())
+        && name_has_owner("org.kde.KWin"))
+        return KSD_BACKEND_KWIN;
+    if (name_has_owner("io.github.keysharp.GnomeShell"))
+        return KSD_BACKEND_GNOME;
+    if (name_has_owner("io.github.keysharp.CinnamonShell"))
+        return KSD_BACKEND_CINNAMON;
+    return KSD_BACKEND_NONE;
 }
 
 bool ksd_backend_session_unsupported(void)
@@ -328,7 +284,19 @@ bool ksd_backend_session_unsupported(void)
 
 #define KSD_X11_OPERATIONS \
     (KSD_X11_COORDINATE_OPERATIONS | KSD_X11_CAPTURE_OPERATIONS \
-     | KSD_X11_CLIPBOARD_OPERATIONS | KSD_X11_CONTROL_OPERATIONS)
+     | KSD_X11_CLIPBOARD_OPERATIONS | KSD_X11_CONTROL_OPERATIONS \
+     | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE \
+     | KSD_OPERATION_WINDOW_QUERY \
+     | KSD_OPERATION_WINDOW_WATCH \
+     | KSD_OPERATION_WINDOW_CHILDREN \
+     | KSD_OPERATION_WINDOW_AT_POINT \
+     | KSD_OPERATION_DISPLAY_LIST \
+     | KSD_OPERATION_KEYBOARD_STATE \
+     | KSD_OPERATION_WINDOW_SET_TITLE \
+     | KSD_OPERATION_WINDOW_SET_VISIBLE \
+     | KSD_OPERATION_WINDOW_REDRAW \
+     | KSD_OPERATION_WINDOW_CLICK | KSD_OPERATION_WINDOW_BUTTON \
+     | KSD_OPERATION_WINDOW_FOCUS_CHILD)
 
 uint64_t ksd_backend_x11_route(ksd_backend backend, bool x11_session)
 {
@@ -375,13 +343,19 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * what is actually advertised and narrows this at registration, which is
  * exactly what the withhold-only registration mask exists for.
  *
- * Everything absent here is absent because no protocol provides it, not
- * because it is unwritten. A client on the outside of a Wayland compositor
- * cannot restack another client's window, set its geometry or opacity, learn
- * its pid, or ask which one has focus -- there is no request for any of it.
- * See the capability audit; those nine are impossible rather than pending. */
+ * Everything absent here is absent because none of the supported protocols
+ * provides it. A client on the outside of a Wayland compositor still cannot
+ * restack another client's window, set its geometry or opacity, or learn its
+ * pid. */
 #define KSD_GENERIC_OPERATIONS \
-    (KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES \
+    (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_DESKTOP \
+     | KSD_OPERATION_WINDOW_QUERY \
+     | KSD_OPERATION_KEYBOARD_STATE \
+     | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE \
+     | KSD_OPERATION_CURSOR_POSITION \
+     | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES \
+     | KSD_OPERATION_WINDOW_ACTIVE | KSD_OPERATION_WINDOW_FOCUS \
+     | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_SET_STATE \
      | KSD_OPERATION_CLIPBOARD_MIMETYPES \
      | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT)
 
@@ -395,12 +369,14 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * watch are absent because nothing serves them yet. */
 #define KSD_KWIN_OPERATIONS \
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW \
+     | KSD_OPERATION_KEYBOARD_STATE \
      | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
      | KSD_OPERATION_WINDOW_HANDLES \
      | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE \
      | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_MOVE_RESIZE \
      | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY \
      | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_SET_DECORATED \
+     | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR \
      | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA)
 
 uint64_t ksd_backend_operations(ksd_backend backend)
@@ -414,6 +390,7 @@ uint64_t ksd_backend_operations(ksd_backend backend)
     if (backend != KSD_BACKEND_GNOME && backend != KSD_BACKEND_CINNAMON)
         return 0u;
     uint64_t operations = KSD_OPERATION_WINDOW_LIST
+        | KSD_OPERATION_KEYBOARD_STATE
         | KSD_OPERATION_WINDOW_ACTIVE
         | KSD_OPERATION_WINDOW_WATCH | KSD_OPERATION_WINDOW_FOCUS
         | KSD_OPERATION_WINDOW_RAISE | KSD_OPERATION_WINDOW_LOWER
