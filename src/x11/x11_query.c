@@ -14,7 +14,8 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
         "_NET_MOVERESIZE_WINDOW", "_NET_WORKAREA",
         "_NET_CURRENT_DESKTOP", "_NET_WM_DESKTOP", "_NET_WM_NAME",
         "_NET_WM_PID", "WM_STATE", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
-        "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_MAXIMIZED_VERT",
+        "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_BELOW",
+        "_NET_WM_STATE_MAXIMIZED_VERT",
         "_NET_WM_STATE_MAXIMIZED_HORZ", "WM_CHANGE_STATE",
         "_NET_FRAME_EXTENTS", "_NET_WM_WINDOW_OPACITY", "_MOTIF_WM_HINTS",
         "UTF8_STRING", "_NET_CLIENT_LIST_STACKING",
@@ -36,14 +37,15 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
     fields[10] = &atoms->wm_state;
     fields[11] = &atoms->state_hidden;
     fields[12] = &atoms->state_above;
-    fields[13] = &atoms->state_max_vert;
-    fields[14] = &atoms->state_max_horz;
-    fields[15] = &atoms->change_state;
-    fields[16] = &atoms->frame_extents;
-    fields[17] = &atoms->opacity;
-    fields[18] = &atoms->motif_hints;
-    fields[19] = &atoms->utf8_string;
-    fields[20] = &atoms->client_list_stacking;
+    fields[13] = &atoms->state_below;
+    fields[14] = &atoms->state_max_vert;
+    fields[15] = &atoms->state_max_horz;
+    fields[16] = &atoms->change_state;
+    fields[17] = &atoms->frame_extents;
+    fields[18] = &atoms->opacity;
+    fields[19] = &atoms->motif_hints;
+    fields[20] = &atoms->utf8_string;
+    fields[21] = &atoms->client_list_stacking;
 
     for (size_t index = 0u; index < count; index++)
         cookies[index] = xcb_intern_atom(c, 0,

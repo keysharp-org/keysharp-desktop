@@ -18,6 +18,7 @@ typedef struct x11_atoms {
     xcb_atom_t wm_state;
     xcb_atom_t state_hidden;
     xcb_atom_t state_above;
+    xcb_atom_t state_below;
     xcb_atom_t state_max_vert;
     xcb_atom_t state_max_horz;
     xcb_atom_t change_state;

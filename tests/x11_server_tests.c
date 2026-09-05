@@ -1122,6 +1122,7 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     xcb_atom_t moveresize = intern_in(wm, "_NET_MOVERESIZE_WINDOW");
     xcb_atom_t wm_state = intern_in(wm, "_NET_WM_STATE");
     xcb_atom_t above = intern_in(wm, "_NET_WM_STATE_ABOVE");
+    xcb_atom_t below = intern_in(wm, "_NET_WM_STATE_BELOW");
     xcb_atom_t change_state = intern_in(wm, "WM_CHANGE_STATE");
     xcb_atom_t opacity = intern_in(wm, "_NET_WM_WINDOW_OPACITY");
     xcb_atom_t motif = intern_in(wm, "_MOTIF_WM_HINTS");
@@ -1197,6 +1198,17 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
      * a different state rather than a half-finished one. */
     assert(data[1] != XCB_ATOM_NONE && data[2] != XCB_ATOM_NONE);
     assert(data[1] != data[2]);
+    assert(next_client_message(wm, active, data));
+    assert(data[0] == 2u);
+
+    ksd_result_init(&result);
+    ksd_x11_window_set_state(connection, window, 0u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    assert(next_client_message(wm, wm_state, data));
+    assert(data[0] == 0u);
+    assert(next_client_message(wm, active, data));
+    assert(data[0] == 2u);
 
     /* A state outside the three this verb defines is refused rather than
      * passed to the manager as an unknown number. */
@@ -1275,12 +1287,30 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     assert(property_u32(wm, window, motif, &found) == 2u);
     assert(found);
 
-    /* Raise and lower are server operations a client may perform itself, which
-     * is what makes them work with no manager running. */
+    ksd_result_init(&result);
+    ksd_x11_window_query(connection, window, &result);
+    assert_json_has(&result, "\"decorated\":false");
+    assert_json_has(&result, "\"validFields\":[");
+    assert_json_has(&result, "\"decorated\"");
+    ksd_result_clear(&result);
+
+    /* A direct restack keeps these working without a manager, while BELOW is
+     * the request reparenting managers honor for a managed window. */
     ksd_result_init(&result);
     ksd_x11_window_raise(connection, window, true, &result);
     assert(result.status == KSD_STATUS_OK);
     ksd_result_clear(&result);
+    assert(next_client_message(wm, wm_state, data));
+    assert(data[0] == 0u);
+    assert(data[1] == below);
+
+    ksd_result_init(&result);
+    ksd_x11_window_raise(connection, window, false, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    assert(next_client_message(wm, wm_state, data));
+    assert(data[0] == 1u);
+    assert(data[1] == below);
 
     /* Kill is not a request either. The window is really gone afterwards, and
      * every later verb against it says so. */

@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define KSD_MOTIF_HINTS_FLAG_DECORATIONS 2u
+
 /* Everything one window needs, asked for in a single pass. The naive shape --
  * issue a request and immediately wait for it -- costs a round trip apiece, and
  * with eight per window that is what a window list spends nearly all its time
@@ -16,6 +18,7 @@ typedef struct window_query {
     xcb_get_geometry_cookie_t geometry;
     xcb_get_window_attributes_cookie_t attributes;
     xcb_get_property_cookie_t extents;
+    xcb_get_property_cookie_t motif;
     xcb_get_property_cookie_t fallback_name;
     xcb_translate_coordinates_cookie_t place;
     xcb_get_property_cookie_t state;
@@ -33,6 +36,8 @@ static void issue_window_query(xcb_connection_t *c, const x11_atoms *atoms,
     query->geometry = xcb_get_geometry(c, window);
     query->attributes = xcb_get_window_attributes(c, window);
     query->extents = ksd_x11_property_cookie(c, window, atoms->frame_extents, XCB_ATOM_CARDINAL, 4u);
+    query->motif = ksd_x11_property_cookie(c, window, atoms->motif_hints,
+                                           XCB_ATOM_ANY, 5u);
     query->fallback_name = ksd_x11_property_cookie(c, window, XCB_ATOM_WM_NAME, XCB_ATOM_ANY, KSD_X11_MAX_TEXT / 4u);
     /* Translating against the screen root rather than the root reported by the
      * geometry reply, so this does not have to wait for that reply first. They
@@ -215,6 +220,7 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
     xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(c, query->attributes, NULL);
     xcb_translate_coordinates_reply_t *place = xcb_translate_coordinates_reply(c, query->place, NULL);
     xcb_get_property_reply_t *extents = ksd_x11_take_property(c, query->extents);
+    xcb_get_property_reply_t *motif = ksd_x11_take_property(c, query->motif);
     xcb_get_property_reply_t *name = ksd_x11_take_property(c, query->name);
     xcb_get_property_reply_t *fallback = ksd_x11_take_property(c, query->fallback_name);
     xcb_get_property_reply_t *app = ksd_x11_take_property(c, query->app);
@@ -237,6 +243,20 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
         if (borders_known)
             memcpy(borders, xcb_get_property_value(extents), sizeof(borders));
         for (unsigned i = 0u; i < 4u; i++) if (borders[i] > 32768u) borders[i] = 0u;
+        bool decorated_known = false;
+        bool decorated = false;
+        if (motif != NULL && motif->format == 32
+            && xcb_get_property_value_length(motif) >= 12) {
+            const uint32_t *hints = xcb_get_property_value(motif);
+            if ((hints[0] & KSD_MOTIF_HINTS_FLAG_DECORATIONS) != 0u) {
+                decorated_known = true;
+                decorated = hints[2] != 0u;
+            }
+        }
+        if (!decorated_known && borders_known) {
+            decorated_known = true;
+            decorated = (borders[0] | borders[1] | borders[2] | borders[3]) != 0u;
+        }
         bool minimized = ksd_x11_state_has(state, atoms->state_hidden);
         bool maximized = ksd_x11_state_has(state, atoms->state_max_vert)
             && ksd_x11_state_has(state, atoms->state_max_horz);
@@ -274,18 +294,18 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
             x, y, g->width, g->height, window == active ? "true" : "false",
             minimized ? "true" : "false", maximized ? "true" : "false",
             attributes->map_state == XCB_MAP_STATE_VIEWABLE ? "true" : "false",
-            above ? "true" : "false", (borders[0]|borders[1]|borders[2]|borders[3]) != 0u ? "true" : "false",
+            above ? "true" : "false", decorated ? "true" : "false",
             opacity >> 24u, (!has_desktop || desktop == UINT32_MAX || desktop == current_desktop) ? "true" : "false",
             title_known ? ",\"title\"" : "", class_known ? ",\"appId\"" : "", has_pid ? ",\"pid\"" : "",
             state != NULL ? ",\"minimized\",\"maximized\",\"alwaysOnTop\"" : "",
             /* Declared only where the source property answered, because a consumer must be able to tell an
              * unfocused window from one whose focus this server could not determine. */
             active != XCB_WINDOW_NONE ? ",\"active\"" : "",
-            borders_known ? ",\"decorated\"" : "",
+            decorated_known ? ",\"decorated\"" : "",
             has_desktop ? ",\"onCurrentWorkspace\"" : "");
         ok = ok && size > 0 && (size_t)size < sizeof(scratch) && ksd_buffer_bytes(out, scratch, (size_t)size);
     }
-    free(g); free(attributes); free(place); free(extents); free(name); free(fallback); free(app);
+    free(g); free(attributes); free(place); free(extents); free(motif); free(name); free(fallback); free(app);
     return ok;
 }
 
@@ -295,6 +315,7 @@ static void discard_window_query(xcb_connection_t *c, window_query *query)
 {
     free(xcb_get_window_attributes_reply(c, query->attributes, NULL));
     free(ksd_x11_take_property(c, query->extents));
+    free(ksd_x11_take_property(c, query->motif));
     free(ksd_x11_take_property(c, query->fallback_name));
     free(xcb_get_geometry_reply(c, query->geometry, NULL));
     free(xcb_translate_coordinates_reply(c, query->place, NULL));

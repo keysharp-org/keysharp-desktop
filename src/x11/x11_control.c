@@ -119,7 +119,14 @@ void ksd_x11_window_focus(ksd_x11 *connection, uint32_t window,
 void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
                           ksd_operation_result *result)
 {
+    const x11_atoms *atoms = &connection->atoms;
     CONTROL_PROLOGUE(connection, window, result)
+    /* Reparenting managers may ignore a direct restack of the client or its
+     * frame. BELOW is the manager-owned equivalent; remove it when raising so
+     * a prior lower does not pin the window beneath later restacks. */
+    change_state(c, connection->screen, atoms, window,
+                 raise ? KSD_NET_WM_STATE_REMOVE : KSD_NET_WM_STATE_ADD,
+                 atoms->state_below, XCB_ATOM_NONE);
     /* Restacking is one of the few verbs a client may do directly, and doing
      * it directly is what makes raise and lower work with no window manager
      * running. A reparenting manager will have made the frame the child of the
@@ -243,6 +250,9 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
             change_state(c, connection->screen, atoms, window,
                          KSD_NET_WM_STATE_ADD, atoms->state_max_vert,
                          atoms->state_max_horz);
+            uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
+            send_to_root(c, connection->screen, window,
+                         atoms->active_window, data);
         } else {
             /* Restoring is both: dropping the maximized atoms, and mapping the
              * window, which is what un-minimizes it. A window that was neither
@@ -251,7 +261,9 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
                          KSD_NET_WM_STATE_REMOVE, atoms->state_max_vert,
                          atoms->state_max_horz);
             xcb_map_window(c, window);
-            xcb_flush(c);
+            uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
+            send_to_root(c, connection->screen, window,
+                         atoms->active_window, data);
         }
         applied(result);
     }
