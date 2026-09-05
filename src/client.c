@@ -4,6 +4,7 @@
 #include "protocol_io.h"
 #include "permission_domain.h"
 #include "client_status.h"
+#include "transport.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,7 +22,6 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
 #define KSD_CLIENT_PATH_CAPACITY 4096u
@@ -82,6 +82,10 @@ typedef struct ksd_client_response {
     void *mapped;
     size_t mapped_length;
 } ksd_client_response;
+
+/* Zero is a descriptor the caller owns, so a response starts at -1: response_clear closes anything
+ * non-negative, and a request failing before a memfd arrives would otherwise close the caller's stdin. */
+static const ksd_client_response empty_response = { .payload_fd = -1 };
 
 static const uint8_t client_magic[4] = {
     KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
@@ -472,19 +476,10 @@ static bool set_timeouts(int descriptor, uint32_t timeout_ms)
                       &timeout, sizeof(timeout)) == 0;
 }
 
-static uint64_t monotonic_milliseconds(void)
-{
-    struct timespec now;
-    return clock_gettime(CLOCK_MONOTONIC, &now) == 0
-        ? (uint64_t)now.tv_sec * 1000u
-            + (uint64_t)now.tv_nsec / 1000000u
-        : 0u;
-}
-
 static bool set_remaining_timeout(ksd_connection *connection,
                                   uint64_t deadline)
 {
-    uint64_t now = monotonic_milliseconds();
+    uint64_t now = ksd_monotonic_milliseconds();
     if (now == 0u || now >= deadline) {
         errno = ETIMEDOUT;
         return false;
@@ -756,7 +751,7 @@ static ksd_status request_locked(ksd_connection *connection, uint16_t opcode,
         return system_failure(connection, error,
                               "desktop service connection is closed");
     }
-    uint64_t now = monotonic_milliseconds();
+    uint64_t now = ksd_monotonic_milliseconds();
     if (now == 0u || now > UINT64_MAX - connection->timeout_ms) {
         errno = EIO;
         return system_failure(connection, error,
@@ -812,7 +807,7 @@ ksd_status ksd_connect(const ksd_connect_options *options,
                        ksd_service_info *info, ksd_error *error)
 {
     uint8_t payload[16] = { 0 };
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     if (!valid_error(error) || options == NULL || info == NULL
         || connection == NULL || *connection != NULL
         || options->struct_size < sizeof(*options)
@@ -948,7 +943,7 @@ ksd_status ksd_authorize(ksd_connection *connection,
                          ksd_error *error)
 {
     uint8_t payload[16] = { 0 };
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     if (connection == NULL || granted_scopes == NULL || !valid_error(error)
         || requested_scopes == 0u
         || (requested_scopes
@@ -985,7 +980,7 @@ ksd_status ksd_authorize(ksd_connection *connection,
 
 ksd_status ksd_ping(ksd_connection *connection, ksd_error *error)
 {
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_PING,
                                 NULL, 0u, &response, error);
     if (status == KSD_STATUS_OK
@@ -1089,7 +1084,7 @@ ksd_status ksd_permissions_list(ksd_connection *connection,
         || connection->role != KSD_ROLE_RPC)
         return invalid_argument(error, "invalid permissions list request");
     pthread_mutex_lock(&connection->mutex);
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request_locked(connection, KSD_OP_PERMISSIONS_LIST,
                                        NULL, 0u, &response, error);
     bool cancelled = false;
@@ -1161,7 +1156,7 @@ ksd_status ksd_permissions_revoke(ksd_connection *connection,
     ksd_encode_u32(payload, revoke->target_kind);
     ksd_encode_u32(payload + 4u, revoke->scopes);
     ksd_encode_u64(payload + 8u, revoke->pid);
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_PERMISSIONS_REVOKE,
                                 payload, sizeof(payload), &response, error);
     if (status == KSD_STATUS_OK
@@ -1232,7 +1227,7 @@ static ksd_status request_empty_result(ksd_connection *connection,
                                        uint32_t payload_length,
                                        ksd_error *error)
 {
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, opcode, payload, payload_length,
                                 &response, error);
     if (status == KSD_STATUS_OK
@@ -1395,7 +1390,7 @@ static ksd_status request_capture(ksd_connection *connection,
     if (!valid_rpc(connection) || !valid_capture_output(capture)
         || !valid_error(error))
         return invalid_argument(error, "invalid capture request");
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, opcode, payload, payload_length,
                                 &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1464,7 +1459,7 @@ ksd_status ksd_cursor_position(ksd_connection *connection,
     if (!valid_rpc(connection) || !valid_point_output(position)
         || !valid_error(error))
         return invalid_argument(error, "invalid cursor-position request");
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_CURSOR_POSITION,
                                 NULL, 0u, &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1493,7 +1488,7 @@ ksd_status ksd_work_area(ksd_connection *connection,
     if (!valid_rpc(connection) || !valid_rectangle_output(area)
         || !valid_error(error))
         return invalid_argument(error, "invalid work-area request");
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_WORK_AREA,
                                 NULL, 0u, &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1535,7 +1530,7 @@ static ksd_status request_string_result(ksd_connection *connection,
     if (!valid_rpc(connection) || !valid_string_output(string)
         || !valid_error(error))
         return invalid_argument(error, "invalid desktop text request");
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, opcode, payload, payload_length,
                                 &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1875,7 +1870,7 @@ ksd_status ksd_window_get_reserved(ksd_connection *connection,
         || !valid_error(error))
         return invalid_argument(error, "invalid reserved-window request");
     ksd_encode_u64(payload, cookie);
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_WINDOW_GET_RESERVED,
                                 payload, sizeof(payload), &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1899,7 +1894,7 @@ ksd_status ksd_clipboard_mimetypes(ksd_connection *connection,
     if (!valid_rpc(connection) || !valid_string_list_output(mimetypes)
         || !valid_error(error))
         return invalid_argument(error, "invalid clipboard format request");
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_CLIPBOARD_MIMETYPES,
                                 NULL, 0u, &response, error);
     if (status != KSD_STATUS_OK) {
@@ -1936,7 +1931,7 @@ ksd_status ksd_clipboard_content(ksd_connection *connection,
     uint8_t payload[4u + KSD_MAX_MIMETYPE_BYTES];
     ksd_encode_u32(payload, (uint32_t)length);
     memcpy(payload + 4u, mimetype, length);
-    ksd_client_response response = { 0 };
+    ksd_client_response response = empty_response;
     ksd_status status = request(connection, KSD_OP_CLIPBOARD_CONTENT,
         payload, 4u + (uint32_t)length, &response, error);
     if (status != KSD_STATUS_OK) {
@@ -2100,7 +2095,7 @@ static ksd_status read_event_locked(ksd_connection *connection,
     };
     uint64_t deadline = UINT64_MAX;
     if (timeout_ms != UINT32_MAX) {
-        uint64_t now = monotonic_milliseconds();
+        uint64_t now = ksd_monotonic_milliseconds();
         if (now == 0u || now > UINT64_MAX - timeout_ms)
             return system_failure(connection, error,
                                   "desktop event clock failed");
@@ -2110,7 +2105,7 @@ static ksd_status read_event_locked(ksd_connection *connection,
     for (;;) {
         int timeout = -1;
         if (deadline != UINT64_MAX) {
-            uint64_t now = monotonic_milliseconds();
+            uint64_t now = ksd_monotonic_milliseconds();
             if (now == 0u || now >= deadline) {
                 reset_error(error);
                 return KSD_STATUS_TIMEOUT;
@@ -2137,7 +2132,7 @@ static ksd_status read_event_locked(ksd_connection *connection,
     }
     uint32_t frame_timeout = UINT32_MAX;
     if (deadline != UINT64_MAX) {
-        uint64_t now = monotonic_milliseconds();
+        uint64_t now = ksd_monotonic_milliseconds();
         if (now == 0u || now >= deadline) {
             reset_error(error);
             return KSD_STATUS_TIMEOUT;

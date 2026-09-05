@@ -4,14 +4,11 @@
 #include "protocol.h"
 
 #include <errno.h>
-#include <limits.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <time.h>
 
 _Static_assert(KSD_MAX_REQUEST_TOTAL_PAYLOAD > KSD_MAX_REQUEST_PAYLOAD,
                "a chunked request total must exceed one chunk");
@@ -75,15 +72,6 @@ static bool valid_public_header(const ksd_frame *frame)
         || (frame->opcode == KSD_OP_PING && frame->flags == 0u);
 }
 
-static uint64_t monotonic_milliseconds(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0u;
-    return (uint64_t)now.tv_sec * 1000u
-        + (uint64_t)now.tv_nsec / 1000000u;
-}
-
 static uint64_t socket_deadline(int descriptor, int option)
 {
     struct timeval timeout = { 0 };
@@ -94,76 +82,8 @@ static uint64_t socket_deadline(int descriptor, int option)
         return UINT64_MAX;
     uint64_t duration = (uint64_t)timeout.tv_sec * 1000u
         + ((uint64_t)timeout.tv_usec + 999u) / 1000u;
-    uint64_t now = monotonic_milliseconds();
+    uint64_t now = ksd_monotonic_milliseconds();
     return now > UINT64_MAX - duration ? UINT64_MAX : now + duration;
-}
-
-static bool wait_until(int descriptor, short events, uint64_t deadline)
-{
-    for (;;) {
-        int timeout = -1;
-        if (deadline != UINT64_MAX) {
-            uint64_t now = monotonic_milliseconds();
-            if (now == 0u || now >= deadline) {
-                errno = ETIMEDOUT;
-                return false;
-            }
-            uint64_t remaining = deadline - now;
-            timeout = remaining > (uint64_t)INT_MAX
-                ? INT_MAX : (int)remaining;
-        }
-        struct pollfd item = { .fd = descriptor, .events = events };
-        int ready = poll(&item, 1u, timeout);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready == 0) {
-            errno = ETIMEDOUT;
-            return false;
-        }
-        if (ready < 0 || (item.revents & (POLLERR | POLLNVAL)) != 0)
-            return false;
-        return (item.revents & (events | POLLHUP | POLLRDHUP)) != 0;
-    }
-}
-
-static ssize_t read_until(int descriptor, void *data, size_t length,
-                          uint64_t deadline)
-{
-    uint8_t *cursor = data;
-    size_t offset = 0u;
-    while (offset < length) {
-        if (!wait_until(descriptor, POLLIN, deadline))
-            return -1;
-        ssize_t count = recv(descriptor, cursor + offset, length - offset,
-                             MSG_DONTWAIT);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN
-                          || errno == EWOULDBLOCK))
-            continue;
-        if (count <= 0)
-            return offset == 0u ? count : -1;
-        offset += (size_t)count;
-    }
-    return (ssize_t)offset;
-}
-
-static bool write_until(int descriptor, const void *data, size_t length,
-                        uint64_t deadline)
-{
-    const uint8_t *cursor = data;
-    size_t offset = 0u;
-    while (offset < length) {
-        if (!wait_until(descriptor, POLLOUT, deadline))
-            return false;
-        ssize_t count = send(descriptor, cursor + offset, length - offset,
-                             MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN
-                          || errno == EWOULDBLOCK))
-            continue;
-        if (count <= 0)
-            return false;
-        offset += (size_t)count;
-    }
-    return true;
 }
 
 static void close_received_fd(int *received_fd)
@@ -244,8 +164,9 @@ int ksd_frame_read_fd(int descriptor, const uint8_t magic[4],
         close_received_fd(received_fd);
         return -1;
     }
-    if (read_until(descriptor, frame->payload, frame->payload_length,
-                   deadline) != (ssize_t)frame->payload_length) {
+    if (ksd_transfer_until(descriptor, frame->payload, frame->payload_length,
+                           false, deadline)
+        != (ssize_t)frame->payload_length) {
         close_received_fd(received_fd);
         ksd_frame_clear(frame);
         return -1;
@@ -265,8 +186,9 @@ bool ksd_frame_write_fd(int descriptor, const ksd_frame *frame, int passed_fd)
         return false;
     uint64_t deadline = socket_deadline(descriptor, SO_SNDTIMEO);
     return frame->payload_length == 0u
-        || write_until(descriptor, frame->payload, frame->payload_length,
-                       deadline);
+        || ksd_transfer_until(descriptor, frame->payload,
+                              frame->payload_length, true, deadline)
+            == (ssize_t)frame->payload_length;
 }
 
 int ksd_frame_read(int descriptor, const uint8_t magic[4],
@@ -281,8 +203,9 @@ int ksd_frame_read(int descriptor, const uint8_t magic[4],
     }
     memset(frame, 0, sizeof(*frame));
     uint64_t deadline = socket_deadline(descriptor, SO_RCVTIMEO);
-    ssize_t header_count = read_until(descriptor, header, sizeof(header),
-                                      deadline);
+    ssize_t header_count = ksd_transfer_until(descriptor, header,
+                                               sizeof(header), false,
+                                               deadline);
     if (header_count <= 0)
         return (int)header_count;
 
@@ -307,8 +230,9 @@ int ksd_frame_read(int descriptor, const uint8_t magic[4],
     frame->payload = malloc(frame->payload_length);
     if (frame->payload == NULL)
         return -1;
-    if (read_until(descriptor, frame->payload, frame->payload_length,
-                   deadline) != (ssize_t)frame->payload_length) {
+    if (ksd_transfer_until(descriptor, frame->payload, frame->payload_length,
+                           false, deadline)
+        != (ssize_t)frame->payload_length) {
         ksd_frame_clear(frame);
         return -1;
     }
@@ -324,10 +248,12 @@ bool ksd_frame_write(int descriptor, const ksd_frame *frame)
         return false;
     encode_frame_header(frame, header);
     uint64_t deadline = socket_deadline(descriptor, SO_SNDTIMEO);
-    return write_until(descriptor, header, sizeof(header), deadline)
+    return ksd_transfer_until(descriptor, header, sizeof(header), true,
+                              deadline) == (ssize_t)sizeof(header)
         && (frame->payload_length == 0u
-            || write_until(descriptor, frame->payload,
-                           frame->payload_length, deadline));
+            || ksd_transfer_until(descriptor, frame->payload,
+                                  frame->payload_length, true, deadline)
+                == (ssize_t)frame->payload_length);
 }
 
 bool ksd_frame_pack(const ksd_frame *frame, ksd_buffer *buffer)
@@ -523,6 +449,57 @@ bool ksd_buffer_u64(ksd_buffer *buffer, uint64_t value)
     uint8_t encoded[8];
     ksd_encode_u64(encoded, value);
     return ksd_buffer_bytes(buffer, encoded, sizeof(encoded));
+}
+
+bool ksd_buffer_json_string(ksd_buffer *buffer, const char *value,
+                            size_t length, bool latin1)
+{
+    static const char hexadecimal[] = "0123456789abcdef";
+
+    if ((length != 0u && value == NULL)
+        || !ksd_buffer_bytes(buffer, "\"", 1u))
+        return false;
+    for (size_t index = 0u; index < length; index++) {
+        unsigned char byte = (unsigned char)value[index];
+        char escaped[6];
+        size_t count = 1u;
+
+        if (byte == '"' || byte == '\\') {
+            escaped[0] = '\\';
+            escaped[1] = (char)byte;
+            count = 2u;
+        } else if (byte < 0x20u || byte == 0x7fu
+                   || (latin1 && byte >= 0x80u)) {
+            escaped[0] = '\\';
+            escaped[1] = 'u';
+            escaped[2] = '0';
+            escaped[3] = '0';
+            escaped[4] = hexadecimal[byte >> 4u];
+            escaped[5] = hexadecimal[byte & 0x0fu];
+            count = sizeof(escaped);
+        } else {
+            escaped[0] = (char)byte;
+        }
+        if (!ksd_buffer_bytes(buffer, escaped, count))
+            return false;
+    }
+    return ksd_buffer_bytes(buffer, "\"", 1u);
+}
+
+bool ksd_buffer_frame_text(ksd_buffer *buffer, size_t maximum_payload)
+{
+    if (buffer == NULL || buffer->length > maximum_payload
+        || buffer->length > UINT32_MAX
+        || maximum_payload > SIZE_MAX - 4u)
+        return false;
+    size_t length = buffer->length;
+    buffer->maximum = maximum_payload + 4u;
+    if (!buffer_reserve(buffer, 4u))
+        return false;
+    memmove(buffer->data + 4u, buffer->data, length);
+    ksd_encode_u32(buffer->data, (uint32_t)length);
+    buffer->length = length + 4u;
+    return true;
 }
 
 void ksd_request_assembly_init(ksd_request_assembly *assembly)

@@ -36,7 +36,6 @@ static bool display_name_valid(const char *name)
     return strchr(name, '/') == NULL && strcmp(name, ".") != 0
         && strcmp(name, "..") != 0;
 }
-
 bool ksd_wayland_request_valid(const ksd_frame *request)
 {
     ksd_cursor cursor;
@@ -286,25 +285,4 @@ bool ksd_wayland_execute_on(struct ksd_wayland *connection,
             break;
     }
     return !ksd_wayland_connection_failed(connection);
-}
-
-void ksd_wayland_execute(const ksd_frame *request, pid_t session_pid,
-                         ksd_operation_result *result)
-{
-    ksd_wayland *connection = NULL;
-    ksd_status status;
-
-    if (!ksd_wayland_request_valid(request)) {
-        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
-                         "invalid Wayland request");
-        return;
-    }
-    status = ksd_wayland_open_for_session(session_pid, &connection);
-    if (status != KSD_STATUS_OK) {
-        ksd_result_error(result, status, 0u,
-                         "could not reach the compositor for this session");
-        return;
-    }
-    (void)ksd_wayland_execute_on(connection, request, result);
-    ksd_wayland_close(connection);
 }

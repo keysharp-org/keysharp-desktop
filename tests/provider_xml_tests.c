@@ -160,11 +160,11 @@ int main(int argc, char **argv)
                          "interfaces/private/io.github.keysharp.KWinProvider1.xml",
                          root, "Poll", 4u);
     check_interface("gnome", "providers/gnome/extension.js",
-                    "DBUS_IFACE_XML", root, "CaptureWindow");
+                    "DBUS_IFACE_XML", root, "QueryWindow");
     check_interface("gnome", "providers/gnome/extension.js",
                     "PUBLIC_IFACE_XML", root, NULL);
     check_interface("cinnamon", "providers/cinnamon/extension.js",
-                    "DBUS_IFACE_XML", root, "CaptureWindow");
+                    "DBUS_IFACE_XML", root, "QueryWindow");
     check_interface("cinnamon", "providers/cinnamon/extension.js",
                     "PUBLIC_IFACE_XML", root, NULL);
     return 0;

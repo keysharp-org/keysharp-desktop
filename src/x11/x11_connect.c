@@ -79,6 +79,7 @@ ksd_status ksd_x11_open(const char *display, const char *authority,
         return KSD_STATUS_NOT_FOUND;
     }
     opened->screen = screens.data;
+    ksd_x11_load_atoms(opened->connection, &opened->atoms);
     *connection = opened;
     return KSD_STATUS_OK;
 }

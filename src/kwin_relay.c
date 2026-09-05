@@ -18,6 +18,11 @@
  * uses: a thread blocks on the request it sent, so it cannot have two. */
 #define KSD_KWIN_RELAY_PENDING 128u
 
+static const uint8_t relay_magic[4] = {
+    KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+    KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+};
+
 typedef struct relay_pending {
     bool active;
     bool done;
@@ -45,15 +50,6 @@ struct ksd_kwin_relay {
     uint64_t next_request_id;
     relay_pending pending[KSD_KWIN_RELAY_PENDING];
 };
-
-static uint64_t relay_monotonic_ms(void)
-{
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0u;
-    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
-}
 
 ksd_kwin_relay *ksd_kwin_relay_create(int descriptor)
 {
@@ -133,52 +129,6 @@ void ksd_kwin_relay_retire(ksd_kwin_relay *relay)
     ksd_kwin_relay_release(relay);
 }
 
-/* Waits for the socket to become readable, or gives up at the deadline.
- * Without this the reader blocks in a read that has no timeout, and a daemon
- * that stops answering parks that thread for ever -- it never returns to check
- * its own deadline, and every other caller waits on it. */
-static int wait_readable(int descriptor, uint64_t deadline_ms)
-{
-    for (;;) {
-        struct pollfd item = { .fd = descriptor, .events = POLLIN };
-        uint64_t now = relay_monotonic_ms();
-        int ready;
-
-        if (now == 0u || now >= deadline_ms)
-            return 0;
-        ready = poll(&item, 1u, (int)(deadline_ms - now));
-        if (ready < 0 && errno == EINTR)
-            continue;
-        return ready;
-    }
-}
-
-/* Reads exactly length bytes, or gives up at the deadline. ksd_read_all has no
- * deadline of its own, so a peer that writes half a header and then stalls
- * parks this thread for ever -- and it is the reader, so every other caller
- * waits on it too. Waiting for readable before each read is what bounds that:
- * a peer that stops mid-record loses the channel rather than owning it. */
-static bool read_all_until(int descriptor, void *data, size_t length,
-                           uint64_t deadline_ms)
-{
-    uint8_t *bytes = data;
-    size_t offset = 0u;
-
-    while (offset < length) {
-        ssize_t count;
-
-        if (wait_readable(descriptor, deadline_ms) <= 0)
-            return false;
-        count = read(descriptor, bytes + offset, length - offset);
-        if (count < 0 && errno == EINTR)
-            continue;
-        if (count <= 0)
-            return false;
-        offset += (size_t)count;
-    }
-    return true;
-}
-
 /* Reads one response frame and hands it to whoever was waiting for it. Called
  * with the lock NOT held, by whichever caller took the reader role. Returns
  * false only on a broken channel; a deadline that passes with nothing to read
@@ -190,12 +140,8 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
     ksd_frame frame;
     bool matched = false;
     int payload_fd = -1;
-    int ready = wait_readable(relay->descriptor, deadline_ms);
-
-    if (ready == 0)
-        return true;
-    if (ready < 0)
-        return false;
+    if (!ksd_wait_until(relay->descriptor, POLLIN, deadline_ms))
+        return errno == ETIMEDOUT;
     if (ksd_receive_fd_until(relay->descriptor, header, sizeof(header),
                               deadline_ms, &payload_fd) != 0)
         return false;
@@ -205,7 +151,7 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
      * shorter than that is not an answer this daemon wrote. */
     uint16_t flags = ksd_decode_u16(header + KSD_FRAME_FLAGS_OFFSET);
     bool file_response = flags == KSD_RELAY_CAPTURE_FD;
-    if (memcmp(header, "KSDP", 4u) != 0
+    if (memcmp(header, relay_magic, sizeof(relay_magic)) != 0
         || ksd_decode_u16(header + KSD_FRAME_MAJOR_OFFSET) != KSD_PROTOCOL_MAJOR
         || ksd_decode_u16(header + KSD_FRAME_MINOR_OFFSET) != KSD_PROTOCOL_MINOR
         || (flags != 0u && !file_response)
@@ -215,8 +161,10 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
         goto malformed;
     if (payload_length != 0u) {
         body = malloc(payload_length);
-        if (body == NULL || !read_all_until(relay->descriptor, body,
-                                            payload_length, deadline_ms)) {
+        if (body == NULL
+            || ksd_transfer_until(relay->descriptor, body, payload_length,
+                                  false, deadline_ms)
+                != (ssize_t)payload_length) {
             goto malformed;
         }
     }
@@ -365,7 +313,7 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
         pthread_cond_broadcast(&relay->changed);
     }
     while (sent && !slot->done && !relay->broken) {
-        uint64_t now = relay_monotonic_ms();
+        uint64_t now = ksd_monotonic_milliseconds();
         struct timespec until;
 
         if (now == 0u || now >= deadline_ms)

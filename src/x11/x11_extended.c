@@ -14,27 +14,11 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-x11.h>
 
-static bool text(ksd_buffer *out, const char *value, size_t length)
-{
-    if (!ksd_buffer_bytes(out, "\"", 1u)) return false;
-    for (size_t i = 0u; i < length; i++) {
-        unsigned char byte = (unsigned char)value[i];
-        char escaped[7];
-        size_t count = 1u;
-        if (byte == '"' || byte == '\\') {
-            escaped[0] = '\\'; escaped[1] = (char)byte; count = 2u;
-        } else if (byte < 32u) {
-            (void)snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
-            count = 6u;
-        } else escaped[0] = (char)byte;
-        if (!ksd_buffer_bytes(out, escaped, count)) return false;
-    }
-    return ksd_buffer_bytes(out, "\"", 1u);
-}
-
 static void finish(ksd_buffer *out, bool ok, ksd_operation_result *result)
 {
-    if (ok) ksd_x11_json_result(out, result);
+    if (ok)
+        (void)ksd_result_take_framed_text(out, result, KSD_STATUS_INTERNAL,
+                                          "out of memory");
     else {
         ksd_buffer_clear(out);
         ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
@@ -368,8 +352,11 @@ void ksd_x11_display_list(ksd_x11 *connection, ksd_operation_result *result)
             output_mode(resources, crtc, &refresh, &rotation);
             if (count++ != 0u) ok = ksd_buffer_bytes(&out, ",", 1u);
             ok = ok && ksd_buffer_bytes(&out, "{\"name\":", 8u)
-                && text(&out, name != NULL ? xcb_get_atom_name_name(name) : "",
-                    name != NULL ? (size_t)xcb_get_atom_name_name_length(name) : 0u);
+                && ksd_buffer_json_string(&out,
+                    name != NULL ? xcb_get_atom_name_name(name) : "",
+                    name != NULL
+                        ? (size_t)xcb_get_atom_name_name_length(name) : 0u,
+                    false);
             char data[512];
             int size = snprintf(data, sizeof(data),
                 ",\"output\":%u,\"x\":%d,\"y\":%d,\"width\":%u,\"height\":%u,"
@@ -398,8 +385,10 @@ void ksd_x11_display_list(ksd_x11 *connection, ksd_operation_result *result)
                 output_mode(resources, crtc, &refresh, &rotation);
                 if (count++ != 0u) ok = ksd_buffer_bytes(&out, ",", 1u);
                 ok = ok && ksd_buffer_bytes(&out, "{\"name\":", 8u)
-                    && text(&out, (const char *)xcb_randr_get_output_info_name(oi),
-                        (size_t)xcb_randr_get_output_info_name_length(oi));
+                    && ksd_buffer_json_string(&out,
+                        (const char *)xcb_randr_get_output_info_name(oi),
+                        (size_t)xcb_randr_get_output_info_name_length(oi),
+                        false);
                 char data[384];
                 int size = snprintf(data, sizeof(data),
                     ",\"output\":%u,\"x\":%d,\"y\":%d,\"width\":%u,\"height\":%u,"
@@ -520,11 +509,6 @@ static uint32_t modifier_mask(struct xkb_keymap *keymap, const xcb_query_keymap_
     return result;
 }
 
-void ksd_x11_keyboard_state(ksd_x11 *connection, ksd_operation_result *result)
-{
-    ksd_x11_keyboard_state_since(connection, NULL, 0u, result);
-}
-
 void ksd_x11_keyboard_state_since(ksd_x11 *connection, const uint8_t *revision,
                                    uint32_t revision_length, ksd_operation_result *result)
 {
@@ -558,12 +542,15 @@ void ksd_x11_keyboard_state_since(ksd_x11 *connection, const uint8_t *revision,
         ok = size > 0 && (size_t)size < sizeof(data)
             && ksd_buffer_bytes(&out, data, (size_t)size);
         if (revision_length != 32u || revision == NULL || memcmp(revision, cache->revision, 32u) != 0)
-            ok = ok && ksd_buffer_bytes(&out, ",\"keymap\":", 10u) && text(&out, cache->text, strlen(cache->text));
+            ok = ok && ksd_buffer_bytes(&out, ",\"keymap\":", 10u)
+                && ksd_buffer_json_string(&out, cache->text,
+                                          strlen(cache->text), false);
         ok = ok && ksd_buffer_bytes(&out, ",\"layouts\":[", 12u);
         for (xkb_layout_index_t i = 0u; ok && i < xkb_keymap_num_layouts(cache->keymap); i++) {
             const char *name = xkb_keymap_layout_get_name(cache->keymap, i);
             if (i != 0u) ok = ksd_buffer_bytes(&out, ",", 1u);
-            ok = ok && text(&out, name != NULL ? name : "", name != NULL ? strlen(name) : 0u);
+            ok = ok && ksd_buffer_json_string(&out, name != NULL ? name : "",
+                name != NULL ? strlen(name) : 0u, false);
         }
         ok = ok && ksd_buffer_bytes(&out, "],\"pointerMapping\":[", 20u);
         const uint8_t *buttons = xcb_get_pointer_mapping_map(mapping);
@@ -578,5 +565,8 @@ void ksd_x11_keyboard_state_since(ksd_x11 *connection, const uint8_t *revision,
     if (!ok) {
         ksd_buffer_clear(&out);
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "XKB keyboard state is unavailable");
-    } else ksd_x11_json_result(&out, result);
+    } else {
+        (void)ksd_result_take_framed_text(&out, result, KSD_STATUS_INTERNAL,
+                                          "out of memory");
+    }
 }

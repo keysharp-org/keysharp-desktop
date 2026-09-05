@@ -251,7 +251,7 @@ bool ksd_x11_watch_run(ksd_x11 *connection, int stream_fd, uint64_t request_id)
     /* This runs only in a dedicated worker process. A stalled X server must
      * not retain that process after its authority connection disappears. */
     alarm(10u);
-    ksd_x11_load_atoms(c, &watch.atoms);
+    watch.atoms = connection->atoms;
     watch.atoms.client_list = intern(c, "_NET_CLIENT_LIST");
     watch.atoms.active_window = intern(c, "_NET_ACTIVE_WINDOW");
     watch.atoms.wm_name = intern(c, "_NET_WM_NAME");

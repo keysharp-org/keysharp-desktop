@@ -14,6 +14,72 @@
 
 #define KSD_PATH_CAPACITY 4096u
 
+uint64_t ksd_monotonic_milliseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0u;
+    return (uint64_t)now.tv_sec * 1000u
+        + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+bool ksd_wait_until(int descriptor, short events, uint64_t deadline_ms)
+{
+    for (;;) {
+        int timeout = -1;
+
+        if (deadline_ms != UINT64_MAX) {
+            uint64_t now = ksd_monotonic_milliseconds();
+            if (now == 0u || now >= deadline_ms) {
+                errno = ETIMEDOUT;
+                return false;
+            }
+            uint64_t remaining = deadline_ms - now;
+            timeout = remaining > (uint64_t)INT_MAX
+                ? INT_MAX : (int)remaining;
+        }
+        struct pollfd item = { .fd = descriptor, .events = events };
+        int ready = poll(&item, 1u, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready == 0)
+            errno = ETIMEDOUT;
+        if (ready <= 0 || (item.revents & (POLLERR | POLLNVAL)) != 0)
+            return false;
+        return (item.revents & (events | POLLHUP | POLLRDHUP)) != 0;
+    }
+}
+
+ssize_t ksd_transfer_until(int descriptor, void *data, size_t length,
+                           bool write_data, uint64_t deadline_ms)
+{
+    uint8_t *bytes = data;
+    size_t offset = 0u;
+
+    if (descriptor < 0 || (length != 0u && data == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (offset < length) {
+        if (!ksd_wait_until(descriptor, write_data ? POLLOUT : POLLIN,
+                            deadline_ms))
+            return -1;
+        ssize_t count = write_data
+            ? send(descriptor, bytes + offset, length - offset,
+                   MSG_DONTWAIT | MSG_NOSIGNAL)
+            : recv(descriptor, bytes + offset, length - offset,
+                   MSG_DONTWAIT);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN
+                          || errno == EWOULDBLOCK))
+            continue;
+        if (count <= 0)
+            return !write_data && offset == 0u ? count : -1;
+        offset += (size_t)count;
+    }
+    return (ssize_t)offset;
+}
+
 bool ksd_write_all(int descriptor, const void *data, size_t length)
 {
     const uint8_t *cursor = data;
@@ -138,15 +204,6 @@ int ksd_receive_optional_fd(int descriptor, void *data, size_t length,
     return 0;
 }
 
-static uint64_t transport_monotonic_ms(void)
-{
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0u;
-    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
-}
-
 int ksd_receive_fd_until(int descriptor, void *data, size_t length,
                          uint64_t deadline_ms, int *received_fd)
 {
@@ -161,22 +218,7 @@ int ksd_receive_fd_until(int descriptor, void *data, size_t length,
     }
     *received_fd = -1;
     while (offset < length) {
-        struct pollfd item = { .fd = descriptor, .events = POLLIN };
-        uint64_t now = transport_monotonic_ms();
-        if (now == 0u || now >= deadline_ms) {
-            errno = ETIMEDOUT;
-            goto failed;
-        }
-        uint64_t remaining = deadline_ms - now;
-        int ready = poll(&item, 1u,
-            remaining > INT_MAX ? INT_MAX : (int)remaining);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready == 0) {
-            errno = ETIMEDOUT;
-            goto failed;
-        }
-        if (ready < 0)
+        if (!ksd_wait_until(descriptor, POLLIN, deadline_ms))
             goto failed;
         uint8_t control[CMSG_SPACE(sizeof(int) * 2u)] = { 0 };
         struct iovec iov = { .iov_base = bytes + offset,

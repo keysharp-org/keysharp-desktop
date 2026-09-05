@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+uint64_t ksd_monotonic_milliseconds(void);
+bool ksd_wait_until(int descriptor, short events, uint64_t deadline_ms);
+ssize_t ksd_transfer_until(int descriptor, void *data, size_t length,
+                           bool write_data, uint64_t deadline_ms);
 bool ksd_write_all(int descriptor, const void *data, size_t length);
 bool ksd_read_all(int descriptor, void *data, size_t length);
 bool ksd_send_with_fd(int descriptor, const void *data, size_t length,

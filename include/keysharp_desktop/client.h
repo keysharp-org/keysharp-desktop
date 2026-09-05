@@ -22,14 +22,7 @@ extern "C" {
 #endif
 
 #define KSD_CLIENT_ABI_MAJOR 0u
-/* Minor 2 tolerates a newer service: an unrecognized backend value and
- * unrecognized operation and scope bits no longer fail the connection. Minor 3
- * names KSD_BACKEND_GENERIC, the session whose compositor this service has no
- * backend for. Minor 4 names the brokered clipboard write, minor 5 the
- * ungated window-handle list, minor 6 the KWin skip-taskbar control, and minor
- * 7 the whole-desktop capture used by screenshot portals. See
- * docs/integrating.md for exactly which masks are narrowed and which are
- * delivered verbatim. */
+/* Unknown backend, operation and scope values are delivered verbatim. */
 #define KSD_CLIENT_ABI_MINOR 8u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"

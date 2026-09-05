@@ -27,61 +27,6 @@
 #define KSD_MOTIF_HINTS_WORDS 5u
 #define KSD_MOTIF_HINTS_FLAG_DECORATIONS 2u
 
-typedef struct control_atoms {
-    xcb_atom_t active_window;
-    xcb_atom_t close_window;
-    xcb_atom_t moveresize_window;
-    xcb_atom_t wm_state;
-    xcb_atom_t state_above;
-    xcb_atom_t state_max_vert;
-    xcb_atom_t state_max_horz;
-    xcb_atom_t change_state;
-    xcb_atom_t opacity;
-    xcb_atom_t motif_hints;
-} control_atoms;
-
-static xcb_atom_t intern(xcb_connection_t *connection, const char *name)
-{
-    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(connection,
-        xcb_intern_atom(connection, 0, (uint16_t)strlen(name), name), NULL);
-    xcb_atom_t atom = XCB_ATOM_NONE;
-
-    if (reply != NULL) {
-        atom = reply->atom;
-        free(reply);
-    }
-    return atom;
-}
-
-/* Interned in one round trip rather than ten. Every request goes out before
- * any reply is collected, which is the whole reason this backend uses xcb. */
-static bool load_atoms(xcb_connection_t *c, control_atoms *atoms)
-{
-    static const char *const names[] = {
-        "_NET_ACTIVE_WINDOW", "_NET_CLOSE_WINDOW", "_NET_MOVERESIZE_WINDOW",
-        "_NET_WM_STATE", "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_MAXIMIZED_VERT",
-        "_NET_WM_STATE_MAXIMIZED_HORZ", "WM_CHANGE_STATE",
-        "_NET_WM_WINDOW_OPACITY", "_MOTIF_WM_HINTS",
-    };
-    xcb_intern_atom_cookie_t cookies[10];
-    xcb_atom_t *fields = &atoms->active_window;
-
-    for (size_t index = 0u; index < 10u; index++)
-        cookies[index] = xcb_intern_atom(c, 0,
-            (uint16_t)strlen(names[index]), names[index]);
-    for (size_t index = 0u; index < 10u; index++) {
-        xcb_intern_atom_reply_t *reply =
-            xcb_intern_atom_reply(c, cookies[index], NULL);
-
-        if (reply == NULL)
-            return false;
-        fields[index] = reply->atom;
-        free(reply);
-    }
-    (void)intern;
-    return true;
-}
-
 /* Whether the window still exists. Every verb checks first, so a window that
  * went away is NOT_FOUND rather than a request sent into nothing and reported
  * as success. The check is a race by nature -- the window can close between
@@ -140,7 +85,7 @@ static void send_to_root(xcb_connection_t *c, const xcb_screen_t *screen,
  * is two atoms -- vertical and horizontal -- and a window maximized in only
  * one direction is a different state, not a half-done one. */
 static void change_state(xcb_connection_t *c, const xcb_screen_t *screen,
-                         const control_atoms *atoms, xcb_window_t window,
+                         const x11_atoms *atoms, xcb_window_t window,
                          uint32_t action, xcb_atom_t first, xcb_atom_t second)
 {
     uint32_t data[5] = {
@@ -150,14 +95,8 @@ static void change_state(xcb_connection_t *c, const xcb_screen_t *screen,
     send_to_root(c, screen, window, atoms->wm_state, data);
 }
 
-#define CONTROL_PROLOGUE(connection, window, atoms, result)                   \
+#define CONTROL_PROLOGUE(connection, window, result)                          \
     xcb_connection_t *c = (connection)->connection;                           \
-    if (!load_atoms(c, &(atoms))) {                                           \
-        ksd_result_error((result), KSD_STATUS_INTERNAL, 0u,                   \
-                         "could not name the window protocol on this "        \
-                         "display");                                          \
-        return;                                                               \
-    }                                                                         \
     if (!window_exists(c, (window))) {                                        \
         missing(result);                                                      \
         return;                                                               \
@@ -166,22 +105,21 @@ static void change_state(xcb_connection_t *c, const xcb_screen_t *screen,
 void ksd_x11_window_focus(ksd_x11 *connection, uint32_t window,
                           ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    const x11_atoms *atoms = &connection->atoms;
+    CONTROL_PROLOGUE(connection, window, result)
     /* Timestamp zero rather than a made-up one. A window manager compares it
      * against the last user interaction to decide whether to focus or merely
      * flag the window, and inventing a current time would defeat that
      * deliberately -- this service has no user interaction to report. */
     uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
-    send_to_root(c, connection->screen, window, atoms.active_window, data);
+    send_to_root(c, connection->screen, window, atoms->active_window, data);
     applied(result);
 }
 
 void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
                           ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    CONTROL_PROLOGUE(connection, window, result)
     /* Restacking is one of the few verbs a client may do directly, and doing
      * it directly is what makes raise and lower work with no window manager
      * running. A reparenting manager will have made the frame the child of the
@@ -207,21 +145,20 @@ void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
 void ksd_x11_window_close(ksd_x11 *connection, uint32_t window,
                           ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    const x11_atoms *atoms = &connection->atoms;
+    CONTROL_PROLOGUE(connection, window, result)
     /* A close REQUEST. The application is entitled to refuse it, or to put up
      * a dialog, and this service reports that the ask was delivered rather
      * than that the window went away. */
     uint32_t data[5] = { 0u, KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u };
-    send_to_root(c, connection->screen, window, atoms.close_window, data);
+    send_to_root(c, connection->screen, window, atoms->close_window, data);
     applied(result);
 }
 
 void ksd_x11_window_kill(ksd_x11 *connection, uint32_t window,
                          ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    CONTROL_PROLOGUE(connection, window, result)
     /* Not a request. This severs the client's connection to the server, and
      * every other window that client owns dies with it. That is what killing
      * means here, and it is why it is a separate verb from close rather than
@@ -236,11 +173,11 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
                                 uint32_t height,
                                 ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    const x11_atoms *atoms = &connection->atoms;
+    CONTROL_PROLOGUE(connection, window, result)
     uint32_t extents[4] = { 0u };
     xcb_get_property_reply_t *frame = ksd_x11_property(c, window,
-        intern(c, "_NET_FRAME_EXTENTS"), XCB_ATOM_CARDINAL, 4u);
+        atoms->frame_extents, XCB_ATOM_CARDINAL, 4u);
     if (frame != NULL && frame->format == 32
         && xcb_get_property_value_length(frame) >= (int)sizeof(extents))
         memcpy(extents, xcb_get_property_value(frame), sizeof(extents));
@@ -268,7 +205,7 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
         flags, (uint32_t)x, (uint32_t)y, width, height,
     };
 
-    send_to_root(c, connection->screen, window, atoms.moveresize_window, data);
+    send_to_root(c, connection->screen, window, atoms->moveresize_window, data);
     /* Also configured directly, so the verb does something on a bare display
      * where no window manager will act on the message above. A managed window
      * has its configure request redirected to the manager, which is exactly
@@ -285,7 +222,7 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
 void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
                               uint32_t state, ksd_operation_result *result)
 {
-    control_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
 
     if (state > 2u) {
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
@@ -293,26 +230,26 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
         return;
     }
     {
-        CONTROL_PROLOGUE(connection, window, atoms, result)
+        CONTROL_PROLOGUE(connection, window, result)
         if (state == 1u) {
             /* Minimize is ICCCM, not EWMH: WM_CHANGE_STATE to IconicState.
              * There is no _NET_WM_STATE atom for it -- _NET_WM_STATE_HIDDEN
              * describes a window that IS minimized and is set by the manager,
              * not a request to minimize one. */
             uint32_t data[5] = { KSD_ICCCM_ICONIC_STATE, 0u, 0u, 0u, 0u };
-            send_to_root(c, connection->screen, window, atoms.change_state,
+            send_to_root(c, connection->screen, window, atoms->change_state,
                          data);
         } else if (state == 2u) {
-            change_state(c, connection->screen, &atoms, window,
-                         KSD_NET_WM_STATE_ADD, atoms.state_max_vert,
-                         atoms.state_max_horz);
+            change_state(c, connection->screen, atoms, window,
+                         KSD_NET_WM_STATE_ADD, atoms->state_max_vert,
+                         atoms->state_max_horz);
         } else {
             /* Restoring is both: dropping the maximized atoms, and mapping the
              * window, which is what un-minimizes it. A window that was neither
              * is unharmed by either. */
-            change_state(c, connection->screen, &atoms, window,
-                         KSD_NET_WM_STATE_REMOVE, atoms.state_max_vert,
-                         atoms.state_max_horz);
+            change_state(c, connection->screen, atoms, window,
+                         KSD_NET_WM_STATE_REMOVE, atoms->state_max_vert,
+                         atoms->state_max_horz);
             xcb_map_window(c, window);
             xcb_flush(c);
         }
@@ -324,7 +261,7 @@ void ksd_x11_window_set_opacity(ksd_x11 *connection, uint32_t window,
                                 uint32_t opacity,
                                 ksd_operation_result *result)
 {
-    control_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
 
     if (opacity > 255u) {
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
@@ -332,7 +269,7 @@ void ksd_x11_window_set_opacity(ksd_x11 *connection, uint32_t window,
         return;
     }
     {
-        CONTROL_PROLOGUE(connection, window, atoms, result)
+        CONTROL_PROLOGUE(connection, window, result)
         /* The property is a 32-bit value where 0xffffffff is opaque, while
          * every backend of this service reports and takes 0 to 255. The byte
          * is replicated across all four rather than shifted into the top one,
@@ -342,7 +279,7 @@ void ksd_x11_window_set_opacity(ksd_x11 *connection, uint32_t window,
          * what the window list does, returns the byte that was written. */
         uint32_t value = opacity * 0x01010101u;
 
-        xcb_change_property(c, XCB_PROP_MODE_REPLACE, window, atoms.opacity,
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, window, atoms->opacity,
                             XCB_ATOM_CARDINAL, 32, 1u, &value);
         xcb_flush(c);
         applied(result);
@@ -352,11 +289,11 @@ void ksd_x11_window_set_opacity(ksd_x11 *connection, uint32_t window,
 void ksd_x11_window_set_above(ksd_x11 *connection, uint32_t window,
                               bool above, ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
-    change_state(c, connection->screen, &atoms, window,
+    const x11_atoms *atoms = &connection->atoms;
+    CONTROL_PROLOGUE(connection, window, result)
+    change_state(c, connection->screen, atoms, window,
                  above ? KSD_NET_WM_STATE_ADD : KSD_NET_WM_STATE_REMOVE,
-                 atoms.state_above, XCB_ATOM_NONE);
+                 atoms->state_above, XCB_ATOM_NONE);
     applied(result);
 }
 
@@ -364,8 +301,8 @@ void ksd_x11_window_set_decorated(ksd_x11 *connection, uint32_t window,
                                   bool decorated,
                                   ksd_operation_result *result)
 {
-    control_atoms atoms;
-    CONTROL_PROLOGUE(connection, window, atoms, result)
+    const x11_atoms *atoms = &connection->atoms;
+    CONTROL_PROLOGUE(connection, window, result)
     /* flags, functions, decorations, input_mode, status. Only the first and
      * third are set: the flags word marks the decorations field meaningful,
      * and the decorations field is all-or-nothing here. */
@@ -373,8 +310,8 @@ void ksd_x11_window_set_decorated(ksd_x11 *connection, uint32_t window,
         KSD_MOTIF_HINTS_FLAG_DECORATIONS, 0u, decorated ? 1u : 0u, 0u, 0u,
     };
 
-    xcb_change_property(c, XCB_PROP_MODE_REPLACE, window, atoms.motif_hints,
-                        atoms.motif_hints, 32, KSD_MOTIF_HINTS_WORDS, hints);
+    xcb_change_property(c, XCB_PROP_MODE_REPLACE, window, atoms->motif_hints,
+                        atoms->motif_hints, 32, KSD_MOTIF_HINTS_WORDS, hints);
     xcb_flush(c);
     applied(result);
 }

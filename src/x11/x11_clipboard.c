@@ -244,19 +244,9 @@ static xcb_window_t make_requestor(xcb_connection_t *connection,
 
 static void bytes_result(ksd_buffer *value, ksd_operation_result *result)
 {
-    ksd_buffer framed;
-
-    if (value->length > KSD_MAX_TEXT_BYTES) {
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "clipboard content is too large");
-        return;
-    }
-    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
-    if (!ksd_buffer_u32(&framed, (uint32_t)value->length)
-        || !ksd_buffer_bytes(&framed, value->data, value->length)
-        || !ksd_result_copy(result, framed.data, (uint32_t)framed.length))
+    if (!ksd_buffer_frame_text(value, KSD_MAX_TEXT_BYTES)
+        || !ksd_result_copy(result, value->data, (uint32_t)value->length))
         ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "out of memory");
-    ksd_buffer_clear(&framed);
 }
 
 /* Latin-1 is what a STRING selection holds by definition, and every Latin-1

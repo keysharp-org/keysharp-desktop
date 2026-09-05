@@ -100,15 +100,6 @@ static xcb_get_property_reply_t *inherited_class(xcb_connection_t *c,
     return NULL;
 }
 
-static xcb_atom_t icccm_state_atom(xcb_connection_t *c)
-{
-    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(c,
-        xcb_intern_atom(c, 1u, 8u, "WM_STATE"), NULL);
-    xcb_atom_t atom = reply != NULL ? reply->atom : XCB_ATOM_NONE;
-    free(reply);
-    return atom;
-}
-
 static xcb_window_t managed_child(xcb_connection_t *c, xcb_window_t window,
                                    xcb_atom_t wm_state, unsigned depth, unsigned *budget)
 {
@@ -128,9 +119,9 @@ static xcb_window_t managed_child(xcb_connection_t *c, xcb_window_t window,
     return found;
 }
 
-static xcb_window_t client_toplevel(xcb_connection_t *c, xcb_window_t window)
+static xcb_window_t client_toplevel(xcb_connection_t *c, xcb_window_t window,
+                                    xcb_atom_t wm_state)
 {
-    xcb_atom_t wm_state = icccm_state_atom(c);
     for (unsigned depth = 0u; depth < 64u; depth++) {
         xcb_get_property_reply_t *state = ksd_x11_property(c, window, wm_state, XCB_ATOM_ANY, 2u);
         bool managed = state != NULL && state->format == 32u && xcb_get_property_value_length(state) >= 4;
@@ -160,7 +151,8 @@ static xcb_window_t active_window(ksd_x11 *connection, const x11_atoms *atoms)
     free(focus);
     if (active == XCB_INPUT_FOCUS_NONE || active == XCB_INPUT_FOCUS_POINTER_ROOT
         || active == connection->screen->root) return XCB_WINDOW_NONE;
-    return client_toplevel(connection->connection, active);
+    return client_toplevel(connection->connection, active,
+                           atoms->icccm_wm_state);
 }
 
 static bool add_handle(xcb_window_t *windows, size_t *count, xcb_window_t window)
@@ -195,7 +187,7 @@ static bool enumerate_windows(ksd_x11 *connection, const x11_atoms *atoms,
     free(reply);
     xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c, xcb_query_tree(c, root), NULL);
     if (tree == NULL) return false;
-    xcb_atom_t wm_state = icccm_state_atom(c);
+    xcb_atom_t wm_state = atoms->icccm_wm_state;
     const xcb_window_t *children = xcb_query_tree_children(tree);
     unsigned budget = KSD_X11_MAX_WINDOWS;
     for (int i = 0; ok && i < xcb_query_tree_children_length(tree); i++) {
@@ -240,7 +232,9 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
         app = inherited_class(c, window, app);
         int32_t x = place->dst_x, y = place->dst_y;
         uint32_t borders[4] = { 0u };
-        if (extents != NULL && extents->format == 32 && xcb_get_property_value_length(extents) >= 16)
+        bool borders_known = extents != NULL && extents->format == 32
+            && xcb_get_property_value_length(extents) >= 16;
+        if (borders_known)
             memcpy(borders, xcb_get_property_value(extents), sizeof(borders));
         for (unsigned i = 0u; i < 4u; i++) if (borders[i] > 32768u) borders[i] = 0u;
         bool minimized = ksd_x11_state_has(state, atoms->state_hidden);
@@ -274,7 +268,7 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
             ",\"client\":{\"x\":%d,\"y\":%d,\"width\":%u,\"height\":%u}"
             ",\"active\":%s,\"minimized\":%s,\"maximized\":%s,\"visible\":%s"
             ",\"alwaysOnTop\":%s,\"decorated\":%s,\"transparency\":%u,\"onCurrentWorkspace\":%s"
-            ",\"validFields\":[\"frame\",\"client\",\"visible\",\"transparency\"%s%s%s%s]}",
+            ",\"validFields\":[\"frame\",\"client\",\"visible\",\"transparency\"%s%s%s%s%s%s%s]}",
             pid, x-(int32_t)borders[0], y-(int32_t)borders[2],
             g->width+borders[0]+borders[1], g->height+borders[2]+borders[3],
             x, y, g->width, g->height, window == active ? "true" : "false",
@@ -283,7 +277,12 @@ static bool append_window(ksd_buffer *out, xcb_connection_t *c,
             above ? "true" : "false", (borders[0]|borders[1]|borders[2]|borders[3]) != 0u ? "true" : "false",
             opacity >> 24u, (!has_desktop || desktop == UINT32_MAX || desktop == current_desktop) ? "true" : "false",
             title_known ? ",\"title\"" : "", class_known ? ",\"appId\"" : "", has_pid ? ",\"pid\"" : "",
-            state != NULL ? ",\"minimized\",\"maximized\",\"alwaysOnTop\"" : "");
+            state != NULL ? ",\"minimized\",\"maximized\",\"alwaysOnTop\"" : "",
+            /* Declared only where the source property answered, because a consumer must be able to tell an
+             * unfocused window from one whose focus this server could not determine. */
+            active != XCB_WINDOW_NONE ? ",\"active\"" : "",
+            borders_known ? ",\"decorated\"" : "",
+            has_desktop ? ",\"onCurrentWorkspace\"" : "");
         ok = ok && size > 0 && (size_t)size < sizeof(scratch) && ksd_buffer_bytes(out, scratch, (size_t)size);
     }
     free(g); free(attributes); free(place); free(extents); free(name); free(fallback); free(app);
@@ -306,37 +305,16 @@ static void discard_window_query(xcb_connection_t *c, window_query *query)
     free(ksd_x11_take_property(c, query->app));
 }
 
-/* The providers frame a JSON reply as a length and then the bytes. */
-void ksd_x11_json_result(ksd_buffer *out, ksd_operation_result *result)
-{
-    ksd_buffer framed;
-
-    if (out->length > KSD_MAX_TEXT_BYTES) {
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the window list is too large");
-        ksd_buffer_clear(out);
-        return;
-    }
-    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
-    if (!ksd_buffer_u32(&framed, (uint32_t)out->length)
-        || !ksd_buffer_bytes(&framed, out->data, out->length)
-        || !ksd_result_copy(result, framed.data, (uint32_t)framed.length))
-        ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "out of memory");
-    ksd_buffer_clear(&framed);
-    ksd_buffer_clear(out);
-}
-
 /* Handles carry no title, class, pid, geometry or other window metadata. */
 void ksd_x11_window_handles(ksd_x11 *connection, ksd_operation_result *result)
 {
-    x11_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
     xcb_window_t windows[KSD_X11_MAX_WINDOWS];
     size_t count;
     ksd_buffer out;
     bool ok;
     bool first = true;
-    ksd_x11_load_atoms(connection->connection, &atoms);
-    if (!enumerate_windows(connection, &atoms, windows, &count)) {
+    if (!enumerate_windows(connection, atoms, windows, &count)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "could not enumerate X11 windows");
         return;
     }
@@ -358,7 +336,8 @@ void ksd_x11_window_handles(ksd_x11 *connection, ksd_operation_result *result)
         ksd_buffer_clear(&out);
         return;
     }
-    ksd_x11_json_result(&out, result);
+    (void)ksd_result_take_framed_text(&out, result, KSD_STATUS_INTERNAL,
+                                      "out of memory");
 }
 
 void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
@@ -366,7 +345,7 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
 {
     xcb_connection_t *c = connection->connection;
     xcb_window_t root = connection->screen->root;
-    x11_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
     uint32_t current_desktop = 0u;
     uint32_t active_value = 0u;
     ksd_buffer out;
@@ -374,13 +353,12 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
     bool ok;
     bool first = true;
 
-    ksd_x11_load_atoms(c, &atoms);
-    (void)ksd_x11_cardinal(c, root, atoms.current_desktop, &current_desktop);
-    active_value = active_window(connection, &atoms);
+    (void)ksd_x11_cardinal(c, root, atoms->current_desktop, &current_desktop);
+    active_value = active_window(connection, atoms);
 
     xcb_window_t windows[KSD_X11_MAX_WINDOWS];
     size_t count;
-    if (!enumerate_windows(connection, &atoms, windows, &count)) {
+    if (!enumerate_windows(connection, atoms, windows, &count)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "could not enumerate X11 windows");
         return;
     }
@@ -393,14 +371,14 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
 
     /* Issue everything, then read everything. */
     for (size_t index = 0u; index < count; index++)
-        issue_window_query(c, &atoms, root, windows[index], &queries[index]);
+        issue_window_query(c, atoms, root, windows[index], &queries[index]);
 
     ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
     ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"windows\":[", 22u);
     for (size_t index = 0u; index < count; index++) {
         xcb_get_property_reply_t *state =
             ksd_x11_take_property(c, queries[index].state);
-        bool hidden = ksd_x11_state_has(state, atoms.state_hidden);
+        bool hidden = ksd_x11_state_has(state, atoms->state_hidden);
 
         if (!ok || (!include_hidden && hidden)) {
             discard_window_query(c, &queries[index]);
@@ -415,7 +393,7 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
             ok = false;
             continue;
         }
-        ok = append_window(&out, c, &atoms, windows[index],
+        ok = append_window(&out, c, atoms, windows[index],
                                  (xcb_window_t)active_value, current_desktop,
                                  &queries[index], state, include_hidden, &included);
         free(state);
@@ -430,23 +408,23 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
                          "could not build the window list");
         return;
     }
-    ksd_x11_json_result(&out, result);
+    (void)ksd_result_take_framed_text(&out, result, KSD_STATUS_INTERNAL,
+                                      "out of memory");
 }
 
 void ksd_x11_window_active(ksd_x11 *connection, ksd_operation_result *result)
 {
     xcb_connection_t *c = connection->connection;
     xcb_window_t root = connection->screen->root;
-    x11_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
     uint32_t current_desktop = 0u;
     uint32_t active_value = 0u;
     ksd_buffer out;
     bool ok;
 
-    ksd_x11_load_atoms(c, &atoms);
-    (void)ksd_x11_cardinal(c, root, atoms.current_desktop, &current_desktop);
+    (void)ksd_x11_cardinal(c, root, atoms->current_desktop, &current_desktop);
     ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
-    active_value = active_window(connection, &atoms);
+    active_value = active_window(connection, atoms);
     if (active_value == XCB_WINDOW_NONE) {
         /* No active window is an answer rather than a failure: a session with
          * every window minimised has none. */
@@ -455,11 +433,11 @@ void ksd_x11_window_active(ksd_x11 *connection, ksd_operation_result *result)
         window_query query;
         xcb_get_property_reply_t *state;
 
-        issue_window_query(c, &atoms, root, (xcb_window_t)active_value,
+        issue_window_query(c, atoms, root, (xcb_window_t)active_value,
                            &query);
         state = ksd_x11_take_property(c, query.state);
         ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"window\":", 20u)
-            && append_window(&out, c, &atoms, (xcb_window_t)active_value,
+            && append_window(&out, c, atoms, (xcb_window_t)active_value,
                              (xcb_window_t)active_value, current_desktop,
                              &query, state, true, NULL)
             && ksd_buffer_bytes(&out, "}", 1u);
@@ -471,25 +449,25 @@ void ksd_x11_window_active(ksd_x11 *connection, ksd_operation_result *result)
                          "could not build the active window");
         return;
     }
-    ksd_x11_json_result(&out, result);
+    (void)ksd_result_take_framed_text(&out, result, KSD_STATUS_INTERNAL,
+                                      "out of memory");
 }
 
 void ksd_x11_window_query(ksd_x11 *connection, uint32_t window,
                            ksd_operation_result *result)
 {
     xcb_connection_t *c = connection->connection;
-    x11_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
     uint32_t active = 0u, desktop = 0u;
     window_query query;
     ksd_buffer out;
-    ksd_x11_load_atoms(c, &atoms);
-    active = active_window(connection, &atoms);
-    (void)ksd_x11_cardinal(c, connection->screen->root, atoms.current_desktop, &desktop);
-    issue_window_query(c, &atoms, connection->screen->root, window, &query);
+    active = active_window(connection, atoms);
+    (void)ksd_x11_cardinal(c, connection->screen->root, atoms->current_desktop, &desktop);
+    issue_window_query(c, atoms, connection->screen->root, window, &query);
     xcb_get_property_reply_t *state = ksd_x11_take_property(c, query.state);
     ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
     bool ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"window\":", 20u)
-        && append_window(&out, c, &atoms, window, active, desktop, &query, state, true, NULL);
+        && append_window(&out, c, atoms, window, active, desktop, &query, state, true, NULL);
     free(state);
     if (!ok) {
         ksd_buffer_clear(&out);
@@ -499,7 +477,7 @@ void ksd_x11_window_query(ksd_x11 *connection, uint32_t window,
     xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c, xcb_query_tree(c, window), NULL);
     xcb_window_t parent = tree != NULL ? tree->parent : XCB_WINDOW_NONE;
     free(tree);
-    xcb_window_t top = client_toplevel(c, window);
+    xcb_window_t top = client_toplevel(c, window, atoms->icccm_wm_state);
     char relationships[128];
     int written = snprintf(relationships, sizeof(relationships),
         ",\"parent\":\"%u\",\"topLevel\":\"%u\"}}", parent, top);
@@ -510,5 +488,6 @@ void ksd_x11_window_query(ksd_x11 *connection, uint32_t window,
         ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u, "window result is too large");
         return;
     }
-    ksd_x11_json_result(&out, result);
+    (void)ksd_result_take_framed_text(&out, result, KSD_STATUS_INTERNAL,
+                                      "out of memory");
 }

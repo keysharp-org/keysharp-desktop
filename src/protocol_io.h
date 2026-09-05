@@ -87,6 +87,9 @@ bool ksd_buffer_u16(ksd_buffer *buffer, uint16_t value);
 bool ksd_buffer_u32(ksd_buffer *buffer, uint32_t value);
 bool ksd_buffer_u64(ksd_buffer *buffer, uint64_t value);
 bool ksd_buffer_bytes(ksd_buffer *buffer, const void *data, size_t length);
+bool ksd_buffer_json_string(ksd_buffer *buffer, const char *value,
+                            size_t length, bool latin1);
+bool ksd_buffer_frame_text(ksd_buffer *buffer, size_t maximum_payload);
 
 /*
  * Reassembly of a chunked request. Every frame of a sequence carries one

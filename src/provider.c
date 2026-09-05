@@ -384,8 +384,13 @@ static GVariant *provider_call(uid_t uid, pid_t provider_pid,
 {
     GDBusConnection *connection =
         provider_connection_get(uid, provider_pid, backend, error);
-    if (connection == NULL)
+    if (connection == NULL) {
+        if (parameters != NULL) {
+            g_variant_ref_sink(parameters);
+            g_variant_unref(parameters);
+        }
         return NULL;
+    }
     GVariant *reply = g_dbus_connection_call_sync(connection, NULL,
         KSD_PROVIDER_OBJECT_PATH, KSD_PROVIDER_INTERFACE, method, parameters,
         reply_type, G_DBUS_CALL_FLAGS_NONE, timeout_ms, NULL, error);
@@ -812,6 +817,17 @@ static void execute_window(uid_t uid, pid_t pid, pid_t provider_pid,
         string_result(reply, error, result);
         return;
     }
+    if (request->opcode == KSD_OP_WINDOW_QUERY) {
+        if (!parse_handle(request, &handle)) {
+            invalid_request(result);
+            return;
+        }
+        reply = provider_call(uid, provider_pid, backend, "QueryWindow",
+            g_variant_new("(t)", (guint64)handle), G_VARIANT_TYPE("(s)"),
+            KSD_PROVIDER_TIMEOUT_MS, &error);
+        string_result(reply, error, result);
+        return;
+    }
     if (method != NULL) {
         if (!parse_handle(request, &handle)) {
             invalid_request(result);
@@ -1188,6 +1204,7 @@ void ksd_provider_execute(uid_t uid, pid_t pid, pid_t provider_pid,
     }
     if ((request->opcode >= KSD_OP_WINDOW_LIST
          && request->opcode <= KSD_OP_WINDOW_WATCH)
+        || request->opcode == KSD_OP_WINDOW_QUERY
         || (request->opcode >= KSD_OP_WINDOW_FOCUS
             && request->opcode <= KSD_OP_WINDOW_GET_RESERVED)) {
         execute_window(uid, pid, provider_pid, backend, request, result);

@@ -1,57 +1,292 @@
-// GNOME Shell provider for desktop automation clients.
-// It exposes compositor-owned state through authenticated D-Bus surfaces.
-//
-// Requires GNOME Shell 45+ (ESM extension format).
-// D-Bus service name : io.github.keysharp.GnomeShell
-// Object path        : /io/github/keysharp/GnomeShell
-// Interface          : io.github.keysharp.GnomeShell1
+// Generated from providers/shared; edit and regenerate those sources.
+// GNOME Shell 45+ loader and compositor adapter.
+import GnomeGLib from 'gi://GLib';
+import GnomeGio from 'gi://Gio';
+import GnomeMeta from 'gi://Meta';
+import GnomeClutter from 'gi://Clutter';
+import GnomeCogl from 'gi://Cogl';
+import GnomeGdkPixbuf from 'gi://GdkPixbuf';
+import GnomeShell from 'gi://Shell';
+import GnomeSt from 'gi://St';
+import GnomeCairoGI from 'gi://cairo';
+import * as GnomeMain from 'resource:///org/gnome/shell/ui/main.js';
+import * as GnomeConfig from 'resource:///org/gnome/shell/misc/config.js';
 
-import GLib from 'gi://GLib';
-import Gio from 'gi://Gio';
-import Meta from 'gi://Meta';
-import Clutter from 'gi://Clutter';
-import Cogl from 'gi://Cogl';
-import GdkPixbuf from 'gi://GdkPixbuf';
-import Shell from 'gi://Shell';
-import St from 'gi://St';
-import CairoGI from 'gi://cairo';
-import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as Config from 'resource:///org/gnome/shell/misc/config.js';
+const SHELL_MAJOR = Number.parseInt(GnomeConfig.PACKAGE_VERSION.split('.')[0], 10);
+function workArea() {
+    const index = GnomeMain.layoutManager.primaryIndex;
+    const area = GnomeMain.layoutManager.getWorkAreaForMonitor(index);
+    return [Math.round(area.x), Math.round(area.y),
+        Math.round(area.width), Math.round(area.height)];
+}
 
-const SHELL_MAJOR = Number.parseInt(Config.PACKAGE_VERSION.split('.')[0], 10);
+function setDecorated(win, decorated) {
+    const isX11 = typeof win.get_client_type === 'function'
+        ? win.get_client_type() === GnomeMeta.WindowClientType.X11
+        : typeof win.get_xwindow === 'function' && win.get_xwindow() !== 0;
+    if (!isX11 || typeof win.get_xwindow !== 'function')
+        return true;
 
-const SERVICE_NAME = 'io.github.keysharp.GnomeShell';
-const PROVIDER_INTERFACE_NAME = 'org.keysharp.Desktop.Provider1';
-const PROVIDER_OBJECT_PATH = '/org/keysharp/DesktopProvider';
-const PROVIDER_SOCKET_NAME = 'provider-gnome.sock';
-const MAX_CLIPBOARD_BYTES = 16 * 1024 * 1024;
-const MAX_OVERLAY_PNG_BYTES = 16 * 1024 * 1024;
-const MAX_OVERLAY_DIMENSION = 8192;
-const MAX_OVERLAY_PIXELS = 16 * 1024 * 1024;
-const MAX_OVERLAYS_PER_OWNER = 64;
-const MAX_OVERLAYS_TOTAL = 512;
-const MAX_OVERLAY_BYTES_PER_OWNER = 64 * 1024 * 1024;
-const MAX_OVERLAY_BYTES_TOTAL = 256 * 1024 * 1024;
-const MAX_TOOLTIP_CHARS = 65536;
-const MAX_CAPTURE_BYTES = 256 * 1024 * 1024;
-const MAX_CAPTURE_DIMENSION = 32768;
-const MAX_CAPTURE_PIXELS = 64 * 1024 * 1024;
+    const xid = win.get_xwindow();
+    if (!xid)
+        return true;
 
-// How many compositor frames to wait for a reserved window to become placeable.
-// Retries are timer-driven, so this is a real time budget: 40 x 16ms.
-const PLACEMENT_MAX_TRIES = 40;
-const PLACEMENT_RETRY_MS = 16;
-// How long the actor watchdog stays armed after placement; the observed yank fight lasts ~150ms.
-const PLACEMENT_WATCH_MS = 600;
+    const value = decorated ? 1 : 0;
+    GnomeGLib.spawn_command_line_async(`xprop -id ${xid} -f _MOTIF_WM_HINTS 32c `
+        + `-set _MOTIF_WM_HINTS "2, 0, ${value}, 0, 0"`);
+    return true;
+}
 
-// How long a reservation stays live if the window it was meant for never arrives.
-const PLACEMENT_TTL_MS = 2000;
-const MAX_PLACEMENTS_TOTAL = 256;
-const MAX_PLACEMENTS_PER_PID = 16;
-const MAX_PLACED_TOTAL = 256;
+function addClickThroughChrome(actor) {
+    if (SHELL_MAJOR >= 50)
+        GnomeMain.layoutManager.addTopChrome(actor);
+    else
+        GnomeMain.layoutManager.addTopChrome(actor, {affectsInputRegion: false});
+}
 
-const OBJECT_PATH  = '/io/github/keysharp/GnomeShell';
+function makeImageContent(content, frame, sameSize) {
+    if (content && sameSize) {
+        try {
+            let updated = false;
+            if (SHELL_MAJOR >= 48 && typeof content.get_texture === 'function') {
+                const texture = content.get_texture();
+                if (texture && typeof texture.set_region === 'function') {
+                    updated = texture.set_region(0, 0, 0, 0,
+                        frame.width, frame.height, frame.width, frame.height,
+                        frame.format, frame.rowStride, frame.pixels);
+                    if (updated)
+                        content.invalidate();
+                }
+            } else if (typeof content.set_area === 'function') {
+                const area = new GnomeCairoGI.RectangleInt();
+                area.x = 0;
+                area.y = 0;
+                area.width = frame.width;
+                area.height = frame.height;
+                updated = content.set_area(frame.pixels, frame.format, area,
+                    frame.rowStride);
+            }
+            if (updated)
+                return content;
+        } catch (_e) {
+        }
+    }
 
+    if (SHELL_MAJOR >= 48) {
+        const image = new GnomeSt.ImageContent({
+            preferredWidth: frame.width,
+            preferredHeight: frame.height,
+        });
+        const context = global.stage.context.get_backend().get_cogl_context();
+        image.set_bytes(context, frame.pixbuf.read_pixel_bytes(), frame.format,
+            frame.width, frame.height, frame.rowStride);
+        return image;
+    }
+
+    const image = new GnomeClutter.Image();
+    image.set_data(frame.pixels, frame.format, frame.width, frame.height,
+        frame.rowStride);
+    return image;
+}
+
+function actorResourceScale(actor) {
+    try {
+        const scale = typeof actor.get_resource_scale === 'function'
+            ? Number(actor.get_resource_scale()) : 1;
+        return Number.isFinite(scale) && scale > 0 && scale <= 16 ? scale : 1;
+    } catch (_e) {
+        return 1;
+    }
+}
+
+function _captureWindowRect(provider, win, actor, includeDecoration) {
+    let buffer = null;
+    let frame = null;
+    try {
+        buffer = win.get_buffer_rect();
+        frame = includeDecoration ? buffer : win.get_frame_rect();
+    } catch (_e) {
+        return null;
+    }
+    if (!buffer || !frame)
+        return null;
+
+    const scale = actorResourceScale(actor);
+    const rect = {
+        x: Math.round((frame.x - buffer.x) * scale),
+        y: Math.round((frame.y - buffer.y) * scale),
+        width: Math.floor(frame.width * scale),
+        height: Math.floor(frame.height * scale),
+    };
+    return rect.x >= 0 && rect.y >= 0
+        && provider._validCaptureGeometry(rect.width, rect.height) ? rect : null;
+}
+
+function _fitCaptureRect(provider, rect, texture) {
+    let width = 0;
+    let height = 0;
+    try {
+        width = Number(texture.get_width());
+        height = Number(texture.get_height());
+    } catch (_e) {
+        return null;
+    }
+    if (!Number.isInteger(width) || !Number.isInteger(height)
+        || rect.x >= width || rect.y >= height)
+        return null;
+
+    const fitted = {
+        x: rect.x,
+        y: rect.y,
+        width: Math.min(rect.width, width - rect.x),
+        height: Math.min(rect.height, height - rect.y),
+    };
+    return provider._validCaptureGeometry(fitted.width, fitted.height)
+        ? fitted : null;
+}
+
+function compositeToStream(texture, rect, stream, done) {
+    try {
+        GnomeShell.Screenshot.composite_to_stream(texture,
+            rect.x, rect.y, rect.width, rect.height, 1,
+            null, 0, 0, 1, stream, done);
+    } catch (_e) {
+        GnomeShell.Screenshot.composite_to_stream(texture,
+            rect.x, rect.y, rect.width, rect.height, 1,
+            null, 0, 0, 1, stream, null, done);
+    }
+}
+
+function captureArea(provider, params, reply) {
+    const [x, y, width, height] = params;
+    if (!provider._validCaptureGeometry(width, height)) {
+        reply(null);
+        return;
+    }
+
+    try {
+        const screenshot = new GnomeShell.Screenshot();
+        const stream = GnomeGio.MemoryOutputStream.new_resizable();
+        screenshot.screenshot_area(x, y, width, height, stream, (_obj, result) => {
+            try {
+                screenshot.screenshot_area_finish(result);
+                stream.close(null);
+                reply(new Uint8Array(stream.steal_as_bytes().get_data()));
+            } catch (e) {
+                logError(e, 'Keysharp: CaptureArea screenshot failed');
+                reply(null);
+            }
+        });
+    } catch (e) {
+        logError(e, 'Keysharp: CaptureArea failed');
+        reply(null);
+    }
+}
+
+function captureWindow(provider, handle, includeDecoration, reply) {
+    let watchdog = 0;
+    const done = bytes => {
+        if (watchdog !== 0) {
+            GnomeGLib.source_remove(watchdog);
+            watchdog = 0;
+        }
+        reply(bytes);
+    };
+
+    try {
+        const win = provider._findWindow(handle);
+        const actor = win && typeof win.get_compositor_private === 'function'
+            ? win.get_compositor_private() : null;
+        if (!actor || typeof actor.paint_to_content !== 'function') {
+            done(null);
+            return;
+        }
+
+        const wanted = _captureWindowRect(provider, win, actor, includeDecoration);
+        let content = wanted ? actor.paint_to_content(null) : null;
+        const texture = content && typeof content.get_texture === 'function'
+            ? content.get_texture() : null;
+        const rect = texture ? _fitCaptureRect(provider, wanted, texture) : null;
+        if (!rect) {
+            done(null);
+            return;
+        }
+
+        const stream = GnomeGio.MemoryOutputStream.new_resizable();
+        watchdog = GnomeGLib.timeout_add(GnomeGLib.PRIORITY_DEFAULT, 15000, () => {
+            watchdog = 0;
+            content = null;
+            reply(null);
+            return GnomeGLib.SOURCE_REMOVE;
+        });
+        compositeToStream(texture, rect, stream, (_obj, result) => {
+            content = null;
+            try {
+                GnomeShell.Screenshot.composite_to_stream_finish(result);
+                stream.close(null);
+                done(new Uint8Array(stream.steal_as_bytes().get_data()));
+            } catch (e) {
+                logError(e, 'Keysharp: CaptureWindow composite failed');
+                done(null);
+            }
+        });
+    } catch (e) {
+        logError(e, 'Keysharp: CaptureWindow failed');
+        done(null);
+    }
+}
+
+function windowExtras(win) {
+    let onCurrentWorkspace = true;
+    let known = false;
+    try {
+        const workspace = win.get_workspace();
+        onCurrentWorkspace = win.is_on_all_workspaces()
+            || (workspace !== null
+                && workspace === global.workspace_manager.get_active_workspace());
+        known = true;
+    } catch (_e) {
+    }
+    return {
+        values: {onCurrentWorkspace: onCurrentWorkspace},
+        validFields: known ? ['onCurrentWorkspace'] : [],
+    };
+}
+
+const env = {
+    Clutter: GnomeClutter,
+    Cogl: GnomeCogl,
+    GdkPixbuf: GnomeGdkPixbuf,
+    Gio: GnomeGio,
+    GLib: GnomeGLib,
+    Main: GnomeMain,
+    Meta: GnomeMeta,
+    St: GnomeSt,
+    serviceName: 'io.github.keysharp.GnomeShell',
+    objectPath: '/io/github/keysharp/GnomeShell',
+    providerSocketName: 'provider-gnome.sock',
+    logError: logError,
+    decodeBytes: bytes => new TextDecoder().decode(bytes),
+    addClickThroughChrome: addClickThroughChrome,
+    makeImageContent: makeImageContent,
+    captureArea: captureArea,
+    captureWindow: captureWindow,
+    setDecorated: setDecorated,
+    workArea: workArea,
+    maximizeFlags: GnomeMeta.MaximizeFlags.HORIZONTAL | GnomeMeta.MaximizeFlags.VERTICAL,
+    windowExtras: windowExtras,
+    supportsTooltip: true,
+};
+
+// Shared shell-extension implementation. Loader and compositor differences live in env.
+const Clutter = env.Clutter;
+const Cogl = env.Cogl;
+const GdkPixbuf = env.GdkPixbuf;
+const Gio = env.Gio;
+const GLib = env.GLib;
+const Main = env.Main;
+const Meta = env.Meta;
+const St = env.St;
 const DBUS_IFACE_XML = `
 <node>
   <interface name="org.keysharp.Desktop.Provider1">
@@ -62,6 +297,12 @@ const DBUS_IFACE_XML = `
          Windows are ordered bottom-to-top (index 0 = lowest z-order). -->
     <method name="GetWindowList">
       <arg type="b" direction="in"  name="includeHidden"/>
+      <arg type="s" direction="out" name="json"/>
+    </method>
+
+    <!-- Returns JSON: { ok, window: { ... } }. Missing handles return NotFound. -->
+    <method name="QueryWindow">
+      <arg type="t" direction="in" name="handle"/>
       <arg type="s" direction="out" name="json"/>
     </method>
 
@@ -85,7 +326,7 @@ const DBUS_IFACE_XML = `
     </method>
 
     <!-- Clipboard bridge: Wayland has no focus-independent clipboard access for a background app, and
-         Mutter exposes no data-control protocol, so the shell (which owns the selection) reads/writes it
+         the shell exposes no data-control protocol, so the shell (which owns the selection) reads/writes it
          via MetaSelection and notifies of changes via the MetaSelection owner-changed signal. Content is
          raw MIME-type <-> bytes so every format (text, image, html, uri-list, ...) round-trips. -->
     <method name="GetClipboardMimetypes">
@@ -187,8 +428,7 @@ const DBUS_IFACE_XML = `
       <arg type="b" direction="out" name="ok"/>
     </method>
 
-    <!-- decorated: true = show the titlebar/frame, false = hide it (the GNOME counterpart of KWin's
-         noBorder, used by borderless overlays and WinSetStyle -WS_CAPTION). -->
+    <!-- decorated: true = show the titlebar/frame, false = hide it. -->
     <method name="SetWindowDecorated">
       <arg type="t" direction="in" name="handle"/>
       <arg type="b" direction="in" name="decorated"/>
@@ -245,23 +485,19 @@ const DBUS_IFACE_XML = `
       <arg type="ay" direction="out" name="pngData"/>
     </method>
 
-    <!-- Capture one window and return raw PNG bytes. Same in-memory path as
-         CaptureArea: no flash, no file, no compositor round trip outside this
-         process. handle is the stable_sequence uint32 of Meta.Window (the "id"
-         field of the window JSON). includeDecoration keeps the buffer-rect
-         margin Mutter draws outside the visible frame rect; on Mutter that
-         margin is the shadow and invisible border, since server-side
-         decoration already lives inside the frame rect. The bytes carry the
-         window's own alpha. Returns an empty array on failure. -->
+    <!-- Capture one window and return raw PNG bytes without writing a file.
+         handle is the stable_sequence uint32 of Meta.Window (the "id" field
+         of the window JSON). includeDecoration keeps any compositor buffer
+         margin outside the visible frame rect. Returns an empty array on
+         failure. -->
     <method name="CaptureWindow">
       <arg type="t" direction="in"  name="handle"/>
       <arg type="b" direction="in"  name="includeDecoration"/>
       <arg type="ay" direction="out" name="pngData"/>
     </method>
 
-    <!-- Draw (or update) a click-through rectangle-outline overlay on the compositor stage — the
-         GNOME counterpart of the wlr-layer-shell highlight Keysharp uses on KWin/wlroots (GNOME has
-         no layer-shell, so the overlay has to live inside the shell process). id is a caller-chosen
+    <!-- Draw (or update) a click-through rectangle-outline overlay on the compositor stage. The shell
+         has no layer-shell, so the overlay lives inside the shell process. id is a caller-chosen
          token so the same overlay can be moved/resized or hidden later; x/y/width/height are in global
          compositor coordinates; color is an "RRGGBB" hex string; thickness is the outline width in px.
          The overlay is non-reactive and excluded from the shell input region, so it never eats clicks. -->
@@ -358,11 +594,42 @@ const DBUS_IFACE_XML = `
     </signal>
 
   </interface>
-</node>`;
+</node>
+`;
+const SERVICE_NAME = env.serviceName;
+const PROVIDER_OBJECT_PATH = '/org/keysharp/DesktopProvider';
+const PROVIDER_SOCKET_NAME = env.providerSocketName;
+const OBJECT_PATH = env.objectPath;
+const MAX_CLIPBOARD_BYTES = 16 * 1024 * 1024;
+const MAX_OVERLAY_PNG_BYTES = 16 * 1024 * 1024;
+const MAX_OVERLAY_DIMENSION = 8192;
+const MAX_OVERLAY_PIXELS = 16 * 1024 * 1024;
+const MAX_OVERLAYS_PER_OWNER = 64;
+const MAX_OVERLAYS_TOTAL = 512;
+const MAX_OVERLAY_BYTES_PER_OWNER = 64 * 1024 * 1024;
+const MAX_OVERLAY_BYTES_TOTAL = 256 * 1024 * 1024;
+const MAX_TOOLTIP_CHARS = 65536;
+const MAX_CAPTURE_BYTES = 256 * 1024 * 1024;
+const MAX_CAPTURE_DIMENSION = 32768;
+const MAX_CAPTURE_PIXELS = 64 * 1024 * 1024;
+
+// How many compositor frames to wait for a reserved window to become placeable.
+// Retries are timer-driven, so this is a real time budget: 40 x 16ms.
+const PLACEMENT_MAX_TRIES = 40;
+const PLACEMENT_RETRY_MS = 16;
+// How long the actor watchdog stays armed after placement; the observed yank fight lasts ~150ms.
+const PLACEMENT_WATCH_MS = 600;
+
+// How long a reservation stays live if the window it was meant for never arrives.
+const PLACEMENT_TTL_MS = 2000;
+const MAX_PLACEMENTS_TOTAL = 256;
+const MAX_PLACEMENTS_PER_PID = 16;
+const MAX_PLACED_TOTAL = 256;
+
 
 const PUBLIC_IFACE_XML = `
 <node>
-  <interface name="io.github.keysharp.GnomeShell1">
+  <interface name="io.github.keysharp.ShellExtension1">
     <method name="GetCursorPosition">
       <arg type="i" direction="out" name="x"/>
       <arg type="i" direction="out" name="y"/>
@@ -454,10 +721,10 @@ const INT32_MIN = -2147483648;
 
 // Grace period after a client's D-Bus name drops before its overlays are reaped, so a client that
 // merely reconnected (new unique name, then re-registers) does not lose its overlays. See
-// _handleOverlayConnectionLost. Mirrors the Cinnamon extension.
+// _handleOverlayConnectionLost.
 const OVERLAY_RECONNECT_GRACE_MS = 2000;
 
-export default class KeysharpExtension {
+class KeysharpExtensionCore {
     constructor() {
         this._dbusImpl     = null;
         this._busNameId    = 0;
@@ -495,14 +762,13 @@ export default class KeysharpExtension {
             this._vPointer = seat.create_virtual_device(
                 Clutter.InputDeviceType.POINTER_DEVICE);
         } catch (e) {
-            logError(e, 'Keysharp: could not create virtual pointer device');
+            env.logError(e, 'Keysharp: could not create virtual pointer device');
         }
         this._startProvider();
 
         // Export the D-Bus object first, then own the well-known name. Guard the whole D-Bus bring-up: if
         // export() or bus_own_name() throws, tear down whatever came up (exported object, name watch, virtual
-        // pointer) and bail instead of leaving a half-initialized zombie extension — mirroring the Cinnamon
-        // extension's bus_own_name guard.
+        // pointer) and bail instead of leaving a half-initialized extension.
         // NOTE: Gio.DBus.session is a Gio.DBusConnection — it has no own_name()
         // method. The correct API is the free function Gio.bus_own_name().
         try {
@@ -528,7 +794,7 @@ export default class KeysharpExtension {
                 null,   // name_acquired_closure
                 null);  // name_lost_closure
         } catch (e) {
-            logError(e, 'Keysharp: could not export D-Bus service / own name');
+            env.logError(e, 'Keysharp: could not export D-Bus service / own name');
 
             if (this._overlayNameWatchId !== 0) {
                 try { Gio.DBus.session.signal_unsubscribe(this._overlayNameWatchId); } catch (_e) {}
@@ -592,7 +858,7 @@ export default class KeysharpExtension {
                         this._emitClipboardChanged();
                 });
         } catch (e) {
-            logError(e, 'Keysharp: could not hook clipboard selection');
+            env.logError(e, 'Keysharp: could not hook clipboard selection');
         }
     }
 
@@ -730,13 +996,13 @@ export default class KeysharpExtension {
                         connection.start_message_processing();
                         return true;
                     } catch (e) {
-                        logError(e, 'Keysharp: could not export private provider connection');
+                        env.logError(e, 'Keysharp: could not export private provider connection');
                         return false;
                     }
                 });
             this._providerServer.start();
         } catch (e) {
-            logError(e, 'Keysharp: could not start private desktop provider');
+            env.logError(e, 'Keysharp: could not start private desktop provider');
             this._stopProvider();
         }
     }
@@ -824,6 +1090,21 @@ export default class KeysharpExtension {
         invocation.return_value(new GLib.Variant('(s)', [this._getWindowList(Boolean(params[0]))]));
     }
 
+    QueryWindowAsync(params, invocation) {
+        if (!this._requireProviderPeer(invocation))
+            return;
+        try {
+            const win = this._findWindow(params[0]);
+            if (win) {
+                const json = JSON.stringify({ok: true, window: this._windowInfo(win)});
+                invocation.return_value(new GLib.Variant('(s)', [json]));
+                return;
+            }
+        } catch (_e) {}
+        invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND,
+            'Window not found.');
+    }
+
     GetActiveWindowAsync(_params, invocation) {
         if (!this._requireProviderPeer(invocation))
             return;
@@ -880,7 +1161,7 @@ export default class KeysharpExtension {
             const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/stat`);
             if (!ok)
                 return false;
-            const stat = new TextDecoder().decode(bytes);
+            const stat = env.decodeBytes(bytes);
             const end = stat.lastIndexOf(')');
             if (end < 0 || end + 2 >= stat.length)
                 return false;
@@ -910,16 +1191,12 @@ export default class KeysharpExtension {
 
     // Two out-parameters map to a two-element array in GJS D-Bus dispatch.
     GetCursorPosition() {
-        const [x, y] = global.get_pointer();
-        return [Math.round(x), Math.round(y)];
+        const point = global.get_pointer();
+        return [Math.round(point[0]), Math.round(point[1])];
     }
 
     GetWorkArea() {
-        // Work area of the primary monitor, with panels/struts already subtracted by Mutter — the
-        // panel-excluded usable area a foreign Wayland client cannot compute for itself.
-        const idx = Main.layoutManager.primaryIndex;
-        const wa = Main.layoutManager.getWorkAreaForMonitor(idx);
-        return [Math.round(wa.x), Math.round(wa.y), Math.round(wa.width), Math.round(wa.height)];
+        return env.workArea();
     }
 
     // --- Clipboard --------------------------------------------------------------------------------------
@@ -992,7 +1269,7 @@ export default class KeysharpExtension {
             this._selectionObj().set_owner(Meta.SelectionType.SELECTION_CLIPBOARD, source);
             return true;
         } catch (e) {
-            logError(e, 'Keysharp: SetClipboardContent failed');
+            env.logError(e, 'Keysharp: SetClipboardContent failed');
             return false;
         }
     }
@@ -1038,11 +1315,21 @@ export default class KeysharpExtension {
 
     _focusWindow(handle) {
         const win = this._findWindow(handle);
-        if (!win) return false;
+        if (!win)
+            return false;
         if (win.minimized)
             win.unminimize();
-        Main.activateWindow(win);
-        return true;
+        try {
+            Main.activateWindow(win);
+            return true;
+        } catch (_e) {
+            try {
+                win.activate(global.get_current_time());
+                return true;
+            } catch (_e2) {
+                return false;
+            }
+        }
     }
 
     _raiseWindow(handle) {
@@ -1087,7 +1374,8 @@ export default class KeysharpExtension {
     }
 
     _moveResizeWin(win, x, y, width, height) {
-        if (!win) return false;
+        if (!win)
+            return false;
 
         // Moving a window that has no monitor yet recurses to death inside
         // move_resize_internal -> update_monitor -> wayland_update_main_monitor. Reachable here because a
@@ -1099,7 +1387,7 @@ export default class KeysharpExtension {
         // titlebar first unmaximizes it. Unmaximize BEFORE reading the frame rect so an unchanged-size move
         // keeps the restored size, not the maximized one.
         if (win.maximized_horizontally || win.maximized_vertically)
-            win.unmaximize(Meta.MaximizeFlags.HORIZONTAL | Meta.MaximizeFlags.VERTICAL);
+            win.unmaximize(env.maximizeFlags);
 
         // Read the current frame rect so we can substitute unchanged axes.
         const frame = win.get_frame_rect();
@@ -1113,8 +1401,12 @@ export default class KeysharpExtension {
         // user_op = true marks this a user action, so Mutter applies the looser "keep-minimal on
         // screen" constraint of an interactive drag (allowing off-screen placement) instead of the
         // strict fully-on-screen clamp it forces on app ConfigureRequests. It does not steal focus.
-        win.move_resize_frame(true, nx, ny, nw, nh);
-        return true;
+        try {
+            win.move_resize_frame(true, nx, ny, nw, nh);
+            return true;
+        } catch (_e) {
+            return false;
+        }
     }
 
     // Claim the NEXT window this pid creates under a caller-chosen cookie, so it can ask afterwards which
@@ -1383,42 +1675,55 @@ export default class KeysharpExtension {
 
     _setWindowState(handle, state) {
         const win = this._findWindow(handle);
-        if (!win) return false;
+        if (!win)
+            return false;
 
-        if (state === STATE_MINIMIZED) {
-            win.minimize();
-        } else if (state === STATE_MAXIMIZED) {
-            win.unminimize();
-            win.maximize(Meta.MaximizeFlags.HORIZONTAL | Meta.MaximizeFlags.VERTICAL);
-        } else {
-            win.unminimize();
-            win.unmaximize(Meta.MaximizeFlags.HORIZONTAL | Meta.MaximizeFlags.VERTICAL);
+        try {
+            if (state === STATE_MINIMIZED) {
+                win.minimize();
+            } else if (state === STATE_MAXIMIZED) {
+                if (win.minimized)
+                    win.unminimize();
+                win.maximize(env.maximizeFlags);
+            } else {
+                if (win.minimized)
+                    win.unminimize();
+                win.unmaximize(env.maximizeFlags);
+            }
+            return true;
+        } catch (_e) {
+            return false;
         }
-        return true;
     }
 
     _setWindowAbove(handle, above) {
         const win = this._findWindow(handle);
-        if (!win) return false;
+        if (!win)
+            return false;
 
-        // Mutter exposes make_above()/unmake_above(); guard with is_above() so a redundant
-        // call doesn't throw on compositor versions that are strict about state transitions.
-        if (above) {
-            if (!win.is_above())
-                win.make_above();
-        } else {
-            if (win.is_above())
+        try {
+            if (above) {
+                if (!win.is_above())
+                    win.make_above();
+            } else if (win.is_above()) {
                 win.unmake_above();
+            }
+            return true;
+        } catch (_e) {
+            return false;
         }
-        return true;
     }
 
     _closeWindow(handle) {
         const win = this._findWindow(handle);
         if (!win)
             return false;
-        win.delete(global.get_current_time());
-        return true;
+        try {
+            win.delete(global.get_current_time());
+            return true;
+        } catch (_e) {
+            return false;
+        }
     }
 
     _killWindow(handle) {
@@ -1454,14 +1759,14 @@ export default class KeysharpExtension {
     _sendMouseMoveRelative(dx, dy) {
         if (this._vPointer === null)
             return false;
-        const [x, y] = global.get_pointer();
+        const point = global.get_pointer();
         this._vPointer.notify_absolute_motion(
-            GLib.get_monotonic_time(), x + dx, y + dy);
+            GLib.get_monotonic_time(), point[0] + dx, point[1] + dy);
         return true;
     }
 
     _sendMouseButton(button, pressed) {
-        if (this._vPointer === null || ![1, 2, 3, 8, 9].includes(button))
+        if (this._vPointer === null || [1, 2, 3, 8, 9].indexOf(button) < 0)
             return false;
         this._vPointer.notify_button(
             GLib.get_monotonic_time(), button,
@@ -1484,34 +1789,15 @@ export default class KeysharpExtension {
         return true;
     }
 
-    // Mutter can toggle server-side decorations only for XWayland windows.
     _setWindowDecorated(handle, decorated) {
         const win = this._findWindow(handle);
         if (!win)
             return false;
 
         try {
-            const isX11 = (typeof win.get_client_type === 'function')
-                ? (win.get_client_type() === Meta.WindowClientType.X11)
-                : (typeof win.get_xwindow === 'function' && win.get_xwindow() !== 0);
-
-            // Wayland client: decorations are client-side; nothing the compositor can remove. The window
-            // exists and there is nothing to do, so this is best-effort success, not a failure.
-            if (!isX11 || typeof win.get_xwindow !== 'function')
-                return true;
-
-            const xid = win.get_xwindow();
-            if (!xid)
-                return true;
-
-            // _MOTIF_WM_HINTS: flags=2 (MWM_HINTS_DECORATIONS), decorations field 0 = none / 1 = all.
-            const decor = decorated ? 1 : 0;
-            GLib.spawn_command_line_async(
-                `xprop -id ${xid} -f _MOTIF_WM_HINTS 32c ` +
-                `-set _MOTIF_WM_HINTS "2, 0, ${decor}, 0, 0"`);
-            return true;
+            return env.setDecorated(win, decorated);
         } catch (e) {
-            logError(e, 'Keysharp: SetWindowDecorated failed');
+            env.logError(e, 'Keysharp: SetWindowDecorated failed');
             return false;
         }
     }
@@ -1549,227 +1835,42 @@ export default class KeysharpExtension {
     // Truly async: the D-Bus reply is sent from the screenshot callback, so the shell's main loop
     // keeps running normally in between — no nested main-context pump inside the compositor (which
     // would re-dispatch input/D-Bus re-entrantly and unwind concurrent captures in LIFO order).
-    CaptureAreaAsync(params, invocation) {
-        if (!this._callerIsProviderPeer(invocation)) {
-            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
-                'Screen capture is only permitted through keysharp-desktop.');
+    _returnCapture(invocation, label, capture) {
+        if (!this._requireProviderPeer(invocation))
             return;
-        }
 
-        const [x, y, width, height] = params;
-        const empty = () => invocation.return_value(new GLib.Variant('(ay)', [new Uint8Array(0)]));
-
-        if (!this._validCaptureGeometry(width, height)) {
-            empty();
-            return;
-        }
-
-        try {
-            const screenshot = new Shell.Screenshot();
-            const stream = Gio.MemoryOutputStream.new_resizable();
-
-            screenshot.screenshot_area(x, y, width, height, stream, (_obj, result) => {
-                try {
-                    screenshot.screenshot_area_finish(result);
-                    stream.close(null);
-                    const bytes = new Uint8Array(
-                        stream.steal_as_bytes().get_data());
-                    invocation.return_value(new GLib.Variant('(ay)',
-                        [bytes.length <= MAX_CAPTURE_BYTES
-                            ? bytes : new Uint8Array(0)]));
-                } catch (e) {
-                    logError(e, 'Keysharp: CaptureArea screenshot failed');
-                    empty();
-                }
-            });
-        } catch (e) {
-            logError(e, 'Keysharp: CaptureArea failed');
-            empty();
-        }
-    }
-
-    // Window capture never leaves the compositor either: paint_to_content renders the window actor into an
-    // offscreen texture and composite_to_stream encodes a crop of it straight into a memory stream. Same
-    // async shape as CaptureArea -- the reply is sent from the composite callback, so the shell's main loop
-    // keeps running in between and concurrent captures never nest.
-    CaptureWindowAsync(params, invocation) {
-        if (!this._callerIsProviderPeer(invocation)) {
-            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.PERMISSION_DENIED,
-                'Screen capture is only permitted through keysharp-desktop.');
-            return;
-        }
-
-        const [handle, includeDecoration] = params;
         let replied = false;
-        let watchdog = 0;
         const reply = bytes => {
             if (replied)
                 return;
             replied = true;
-            if (watchdog !== 0) {
-                GLib.source_remove(watchdog);
-                watchdog = 0;
-            }
-            invocation.return_value(new GLib.Variant('(ay)',
-                [bytes && bytes.length <= MAX_CAPTURE_BYTES
-                    ? bytes : new Uint8Array(0)]));
+            const value = bytes && bytes.length > 0 && bytes.length <= MAX_CAPTURE_BYTES
+                ? bytes : new Uint8Array(0);
+            invocation.return_value(new GLib.Variant('(ay)', [value]));
         };
-        const empty = () => reply(null);
 
         try {
-            const win = this._findWindow(handle);
-
-            // get_compositor_private() is null independently of the window being live -- a managed window
-            // that is not composited yet has none -- so it is checked on its own.
-            const actor = (win && typeof win.get_compositor_private === 'function')
-                ? win.get_compositor_private() : null;
-
-            if (!actor || typeof actor.paint_to_content !== 'function') {
-                empty();
-                return;
-            }
-
-            // Bound the pixel count BEFORE painting. CaptureArea's rectangle arrives already bounded by the
-            // broker; a window's size is whatever its client asked for, and paint_to_content costs a full
-            // offscreen paint plus a GPU readback that no later check could refund.
-            const wanted = this._captureWindowRect(win, actor, Boolean(includeDecoration));
-
-            if (!wanted) {
-                empty();
-                return;
-            }
-
-            // paint_to_content returns null for a window it cannot paint WITHOUT setting a GError, so null is
-            // an ordinary outcome here and not something the catch below would ever see.
-            let content = actor.paint_to_content(null);
-            const texture = (content && typeof content.get_texture === 'function')
-                ? content.get_texture() : null;
-            const rect = texture ? this._fitCaptureRect(wanted, texture) : null;
-
-            if (!rect) {
-                empty();
-                return;
-            }
-
-            const stream = Gio.MemoryOutputStream.new_resizable();
-
-            // A composite that never calls back would hold the broker's whole capture budget until its
-            // 30s timeout, starving every other client. Reply on a shorter deadline so a dropped callback
-            // costs one empty capture instead.
-            watchdog = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 15000, () => {
-                watchdog = 0;
-                content = null;
-                reply(null);
-                return GLib.SOURCE_REMOVE;
-            });
-
-            this._compositeToStream(texture, rect, stream, (_obj, result) => {
-                // Clearing the reference here is what keeps the content -- and the texture it owns -- alive
-                // across the whole composite: the callback closes over it only because it is used.
-                content = null;
-                try {
-                    Shell.Screenshot.composite_to_stream_finish(result);
-                    stream.close(null);
-                    const bytes = new Uint8Array(
-                        stream.steal_as_bytes().get_data());
-                    reply(bytes);
-                } catch (e) {
-                    logError(e, 'Keysharp: CaptureWindow composite failed');
-                    empty();
-                }
-            });
+            capture(reply);
         } catch (e) {
-            logError(e, 'Keysharp: CaptureWindow failed');
-            empty();
+            env.logError(e, `Keysharp: ${label} failed`);
+            reply(null);
         }
     }
 
-    // shell_screenshot_composite_to_stream takes no GCancellable: 13 C parameters, and GI drops user_data,
-    // so the GJS-visible arity is 12. Byte-identical at gnome-shell 45, 46, 47 and 48. The 13-argument form
-    // is kept only as a fallback; marshalling is checked before any work starts, so a rejected first call
-    // can never composite twice.
-    _compositeToStream(texture, rect, stream, done) {
-        try {
-            Shell.Screenshot.composite_to_stream(texture,
-                rect.x, rect.y, rect.width, rect.height, 1,
-                null, 0, 0, 1, stream, done);
-        } catch (_e) {
-            Shell.Screenshot.composite_to_stream(texture,
-                rect.x, rect.y, rect.width, rect.height, 1,
-                null, 0, 0, 1, stream, null, done);
-        }
+    CaptureAreaAsync(params, invocation) {
+        this._returnCapture(invocation, 'CaptureArea', reply => {
+            if (env.captureArea === null)
+                reply(null);
+            else
+                env.captureArea(this, params, reply);
+        });
     }
 
-    // composite_to_stream crops with cogl_sub_texture_new, so x/y/width/height are offsets INSIDE the texture
-    // paint_to_content produced -- never stage coordinates. Passing a stage rect double-crops. That texture
-    // covers the actor's buffer rect at its resource scale, so the visible window is (frame - buffer) * scale.
-    // The same delta is the only thing includeDecoration can mean here: Mutter draws the shadow and invisible
-    // border in the buffer margin outside the frame rect, and server-side decoration is already inside it.
-    _captureWindowRect(win, actor, includeDecoration) {
-        let buffer = null;
-        let frame = null;
-
-        try {
-            buffer = win.get_buffer_rect();
-            frame = includeDecoration ? buffer : win.get_frame_rect();
-        } catch (_e) {
-            return null;
-        }
-
-        if (!buffer || !frame)
-            return null;
-
-        const scale = this._actorResourceScale(actor);
-        const x = Math.round((frame.x - buffer.x) * scale);
-        const y = Math.round((frame.y - buffer.y) * scale);
-        const width = Math.floor(frame.width * scale);
-        const height = Math.floor(frame.height * scale);
-
-        return x >= 0 && y >= 0 && this._validCaptureGeometry(width, height)
-            ? {x, y, width, height} : null;
+    CaptureWindowAsync(params, invocation) {
+        this._returnCapture(invocation, 'CaptureWindow', reply => {
+            env.captureWindow(this, params[0], Boolean(params[1]), reply);
+        });
     }
-
-    // The pre-flight rect comes from logical geometry, so rounding can put it a pixel past what was actually
-    // painted and cogl_sub_texture_new would fail the whole capture. Clamp to the real texture, and drop the
-    // capture if what is left no longer passes the same bounds.
-    _fitCaptureRect(rect, texture) {
-        let width = 0;
-        let height = 0;
-
-        try {
-            width = Number(texture.get_width());
-            height = Number(texture.get_height());
-        } catch (_e) {
-            return null;
-        }
-
-        if (!Number.isInteger(width) || !Number.isInteger(height)
-            || rect.x >= width || rect.y >= height)
-            return null;
-
-        const fitted = {
-            x: rect.x,
-            y: rect.y,
-            width: Math.min(rect.width, width - rect.x),
-            height: Math.min(rect.height, height - rect.y),
-        };
-
-        return this._validCaptureGeometry(fitted.width, fitted.height)
-            ? fitted : null;
-    }
-
-    _actorResourceScale(actor) {
-        try {
-            const scale = (typeof actor.get_resource_scale === 'function')
-                ? Number(actor.get_resource_scale()) : 1;
-            return Number.isFinite(scale) && scale > 0 && scale <= 16
-                ? scale : 1;
-        } catch (_e) {
-            return 1;
-        }
-    }
-
-    // Sensitive methods are exported only on authenticated private peer connections.
     _callerIsProviderPeer(invocation) {
         try {
             const connection = invocation.get_connection();
@@ -1868,7 +1969,7 @@ export default class KeysharpExtension {
                 const a = new St.Widget({ reactive: false, style: css });
                 a.set_position(ex, ey);
                 a.set_size(ew, eh);
-                this._addTopChromeClickThrough(a);
+                env.addClickThroughChrome(a);
                 edges.push(a);
             }
 
@@ -1882,7 +1983,7 @@ export default class KeysharpExtension {
             this._ensureOverlayCleanupTimer();
             return true;
         } catch (e) {
-            logError(e, 'Keysharp: ShowHighlight failed');
+            env.logError(e, 'Keysharp: ShowHighlight failed');
             return false;
         }
     }
@@ -1920,7 +2021,7 @@ export default class KeysharpExtension {
             return this._presentImageOverlay(key, owner, busName, x, y, width, height,
                 () => this._decodeImageFrame(pngData));
         } catch (e) {
-            logError(e, 'Keysharp: ShowImageOverlay failed');
+            env.logError(e, 'Keysharp: ShowImageOverlay failed');
             return false;
         }
     }
@@ -1969,7 +2070,7 @@ export default class KeysharpExtension {
 
         const actor = new Clutter.Actor({ reactive: false });
         this._updateImageActor(actor, frame, x, y, width, height);
-        this._addTopChromeClickThrough(actor);
+        env.addClickThroughChrome(actor);
         this._imageOverlays.set(key, {
             actor: actor,
             ownerKey: owner.key,
@@ -1988,7 +2089,7 @@ export default class KeysharpExtension {
             const entry = this._imageOverlays.get(this._overlayKey(id, owner.key));
 
             // No live actor for this id: report failure so the caller re-sends the pixels via ShowImageOverlay.
-            if (!entry || !entry.acto
+            if (!entry || !entry.actor
                 || !this._validOverlayGeometry(width, height))
                 return false;
 
@@ -1996,7 +2097,7 @@ export default class KeysharpExtension {
             entry.actor.set_size(width, height);
             return true;
         } catch (e) {
-            logError(e, 'Keysharp: MoveImageOverlay failed');
+            env.logError(e, 'Keysharp: MoveImageOverlay failed');
             return false;
         }
     }
@@ -2015,12 +2116,14 @@ export default class KeysharpExtension {
     }
 
     SupportsTooltip() {
-        return true;
+        return env.supportsTooltip;
     }
 
     // Draw or update a click-through tooltip label. slot identifies it per owner; empty text clears it.
     // Click-through and owner-tagged like the other overlays (see ShowHighlight for the mechanism).
     _showTooltip(slot, ownerKey, busName, text, x, y) {
+        if (!env.supportsTooltip)
+            return false;
         try {
             const owner = this._parseOverlayOwner(ownerKey);
             const key = this._overlayKey(slot, owner.key);
@@ -2047,7 +2150,7 @@ export default class KeysharpExtension {
                 style: 'background-color: #ffffe1; color: #000000; border: 1px solid #000000; padding: 6px; font-size: 10pt; font-family: sans-serif;',
             });
             actor.set_position(x, y);
-            this._addTopChromeClickThrough(actor);
+            env.addClickThroughChrome(actor);
 
             this._tooltips.set(key, {
                 actor: actor,
@@ -2059,12 +2162,14 @@ export default class KeysharpExtension {
             this._ensureOverlayCleanupTimer();
             return true;
         } catch (e) {
-            logError(e, 'Keysharp: ShowTooltip failed');
+            env.logError(e, 'Keysharp: ShowTooltip failed');
             return false;
         }
     }
 
     _hideTooltip(slot, ownerKey, _busName) {
+        if (!env.supportsTooltip)
+            return false;
         const owner = this._parseOverlayOwner(ownerKey);
         this._removeTooltipByKey(this._overlayKey(slot, owner.key));
 
@@ -2201,7 +2306,7 @@ export default class KeysharpExtension {
             if (!ok)
                 return true;
 
-            const stat = new TextDecoder().decode(bytes);
+            const stat = env.decodeBytes(bytes);
             const end = stat.lastIndexOf(')');
 
             if (end < 0 || end + 2 >= stat.length)
@@ -2421,7 +2526,7 @@ export default class KeysharpExtension {
             throw new Error('Invalid PNG overlay image.');
         const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         if (!signature.every((value, index) => data[index] === value)
-            || String.fromCharCode(...data.slice(12, 16)) !== 'IHDR')
+            || String.fromCharCode.apply(null, data.slice(12, 16)) !== 'IHDR')
             throw new Error('Invalid PNG overlay image.');
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         const width = view.getUint32(16, false);
@@ -2449,94 +2554,20 @@ export default class KeysharpExtension {
         };
     }
 
-    _createImageContent(frame) {
-        // Shell 48 removed Clutter.Image; St.ImageContent replaces it, with set_bytes()
-        // taking a leading Cogl.Context parameter. Give St.ImageContent a real preferred size (its default
-        // -1x-1 produces one shell warning per HUD frame on GNOME 50) and retain the pixels as GLib.Bytes so
-        // their lifetime is owned by the content rather than by GJS's temporary Uint8Array wrapper.
-        let content;
-        if (SHELL_MAJOR >= 48) {
-            content = new St.ImageContent({
-                preferredWidth: frame.width,
-                preferredHeight: frame.height,
-            });
-            const coglContext = global.stage.context.get_backend().get_cogl_context();
-            content.set_bytes(coglContext, frame.pixbuf.read_pixel_bytes(), frame.format,
-                frame.width, frame.height, frame.rowStride);
-        } else {
-            content = new Clutter.Image();
-            content.set_data(frame.pixels, frame.format, frame.width, frame.height, frame.rowStride);
-        }
-
-        return content;
-    }
-
     _updateImageActor(actor, frame, x, y, width, height) {
-        let content = actor.get_content();
-
-        // Both content setters replace the Cogl texture; update that texture in place while the size is stable.
-        if (content && actor._keysharpImageWidth === frame.width &&
-            actor._keysharpImageHeight === frame.height) {
-            try {
-                let updated = false;
-
-                if (SHELL_MAJOR >= 48 && typeof content.get_texture === 'function') {
-                    const texture = content.get_texture();
-
-                    if (texture && typeof texture.set_region === 'function') {
-                        updated = texture.set_region(0, 0, 0, 0,
-                            frame.width, frame.height, frame.width, frame.height,
-                            frame.format, frame.rowStride, frame.pixels);
-
-                        if (updated)
-                            content.invalidate();
-                    }
-                } else if (typeof content.set_area === 'function') {
-                    const area = new CairoGI.RectangleInt();
-                    area.x = 0;
-                    area.y = 0;
-                    area.width = frame.width;
-                    area.height = frame.height;
-                    updated = content.set_area(frame.pixels, frame.format, area, frame.rowStride);
-                }
-
-                if (!updated)
-                    content = null;
-            } catch (_e) {
-                content = null;
-            }
-        } else {
-            content = null;
-        }
-
-        if (!content) {
-            content = this._createImageContent(frame);
+        const previous = actor.get_content();
+        const sameSize = actor._keysharpImageWidth === frame.width
+            && actor._keysharpImageHeight === frame.height;
+        const content = env.makeImageContent(previous, frame, sameSize);
+        if (!content)
+            throw new Error('Could not create image overlay content.');
+        if (content !== previous)
             actor.set_content(content);
-            actor._keysharpImageWidth = frame.width;
-            actor._keysharpImageHeight = frame.height;
-        }
-
+        actor._keysharpImageWidth = frame.width;
+        actor._keysharpImageHeight = frame.height;
         actor.set_position(x, y);
         actor.set_size(width, height);
     }
-
-    // Add a reactive:false actor to the top chrome as a CLICK-THROUGH overlay (clicks fall through to the
-    // window beneath). GNOME Shell 50 removed the `affectsInputRegion` chrome parameter: the shell input
-    // region is now built only from REACTIVE actors, so a reactive:false actor is click-through with no
-    // flag. Shells 45–49 still need `affectsInputRegion: false`, or the non-reactive chrome keeps clipping
-    // the input region and eats clicks. Passing the param on 50 throws "unrecognized parameter
-    // affectsInputRegion" from _trackActor — and because addTopChrome adds the actor to uiGroup BEFORE it
-    // validates params, the throw leaves a visible, untracked, un-reapable orphan actor on stage while the
-    // caller reports failure (which duplicated the overlay via the Eto fallback and persisted till logout).
-    _addTopChromeClickThrough(actor) {
-        if (SHELL_MAJOR >= 50)
-            Main.layoutManager.addTopChrome(actor);
-        else
-            Main.layoutManager.addTopChrome(actor, { affectsInputRegion: false });
-    }
-
-    // Emit a generic WindowEvent for the given window, resolving its full info JSON
-    // (falling back to a bare { id } if the window is mid-teardown).
     _emitWindowEvent(type, win) {
         if (!win) return;
         let json;
@@ -2668,68 +2699,52 @@ export default class KeysharpExtension {
 
     _windowInfo(win) {
         const frame = win.get_frame_rect();
-
-        // The surface as the client drew it, shadow included. That is precisely why it is wrong as a client
-        // origin (see below) and right as the surface origin: a Wayland client is never told where its surface
-        // sits, so this is the only thing its own coordinates can be resolved against. Absent on a compositor
-        // that cannot answer, which leaves the consumer uncorrected rather than wrong.
         let buffer = null;
         try {
-            const b = win.get_buffer_rect();
-            if (b) buffer = {x: b.x, y: b.y, width: b.width, height: b.height};
+            const value = win.get_buffer_rect();
+            if (value)
+                buffer = {x: value.x, y: value.y,
+                    width: value.width, height: value.height};
         } catch (_e) {
         }
 
-        // get_maximized() was removed in Mutter 50; use the individual boolean
-        // GObject properties instead, which are stable across all versions.
-        const maximized = !!(win.maximized_horizontally && win.maximized_vertically);
-
-        // Use frame_rect for both frame and client geometry. get_buffer_rect() extends
-        // outside the visible window to include compositor shadow/glow effects, so using
-        // it as the client origin produces a ~20 px negative offset in coordinate
-        // transforms. On GNOME Wayland, apps use client-side decorations and their
-        // entire surface is the frame rect, so frame == client for coordinate purposes.
-        // Windows on other workspaces still "exist" (enumeration/matching), but must not win
-        // at-point hit-tests — global.get_window_actors() spans ALL workspaces.
-        let onCurrentWorkspace = true;
-        let workspaceKnown = false;
+        let alwaysOnTop = false;
         try {
-            const ws = win.get_workspace();
-            onCurrentWorkspace = win.is_on_all_workspaces()
-                || (ws !== null && ws === global.workspace_manager.get_active_workspace());
-            workspaceKnown = true;
+            alwaysOnTop = typeof win.is_above === 'function'
+                ? Boolean(win.is_above()) : Boolean(win.above);
         } catch (_e) {
         }
 
+        const extras = env.windowExtras(win);
         const snapshot = {
-            id:        String(win.get_stable_sequence()),
-            title:     win.get_title()            ?? '',
-            appId:     win.get_wm_class()         ?? win.get_wm_class_instance() ?? '',
-            pid:       this._clientPid(win),
-            frame:     {x: frame.x, y: frame.y, width: frame.width, height: frame.height},
-            client:    {x: frame.x, y: frame.y, width: frame.width, height: frame.height},
-            buffer:    buffer,
-            active:    !!win.appears_focused,
-            minimized: !!win.minimized,
-            maximized,
-            visible:   !win.minimized,
-            alwaysOnTop: !!win.is_above(),
-            decorated:   !!win.decorated,
+            id: String(win.get_stable_sequence()),
+            title: win.get_title() || '',
+            appId: win.get_wm_class() || win.get_wm_class_instance() || '',
+            pid: this._clientPid(win),
+            frame: {x: frame.x, y: frame.y, width: frame.width, height: frame.height},
+            client: {x: frame.x, y: frame.y, width: frame.width, height: frame.height},
+            buffer: buffer,
+            active: Boolean(win.appears_focused),
+            minimized: Boolean(win.minimized),
+            maximized: Boolean(win.maximized_horizontally && win.maximized_vertically),
+            visible: !win.minimized,
+            alwaysOnTop: alwaysOnTop,
+            decorated: typeof win.decorated === 'boolean' ? win.decorated : true,
             transparency: this._windowOpacity(win),
-            onCurrentWorkspace,
         };
-        snapshot.validFields = ['id', 'title', 'appId', 'frame', 'active',
-            'minimized', 'maximized', 'alwaysOnTop'];
-        if (snapshot.pid > 0) snapshot.validFields.push('pid');
-        if (buffer !== null) snapshot.validFields.push('buffer');
-        if (typeof win.decorated === 'boolean') snapshot.validFields.push('decorated');
-        if (workspaceKnown) snapshot.validFields.push('onCurrentWorkspace');
+        Object.assign(snapshot, extras.values);
+        snapshot.validFields = ['id', 'title', 'appId', 'frame', 'client', 'active',
+            'minimized', 'maximized', 'visible', 'alwaysOnTop', 'transparency'];
+        if (snapshot.pid > 0)
+            snapshot.validFields.push('pid');
+        if (buffer !== null)
+            snapshot.validFields.push('buffer');
+        if (typeof win.decorated === 'boolean')
+            snapshot.validFields.push('decorated');
+        for (const field of extras.validFields)
+            snapshot.validFields.push(field);
         return snapshot;
     }
-
-    // Current whole-window opacity, 0 (transparent)..255 (opaque), read back from the compositor actor.
-    // Mirrors SetWindowOpacity's actor access so WinGetTransparent round-trips; defaults to opaque when
-    // the window has no live actor. Matches the Cinnamon extension's opacity() helper.
     _windowOpacity(win) {
         try {
             const actor = (typeof win.get_compositor_private === 'function')
@@ -2764,3 +2779,6 @@ export default class KeysharpExtension {
         return null;
     }
 }
+
+
+export default class KeysharpExtension extends KeysharpExtensionCore {}

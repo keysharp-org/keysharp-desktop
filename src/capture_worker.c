@@ -34,13 +34,6 @@
 #include <unistd.h>
 
 #define KSD_CAPTURE_WORKER_FD 3
-/* v3 carries the backend. v2 did not, and the worker guessed the route from
- * the payload shape instead -- which sent every KWin capture to the X11 path,
- * because an area capture looks identical either way. That path then refused
- * the XWayland server KWin runs, so KWin area capture could never succeed. */
-/* v4 carries a persist flag. A worker that persists serves many requests on
- * one display connection, which is where the fork, the exec, the privilege
- * drop and the connect stop being per-query costs. */
 #define KSD_CAPTURE_WORKER_VERSION 4u
 #define KSD_CAPTURE_WORKER_HEADER_SIZE 32u
 #define KSD_CAPTURE_WORKER_MAX_GROUPS 256u
@@ -81,15 +74,6 @@ typedef struct worker_environment {
     char bus[192];
     char *values[4];
 } worker_environment;
-
-static uint64_t monotonic_milliseconds(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0u;
-    return (uint64_t)now.tv_sec * 1000u
-        + (uint64_t)now.tv_nsec / 1000000u;
-}
 
 static bool same_identity(const ksp_identity *left,
                           const ksp_identity *right)
@@ -279,10 +263,7 @@ done:
     return true;
 }
 
-/* What the worker will run, for both the parent that decides whether to fork
- * and the child that decides what to dispatch. One definition, because two
- * that were meant to agree did not, and the disagreement was invisible: the
- * parent simply refused, with a diagnostic about something else. */
+/* Shared admission rule for the parent and worker. */
 bool ksd_capture_worker_request_valid(const ksd_frame *request)
 {
     return ksd_local_capture_request_valid(request)
@@ -613,8 +594,10 @@ void ksd_capture_worker_test_authority_watch(int descriptor)
 }
 #endif
 
-int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
-                             pid_t session_pid, uint32_t backend)
+static bool launch_worker(const ksp_identity *identity, gid_t gid,
+                          const ksd_frame *request, pid_t session_pid,
+                          uint32_t backend, bool persistent,
+                          int *parent_socket, pid_t *worker_pid)
 {
     worker_environment environment;
     gid_t *groups = NULL;
@@ -622,21 +605,27 @@ int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
     int executable = -1;
     int sockets[2] = { -1, -1 };
     int capture_pipe[2] = { -1, -1 };
-    pid_t worker = -1;
-    int kept = -1;
     int child_socket = -1;
     int child_executable = -1;
+    pid_t worker = -1;
+    bool launched = false;
 
+    if (parent_socket == NULL || worker_pid == NULL)
+        return false;
+    *parent_socket = -1;
+    *worker_pid = -1;
     if (identity == NULL
         || !capture_environment(identity, &environment)
         || !capture_groups(identity, &groups, &group_count))
         goto done;
     executable = open(KSD_CAPTURE_WORKER_PATH,
                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int socket_type = persistent ? SOCK_STREAM : SOCK_SEQPACKET;
+    uint32_t timeout = persistent ? 5000u : KSD_CAPTURE_WORKER_TIMEOUT_MS;
     if (!trusted_self(executable)
-        || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0
-        || !set_socket_timeout(sockets[0], 5000u)
-        || !set_socket_timeout(sockets[1], 5000u)
+        || socketpair(AF_UNIX, socket_type | SOCK_CLOEXEC, 0, sockets) != 0
+        || !set_socket_timeout(sockets[0], timeout)
+        || !set_socket_timeout(sockets[1], timeout)
         || !create_capture_pipe(capture_pipe))
         goto done;
     child_socket = fcntl(sockets[1], F_DUPFD_CLOEXEC, 10);
@@ -646,32 +635,26 @@ int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
     worker = fork();
     if (worker == 0) {
         if (dup2(child_socket, KSD_CAPTURE_WORKER_FD) < 0
-            || dup2(child_executable, 4) < 0)
-            _exit(1);
-        char *spawn_argv[] = { KSD_CAPTURE_WORKER_PATH, NULL };
-
-        close_range(5, UINT_MAX, 0);
-        fexecve(4, spawn_argv, environment.values);
-        _exit(1);
+            || dup2(child_executable, 4) < 0
+            || close_range(5u, UINT_MAX, 0) != 0)
+            _exit(126);
+        char *arguments[] = { KSD_CAPTURE_WORKER_PATH, NULL };
+        fexecve(4, arguments, environment.values);
+        _exit(127);
     }
     if (worker < 0)
         goto done;
     close(sockets[1]);
     sockets[1] = -1;
-    if (!send_bootstrap(sockets[0], identity, gid, groups, group_count, NULL,
-                        capture_pipe, session_pid, backend, true))
+    if (!send_bootstrap(sockets[0], identity, gid, groups, group_count,
+                        request, capture_pipe, session_pid, backend,
+                        persistent))
         goto done;
-    uint8_t ready = 0u;
-    if (!ksd_read_all(sockets[0], &ready, sizeof(ready)) || ready != 1u)
-        goto done;
-    pthread_t reaper;
-    if (pthread_create(&reaper, NULL, reap_persistent_worker,
-                        (void *)(intptr_t)worker) != 0)
-        goto done;
-    (void)pthread_detach(reaper);
-    worker = -1;
-    kept = sockets[0];
+    *parent_socket = sockets[0];
+    *worker_pid = worker;
     sockets[0] = -1;
+    worker = -1;
+    launched = true;
 
 done:
     if (worker > 0)
@@ -680,18 +663,42 @@ done:
         close(child_socket);
     if (child_executable >= 0)
         close(child_executable);
-    free(groups);
     if (executable >= 0)
         close(executable);
-    if (capture_pipe[0] >= 0)
-        close(capture_pipe[0]);
-    if (capture_pipe[1] >= 0)
-        close(capture_pipe[1]);
-    if (sockets[0] >= 0)
-        close(sockets[0]);
-    if (sockets[1] >= 0)
-        close(sockets[1]);
-    return kept;
+    for (size_t index = 0u; index < 2u; index++) {
+        if (capture_pipe[index] >= 0)
+            close(capture_pipe[index]);
+        if (sockets[index] >= 0)
+            close(sockets[index]);
+    }
+    free(groups);
+    return launched;
+}
+
+int ksd_capture_worker_spawn(const ksp_identity *identity, gid_t gid,
+                             pid_t session_pid, uint32_t backend)
+{
+    int socket = -1;
+    pid_t worker = -1;
+
+    if (!launch_worker(identity, gid, NULL, session_pid, backend, true,
+                       &socket, &worker))
+        return -1;
+    uint8_t ready = 0u;
+    if (!ksd_read_all(socket, &ready, sizeof(ready)) || ready != 1u) {
+        close(socket);
+        terminate_worker(worker);
+        return -1;
+    }
+    pthread_t reaper;
+    if (pthread_create(&reaper, NULL, reap_persistent_worker,
+                       (void *)(intptr_t)worker) != 0) {
+        close(socket);
+        terminate_worker(worker);
+        return -1;
+    }
+    (void)pthread_detach(reaper);
+    return socket;
 }
 
 void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
@@ -701,83 +708,27 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                                 uint32_t backend,
                                 ksd_operation_result *result)
 {
-    worker_environment environment = { 0 };
-    gid_t *groups = NULL;
-    size_t group_count = 0u;
-    int executable = -1;
-    int sockets[2] = { -1, -1 };
-    int capture_pipe[2] = { -1, -1 };
+    int socket = -1;
     pid_t worker = -1;
     bool response_received = false;
 
     if (result == NULL)
         return;
     ksd_result_init(result);
-    /* The parent must admit exactly what the child will run. It used to admit
-     * only captures, while the child accepts captures, X11 verbs and Wayland
-     * verbs -- so every non-capture verb was refused here, before the fork,
-     * with a message about the capture worker. The X11 coordinate group had
-     * been unreachable that way since it landed, and no test saw it because
-     * every test calls the backend functions directly rather than through this
-     * path. The two admission sets are now one expression, and a gate pins
-     * them equal. */
     if (identity == NULL || request == NULL || keep_running == NULL
-        || !ksd_capture_worker_request_valid(request)
-        || !capture_environment(identity, &environment)
-        || !capture_groups(identity, &groups, &group_count)) {
+        || !ksd_capture_worker_request_valid(request)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "capture worker identity is unavailable");
         goto done;
     }
-    executable = open(KSD_CAPTURE_WORKER_PATH,
-                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (!trusted_self(executable)
-        || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC,
-                      0, sockets) != 0
-        || !create_capture_pipe(capture_pipe)
-        || !set_socket_timeout(sockets[0], KSD_CAPTURE_WORKER_TIMEOUT_MS)
-        || !set_socket_timeout(sockets[1], KSD_CAPTURE_WORKER_TIMEOUT_MS)) {
+    if (!launch_worker(identity, gid, request, session_pid, backend, false,
+                       &socket, &worker)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "capture worker could not be started");
         goto done;
     }
-    int child_socket = fcntl(sockets[1], F_DUPFD_CLOEXEC, 10);
-    int child_executable = fcntl(executable, F_DUPFD_CLOEXEC, 10);
-    if (child_socket < 0 || child_executable < 0) {
-        if (child_socket >= 0) close(child_socket);
-        if (child_executable >= 0) close(child_executable);
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "capture worker descriptors are unavailable");
-        goto done;
-    }
-    worker = fork();
-    if (worker == 0) {
-        if (dup2(child_socket, KSD_CAPTURE_WORKER_FD) < 0
-            || dup2(child_executable, 4) < 0
-            || close_range(5u, UINT_MAX, 0) != 0)
-            _exit(126);
-        char *worker_argv[] = { KSD_CAPTURE_WORKER_PATH, NULL };
-        fexecve(4, worker_argv, environment.values);
-        _exit(127);
-    }
-    close(child_socket);
-    close(child_executable);
-    close(sockets[1]);
-    sockets[1] = -1;
-    if (worker < 0 || !send_bootstrap(sockets[0], identity, gid,
-                                      groups, group_count, request,
-                                      capture_pipe, session_pid,
-                                      backend, false)) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "capture worker bootstrap failed");
-        goto done;
-    }
-    close(capture_pipe[0]);
-    close(capture_pipe[1]);
-    capture_pipe[0] = -1;
-    capture_pipe[1] = -1;
-    (void)shutdown(sockets[0], SHUT_WR);
-    uint64_t deadline = monotonic_milliseconds()
+    (void)shutdown(socket, SHUT_WR);
+    uint64_t deadline = ksd_monotonic_milliseconds()
         + KSD_CAPTURE_WORKER_TIMEOUT_MS;
     for (;;) {
         if (!keep_running(user_data)) {
@@ -785,7 +736,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                              "permission changed during capture");
             goto done;
         }
-        uint64_t now = monotonic_milliseconds();
+        uint64_t now = ksd_monotonic_milliseconds();
         if (now == 0u || now >= deadline) {
             ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
                              "capture worker timed out");
@@ -794,7 +745,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
         int wait_ms = (int)(deadline - now > 250u
             ? 250u : deadline - now);
         struct pollfd item = {
-            .fd = sockets[0],
+            .fd = socket,
             .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
         };
         int ready = poll(&item, 1u, wait_ms);
@@ -813,7 +764,7 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
                              "capture worker exited without a result");
             goto done;
         }
-        if (!receive_worker_response(sockets[0], result)) {
+        if (!receive_worker_response(socket, result)) {
             ksd_result_error(result, KSD_STATUS_INTERNAL, 0u,
                              "capture worker returned an invalid result");
             goto done;
@@ -823,17 +774,8 @@ void ksd_capture_worker_execute(const ksp_identity *identity, gid_t gid,
     }
 
 done:
-    if (sockets[0] >= 0)
-        close(sockets[0]);
-    if (sockets[1] >= 0)
-        close(sockets[1]);
-    if (capture_pipe[0] >= 0)
-        close(capture_pipe[0]);
-    if (capture_pipe[1] >= 0)
-        close(capture_pipe[1]);
-    if (executable >= 0)
-        close(executable);
-    free(groups);
+    if (socket >= 0)
+        close(socket);
     if (worker > 0) {
         int status;
         pid_t waited;
@@ -1127,11 +1069,91 @@ unsigned ksd_capture_worker_test_opens;
 #define KSD_NOTE_DISPLAY_OPEN() ((void)0)
 #endif
 
+typedef struct ksd_display_backend {
+    uint32_t backend;
+    bool (*request_valid)(const ksd_frame *request);
+    ksd_status (*open)(pid_t session_pid, void **connection);
+    bool (*execute)(void *connection, const ksd_frame *request,
+                    ksd_operation_result *result);
+    void (*close)(void *connection);
+    const char *open_error;
+} ksd_display_backend;
+
+static ksd_status open_x11(pid_t session_pid, void **connection)
+{
+    struct ksd_x11 *opened = NULL;
+    ksd_status status = ksd_x11_open_for_session(session_pid, &opened);
+    *connection = opened;
+    return status;
+}
+
+static bool execute_x11(void *connection, const ksd_frame *request,
+                        ksd_operation_result *result)
+{
+    return ksd_x11_execute_on(connection, request, result);
+}
+
+static void close_x11(void *connection)
+{
+    ksd_x11_close(connection);
+}
+
+static ksd_status open_wayland(pid_t session_pid, void **connection)
+{
+    struct ksd_wayland *opened = NULL;
+    ksd_status status = ksd_wayland_open_for_session(session_pid, &opened);
+    *connection = opened;
+    return status;
+}
+
+static bool execute_wayland(void *connection, const ksd_frame *request,
+                            ksd_operation_result *result)
+{
+    return ksd_wayland_execute_on(connection, request, result);
+}
+
+static void close_wayland(void *connection)
+{
+    ksd_wayland_close(connection);
+}
+
+static const ksd_display_backend display_backends[] = {
+    {
+        .backend = KSD_BACKEND_X11,
+        .request_valid = ksd_x11_request_valid,
+        .open = open_x11,
+        .execute = execute_x11,
+        .close = close_x11,
+        .open_error = "could not open the X display for this session",
+    },
+    {
+        .backend = KSD_BACKEND_GENERIC,
+        .request_valid = ksd_wayland_request_valid,
+        .open = open_wayland,
+        .execute = execute_wayland,
+        .close = close_wayland,
+        .open_error = "could not reach the compositor for this session",
+    },
+};
+
+static const ksd_display_backend *display_backend(uint32_t backend)
+{
+    for (size_t index = 0u;
+         index < sizeof(display_backends) / sizeof(display_backends[0]);
+         index++)
+        if (display_backends[index].backend == backend)
+            return &display_backends[index];
+    return NULL;
+}
+
 static bool serve_persistently(uint32_t backend, pid_t session_pid)
 {
-    struct ksd_x11 *x11_connection = NULL;
-    struct ksd_wayland *wayland_connection = NULL;
+    const ksd_display_backend *display = display_backend(backend);
+    void *connection = NULL;
     bool ok = true;
+
+    if (display == NULL)
+        return false;
 
     for (;;) {
         uint8_t header[KSD_FRAME_HEADER_SIZE];
@@ -1184,59 +1206,33 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
          * the authority closes our socket. The process deadline bounds that
          * work without limiting an idle worker's lifetime. */
         (void)alarm(capture ? 40u : 10u);
-        if (backend == KSD_BACKEND_X11) {
-            if (x11_connection == NULL) {
-                ksd_status status = ksd_x11_open_for_session(session_pid,
-                                                             &x11_connection);
-                if (status == KSD_STATUS_OK)
-                    KSD_NOTE_DISPLAY_OPEN();
-                else
-                    ksd_result_error(&result, status, 0u,
-                                     "could not open the X display for this "
-                                     "session");
-            }
-            if (x11_connection != NULL
-                && request.opcode == KSD_OP_WINDOW_WATCH
-                && request.payload_length == 0u) {
-                ok = ksd_x11_watch_run(x11_connection, KSD_CAPTURE_WORKER_FD,
-                                       request.request_id);
-                (void)alarm(0u);
-                ksd_result_clear(&result);
-                free(body);
-                break;
-            }
-            if (x11_connection != NULL)
-                alive = ksd_x11_execute_on(x11_connection, &request, &result);
-        } else {
-            if (wayland_connection == NULL) {
-                ksd_status status =
-                    ksd_wayland_open_for_session(session_pid,
-                                                 &wayland_connection);
-                if (status == KSD_STATUS_OK)
-                    KSD_NOTE_DISPLAY_OPEN();
-                else
-                    ksd_result_error(&result, status, 0u,
-                                     "could not reach the compositor for this "
-                                     "session");
-            }
-            if (wayland_connection != NULL)
-                alive = ksd_wayland_execute_on(wayland_connection, &request,
-                                               &result);
+        if (connection == NULL) {
+            ksd_status status = display->open(session_pid, &connection);
+            if (status == KSD_STATUS_OK)
+                KSD_NOTE_DISPLAY_OPEN();
+            else
+                ksd_result_error(&result, status, 0u, display->open_error);
         }
+        if (connection != NULL && backend == KSD_BACKEND_X11
+            && request.opcode == KSD_OP_WINDOW_WATCH
+            && request.payload_length == 0u) {
+            ok = ksd_x11_watch_run(connection, KSD_CAPTURE_WORKER_FD,
+                                   request.request_id);
+            (void)alarm(0u);
+            ksd_result_clear(&result);
+            free(body);
+            break;
+        }
+        if (connection != NULL)
+            alive = display->execute(connection, &request, &result);
         (void)alarm(0u);
         /* A dead connection is dropped so the NEXT request reopens. The
          * current answer still goes back: the caller asked one question and
          * gets one answer, rather than silence because the display chose that
          * moment to go. */
         if (!alive) {
-            if (x11_connection != NULL) {
-                ksd_x11_close(x11_connection);
-                x11_connection = NULL;
-            }
-            if (wayland_connection != NULL) {
-                ksd_wayland_close(wayland_connection);
-                wayland_connection = NULL;
-            }
+            display->close(connection);
+            connection = NULL;
         }
 
         bool capture_fd = result.status == KSD_STATUS_OK
@@ -1273,10 +1269,8 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
         if (!ok)
             break;
     }
-    if (x11_connection != NULL)
-        ksd_x11_close(x11_connection);
-    if (wayland_connection != NULL)
-        ksd_wayland_close(wayland_connection);
+    if (connection != NULL)
+        display->close(connection);
     return ok;
 }
 
@@ -1370,32 +1364,31 @@ int ksd_capture_worker_main(int argc, char **argv)
     bool unpacked = ksd_frame_unpack(packed, frame_length, public_magic,
         KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
         KSD_CAPTURE_WORKER_MAX_REQUEST, true, &request);
-    /* Routed by the BACKEND the authority resolved, not by the shape of the
-     * payload. Shape cannot tell these apart: an area capture is the same
-     * sixteen bytes whoever will serve it, so guessing sent every KWin capture
-     * down the X11 path, where it met an XWayland server and was refused. The
-     * backend is the only thing that actually decides, and it now travels. */
-    bool x11 = unpacked && header.backend == KSD_BACKEND_X11
-        && ksd_x11_request_valid(&request);
-    bool wayland = unpacked && header.backend == KSD_BACKEND_GENERIC
-        && ksd_wayland_request_valid(&request);
+    const ksd_display_backend *display = unpacked
+        ? display_backend(header.backend) : NULL;
+    bool display_request = display != NULL && display->request_valid(&request);
     if (!unpacked || request.flags != 0u || request.request_id == 0u
-        || !(x11 || wayland || ksd_local_capture_request_valid(&request))) {
+        || !(display_request || ksd_local_capture_request_valid(&request))) {
         if (unpacked)
             ksd_frame_clear(&request);
         goto failed;
     }
-    if (x11 || wayland) {
+    ksd_result_init(&result);
+    if (display_request) {
         /* Neither display backend needs the capture pipe or the spool, and
          * holding them open across a round trip would keep descriptors the
          * operation cannot use. */
         close(capture_pipe[0]);
         close(capture_pipe[1]);
         close(capture_spool);
-        if (x11)
-            ksd_x11_execute(&request, header.session_pid, &result);
-        else
-            ksd_wayland_execute(&request, header.session_pid, &result);
+        void *connection = NULL;
+        ksd_status status = display->open(header.session_pid, &connection);
+        if (status != KSD_STATUS_OK)
+            ksd_result_error(&result, status, 0u, display->open_error);
+        else {
+            (void)display->execute(connection, &request, &result);
+            display->close(connection);
+        }
     } else {
         ksd_local_capture_execute(&request, capture_pipe[0], capture_pipe[1],
                                   capture_spool, trusted_kwin_pid, &result);

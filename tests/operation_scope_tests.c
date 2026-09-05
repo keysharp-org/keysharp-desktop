@@ -217,6 +217,10 @@ int main(void)
             & KSD_OPERATION_CAPTURE_WINDOW) != 0u);
     assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
             & KSD_OPERATION_CAPTURE_AREA) == 0u);
+    assert((ksd_backend_operations(KSD_BACKEND_GNOME)
+            & KSD_OPERATION_WINDOW_QUERY) != 0u);
+    assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
+            & KSD_OPERATION_WINDOW_QUERY) != 0u);
     /* KWin serves the two captures from the forked worker and everything else
      * through the script, over the socket its daemon hands over. Pinned as an
      * exact mask so a verb cannot be advertised before the script implements
@@ -225,7 +229,7 @@ int main(void)
            == (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW
                | KSD_OPERATION_KEYBOARD_STATE
                | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
-               | KSD_OPERATION_WINDOW_HANDLES
+               | KSD_OPERATION_WINDOW_HANDLES | KSD_OPERATION_WINDOW_QUERY
                | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
                | KSD_OPERATION_WINDOW_CLOSE
                | KSD_OPERATION_WINDOW_MOVE_RESIZE

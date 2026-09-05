@@ -33,7 +33,7 @@ static void bench_keyboard(ksd_x11 *connection)
 {
     ksd_operation_result result;
     ksd_result_init(&result);
-    ksd_x11_keyboard_state(connection, &result);
+    ksd_x11_keyboard_state_since(connection, NULL, 0u, &result);
     assert(result.status == KSD_STATUS_OK && result.tail_length > 4u);
     uint32_t full_bytes = result.tail_length;
     char *json = calloc(result.tail_length, 1u);

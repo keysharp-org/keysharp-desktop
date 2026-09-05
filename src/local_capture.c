@@ -2,6 +2,7 @@
 #include "install_mode.h"
 
 #include "protocol.h"
+#include "transport.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -30,18 +31,9 @@ static const uint8_t capture_metadata_magic[4] = { 'K', 'S', 'C', 'M' };
 
 static GDBusConnection *session_bus;
 
-static uint64_t monotonic_milliseconds(void)
-{
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        return 0u;
-    return (uint64_t)now.tv_sec * 1000u
-        + (uint64_t)now.tv_nsec / 1000000u;
-}
-
 static int remaining_timeout(uint64_t deadline)
 {
-    uint64_t now = monotonic_milliseconds();
+    uint64_t now = ksd_monotonic_milliseconds();
     if (now == 0u || now >= deadline)
         return 0;
     uint64_t remaining = deadline - now;
@@ -121,7 +113,7 @@ bool ksd_local_capture_kwin_owner_pid(uid_t expected_uid, pid_t *owner_pid)
     char *destination = NULL;
     pid_t pid = 0;
     bool valid = connection != NULL && query_kwin_owner(connection,
-        monotonic_milliseconds() + 5000u, expected_uid, &destination, &pid);
+        ksd_monotonic_milliseconds() + 5000u, expected_uid, &destination, &pid);
     g_free(destination);
     if (error != NULL)
         g_error_free(error);
@@ -323,10 +315,7 @@ bool ksd_capture_child_endpoints_valid(int write_descriptor,
         || write_descriptor == metadata_descriptor
         || fstat(write_descriptor, &status) != 0
         || !S_ISFIFO(status.st_mode)
-        /* The same descriptor ksd_capture_pipe_valid inspected before the
-         * worker dropped privileges, so it has to be judged by the same rule.
-         * Hardcoding root here made the two disagree on one pipe: on a user
-         * installation this rejected a pipe the other had just accepted. */
+        /* Use the same ownership rule before and after dropping privileges. */
         || !ksd_install_owner_trusted(status.st_uid)
         || status.st_gid != ksd_install_group()
         || (status.st_mode & 0777u) != 0u
@@ -346,24 +335,6 @@ bool ksd_capture_child_endpoints_valid(int write_descriptor,
             return false;
     }
     return true;
-}
-
-static bool wait_for_pipe(int descriptor, uint64_t deadline)
-{
-    for (;;) {
-        int timeout = remaining_timeout(deadline);
-        if (timeout <= 0)
-            return false;
-        struct pollfd item = {
-            .fd = descriptor,
-            .events = POLLIN | POLLHUP | POLLERR,
-        };
-        int ready = poll(&item, 1u, timeout);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        return ready > 0 && (item.revents & (POLLIN | POLLHUP)) != 0
-            && (item.revents & (POLLERR | POLLNVAL)) == 0;
-    }
 }
 
 bool ksd_capture_pipe_drain_until(int pipe_descriptor,
@@ -386,7 +357,7 @@ bool ksd_capture_pipe_drain_until(int pipe_descriptor,
         if (count < 0 && errno == EINTR)
             continue;
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (!wait_for_pipe(pipe_descriptor, deadline))
+            if (!ksd_wait_until(pipe_descriptor, POLLIN, deadline))
                 return false;
             continue;
         }
@@ -413,7 +384,7 @@ static bool read_exact(int descriptor, void *data, size_t length,
         if (count < 0 && errno == EINTR)
             continue;
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            if (!wait_for_pipe(descriptor, deadline))
+            if (!ksd_wait_until(descriptor, POLLIN, deadline))
                 return false;
             continue;
         }
@@ -437,7 +408,7 @@ static bool require_pipe_eof(int descriptor, uint64_t deadline)
         if (errno == EINTR)
             continue;
         if ((errno == EAGAIN || errno == EWOULDBLOCK)
-            && wait_for_pipe(descriptor, deadline))
+            && ksd_wait_until(descriptor, POLLIN, deadline))
             continue;
         return false;
     }
@@ -788,7 +759,7 @@ void ksd_local_capture_execute(const ksd_frame *request,
     int child_write = -1;
     int child_metadata = -1;
     pid_t child = -1;
-    uint64_t deadline = monotonic_milliseconds() + KSD_CAPTURE_TIMEOUT_MS;
+    uint64_t deadline = ksd_monotonic_milliseconds() + KSD_CAPTURE_TIMEOUT_MS;
     const int capture_pipe[2] = { image_fd, image_write_fd };
     bool drain_valid = false;
     bool metadata_valid = false;

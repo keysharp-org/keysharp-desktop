@@ -4,8 +4,10 @@
 #include "wl_hypr.h"
 #include "wl_cosmic_windows.h"
 #include "wl_keyboard.h"
+#include "transport.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,12 +117,14 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
-static int64_t monotonic_ms(void)
+static int remaining_milliseconds(uint64_t deadline)
 {
-    struct timespec now;
+    uint64_t now = ksd_monotonic_milliseconds();
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    if (now == 0u || now >= deadline)
+        return 0;
+    uint64_t remaining = deadline - now;
+    return remaining > INT_MAX ? INT_MAX : (int)remaining;
 }
 
 static void sync_done(void *data, struct wl_callback *callback,
@@ -139,18 +143,18 @@ bool ksd_wayland_dispatch_until(ksd_wayland *connection,
                                 bool (*complete)(void *), void *data,
                                 int timeout_ms)
 {
-    int64_t deadline;
+    uint64_t deadline;
 
     if (connection == NULL || connection->display == NULL || complete == NULL
         || timeout_ms <= 0)
         return false;
-    deadline = monotonic_ms() + timeout_ms;
+    deadline = ksd_monotonic_milliseconds() + (uint32_t)timeout_ms;
     while (!complete(data)) {
         struct pollfd item = {
             .fd = wl_display_get_fd(connection->display),
             .events = POLLIN,
         };
-        int remaining = (int)(deadline - monotonic_ms());
+        int remaining = remaining_milliseconds(deadline);
         int ready;
 
         if (remaining <= 0)
@@ -187,7 +191,7 @@ bool ksd_wayland_dispatch_until(ksd_wayland *connection,
  * X11, answered the same way. */
 bool ksd_wayland_roundtrip(ksd_wayland *connection, int timeout_ms)
 {
-    int64_t deadline = monotonic_ms() + timeout_ms;
+    uint64_t deadline = ksd_monotonic_milliseconds() + (uint32_t)timeout_ms;
     struct wl_callback *callback = wl_display_sync(connection->display);
     int done = 0;
     bool ok = false;
@@ -201,7 +205,7 @@ bool ksd_wayland_roundtrip(ksd_wayland *connection, int timeout_ms)
             .fd = wl_display_get_fd(connection->display),
             .events = POLLIN,
         };
-        int remaining = (int)(deadline - monotonic_ms());
+        int remaining = remaining_milliseconds(deadline);
         int ready;
 
         if (remaining <= 0)
@@ -240,7 +244,7 @@ finish:
 bool ksd_wayland_drain(int descriptor, int timeout_ms, uint8_t **data,
                        size_t *length)
 {
-    int64_t deadline = monotonic_ms() + timeout_ms;
+    uint64_t deadline = ksd_monotonic_milliseconds() + (uint32_t)timeout_ms;
     size_t capacity = 4096u;
     uint8_t *buffer = malloc(capacity);
     size_t used = 0u;
@@ -251,7 +255,7 @@ bool ksd_wayland_drain(int descriptor, int timeout_ms, uint8_t **data,
         return false;
     for (;;) {
         struct pollfd item = { .fd = descriptor, .events = POLLIN };
-        int remaining = (int)(deadline - monotonic_ms());
+        int remaining = remaining_milliseconds(deadline);
         ssize_t count;
 
         if (remaining <= 0) {
@@ -313,9 +317,6 @@ uint64_t ksd_wayland_new_handle(const ksd_wayland *connection)
         value &= INT64_MAX;
         bool duplicate = value == 0u;
         for (const ksd_wl_toplevel *item = connection->toplevels;
-             !duplicate && item != NULL; item = item->next)
-            duplicate = item->id == value;
-        for (const ksd_wlr_toplevel *item = connection->wlr_toplevels;
              !duplicate && item != NULL; item = item->next)
             duplicate = item->id == value;
         if (!duplicate)
@@ -390,7 +391,6 @@ void ksd_wayland_close(ksd_wayland *connection)
     ksd_wayland_cosmic_clear(connection);
     if (connection->toplevel_list != NULL)
         ext_foreign_toplevel_list_v1_destroy(connection->toplevel_list);
-    ksd_wayland_wlr_toplevels_clear(connection);
     if (connection->toplevel_manager != NULL)
         zwlr_foreign_toplevel_manager_v1_destroy(connection->toplevel_manager);
     ksd_wayland_keyboard_clear(connection);

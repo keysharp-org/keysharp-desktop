@@ -21,6 +21,42 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_desktop/client.h"
+    KEYSHARP_DESKTOP_ABI_MINOR_LINE REGEX "^#define KSD_CLIENT_ABI_MINOR ")
+string(REGEX MATCH "[0-9]+" KEYSHARP_DESKTOP_ABI_MINOR
+    "${KEYSHARP_DESKTOP_ABI_MINOR_LINE}")
+
+set(KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/providers")
+set(KEYSHARP_DESKTOP_PROVIDER_OUTPUTS
+    "${KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR}/gnome/extension.js"
+    "${KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR}/cinnamon/extension.js")
+set(KEYSHARP_DESKTOP_PROVIDER_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/provider-core.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/gnome-shim.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/cinnamon-shim.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/interfaces/private/org.keysharp.Desktop.Provider1.xml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/generate.cmake")
+add_custom_command(
+    OUTPUT ${KEYSHARP_DESKTOP_PROVIDER_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DOUTPUT_DIR=${KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/generate.cmake
+    DEPENDS ${KEYSHARP_DESKTOP_PROVIDER_INPUTS}
+    COMMENT "Generating shell provider extensions"
+    VERBATIM)
+add_custom_target(generate-provider-extensions ALL
+    DEPENDS ${KEYSHARP_DESKTOP_PROVIDER_OUTPUTS})
+add_custom_target(regenerate-provider-extensions
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DOUTPUT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/providers
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/providers/shared/generate.cmake
+    DEPENDS ${KEYSHARP_DESKTOP_PROVIDER_INPUTS}
+    COMMENT "Regenerating committed shell provider extensions"
+    VERBATIM)
+
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(GIO REQUIRED IMPORTED_TARGET gio-2.0 gio-unix-2.0)
@@ -78,7 +114,6 @@ add_library(keysharp-desktop-common STATIC
     src/kwin_lanes.c
     src/kwin_bus.c
     src/kwin_relay.c
-    src/kwin_host.c
     src/kwin_jobs.c
     src/kwin_peer.c
     src/kwin_envelope.c
@@ -165,11 +200,7 @@ pkg_get_variable(WAYLAND_SCANNER_BIN wayland-scanner wayland_scanner)
 set(KEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR "" CACHE PATH
     "wayland-protocols data directory, overriding the installed one")
 if(KEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR STREQUAL "")
-    # 1.39 is where ext-data-control-v1 arrived, and the clipboard needs it.
-    # The floor used to be 1.32 -- the version that added
-    # ext-foreign-toplevel-list-v1, the other protocol used here -- so it passed
-    # on distributions that then failed further down with a missing file,
-    # naming a path where the real answer was a version.
+    # 1.39 is where ext-data-control-v1 arrived.
     pkg_check_modules(WAYLAND_PROTOCOLS REQUIRED wayland-protocols>=1.39)
     pkg_get_variable(WAYLAND_PROTOCOL_DIR wayland-protocols pkgdatadir)
 else()
@@ -212,73 +243,29 @@ foreach(spec
     list(APPEND KSD_WAYLAND_SERVER_GENERATED "${server_header}")
 endforeach()
 
-# wlroots protocols are not part of wayland-protocols. Pin the unstable wire
-# definition with the implementation so builds do not depend on a distro
-# carrying a separate, rarely packaged XML collection.
-set(wlr_xml
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-foreign-toplevel-management-unstable-v1.xml")
-set(wlr_stem "wlr-foreign-toplevel-management-unstable-v1")
-set(wlr_header "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-client-protocol.h")
-set(wlr_source "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-protocol.c")
-set(wlr_server_header "${CMAKE_CURRENT_BINARY_DIR}/${wlr_stem}-server-protocol.h")
-add_custom_command(OUTPUT "${wlr_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${wlr_xml}" "${wlr_header}"
-    DEPENDS "${wlr_xml}" VERBATIM)
-add_custom_command(OUTPUT "${wlr_source}"
-    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${wlr_xml}" "${wlr_source}"
-    DEPENDS "${wlr_xml}" VERBATIM)
-add_custom_command(OUTPUT "${wlr_server_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${wlr_xml}" "${wlr_server_header}"
-    DEPENDS "${wlr_xml}" VERBATIM)
-list(APPEND KSD_WAYLAND_GENERATED "${wlr_header}" "${wlr_source}")
-list(APPEND KSD_WAYLAND_SERVER_GENERATED "${wlr_server_header}")
-
-set(screencopy_xml
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-screencopy-unstable-v1.xml")
-set(screencopy_stem "wlr-screencopy-unstable-v1")
-set(screencopy_header
-    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-client-protocol.h")
-set(screencopy_source
-    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-protocol.c")
-set(screencopy_server_header
-    "${CMAKE_CURRENT_BINARY_DIR}/${screencopy_stem}-server-protocol.h")
-add_custom_command(OUTPUT "${screencopy_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${screencopy_xml}"
-        "${screencopy_header}"
-    DEPENDS "${screencopy_xml}" VERBATIM)
-add_custom_command(OUTPUT "${screencopy_source}"
-    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${screencopy_xml}"
-        "${screencopy_source}"
-    DEPENDS "${screencopy_xml}" VERBATIM)
-add_custom_command(OUTPUT "${screencopy_server_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${screencopy_xml}"
-        "${screencopy_server_header}"
-    DEPENDS "${screencopy_xml}" VERBATIM)
-list(APPEND KSD_WAYLAND_GENERATED
-    "${screencopy_header}" "${screencopy_source}")
-list(APPEND KSD_WAYLAND_SERVER_GENERATED "${screencopy_server_header}")
-
-set(pointer_xml
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/wlr-virtual-pointer-unstable-v1.xml")
-set(pointer_stem "wlr-virtual-pointer-unstable-v1")
-set(pointer_header "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-client-protocol.h")
-set(pointer_source "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-protocol.c")
-set(pointer_server_header
-    "${CMAKE_CURRENT_BINARY_DIR}/${pointer_stem}-server-protocol.h")
-add_custom_command(OUTPUT "${pointer_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} client-header "${pointer_xml}"
-        "${pointer_header}"
-    DEPENDS "${pointer_xml}" VERBATIM)
-add_custom_command(OUTPUT "${pointer_source}"
-    COMMAND ${WAYLAND_SCANNER_BIN} private-code "${pointer_xml}"
-        "${pointer_source}"
-    DEPENDS "${pointer_xml}" VERBATIM)
-add_custom_command(OUTPUT "${pointer_server_header}"
-    COMMAND ${WAYLAND_SCANNER_BIN} server-header "${pointer_xml}"
-        "${pointer_server_header}"
-    DEPENDS "${pointer_xml}" VERBATIM)
-list(APPEND KSD_WAYLAND_GENERATED "${pointer_header}" "${pointer_source}")
-list(APPEND KSD_WAYLAND_SERVER_GENERATED "${pointer_server_header}")
+# wlroots protocols are vendored because distributions rarely package them.
+foreach(spec
+        "wlr-foreign-toplevel-management-unstable-v1"
+        "wlr-screencopy-unstable-v1"
+        "wlr-virtual-pointer-unstable-v1")
+    set(xml "${CMAKE_CURRENT_SOURCE_DIR}/protocols/${spec}.xml")
+    set(header "${CMAKE_CURRENT_BINARY_DIR}/${spec}-client-protocol.h")
+    set(source "${CMAKE_CURRENT_BINARY_DIR}/${spec}-protocol.c")
+    set(server_header
+        "${CMAKE_CURRENT_BINARY_DIR}/${spec}-server-protocol.h")
+    add_custom_command(OUTPUT "${header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} client-header "${xml}" "${header}"
+        DEPENDS "${xml}" VERBATIM)
+    add_custom_command(OUTPUT "${source}"
+        COMMAND ${WAYLAND_SCANNER_BIN} private-code "${xml}" "${source}"
+        DEPENDS "${xml}" VERBATIM)
+    add_custom_command(OUTPUT "${server_header}"
+        COMMAND ${WAYLAND_SCANNER_BIN} server-header "${xml}"
+            "${server_header}"
+        DEPENDS "${xml}" VERBATIM)
+    list(APPEND KSD_WAYLAND_GENERATED "${header}" "${source}")
+    list(APPEND KSD_WAYLAND_SERVER_GENERATED "${server_header}")
+endforeach()
 
 # COSMIC's version-2 toplevel extension enriches the standard ext list with
 # state and geometry; its version-1 manager supplies the matching actions.
@@ -436,9 +423,13 @@ install(EXPORT KeysharpDesktopTargets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KeysharpDesktop)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.keysharp.DesktopCapture.desktop
     DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-install(DIRECTORY providers/gnome/
+install(FILES
+    "${KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR}/gnome/extension.js"
+    providers/gnome/metadata.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/gnome-shell/extensions/keysharp@keysharp.io)
-install(DIRECTORY providers/cinnamon/
+install(FILES
+    "${KEYSHARP_DESKTOP_PROVIDER_GENERATED_DIR}/cinnamon/extension.js"
+    providers/cinnamon/metadata.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/cinnamon/extensions/keysharp@keysharp.io)
 # A KPackage, not an extension, so it goes where Scripting::start() looks and is
 # named by the KPlugin.Id in its manifest rather than by a uuid directory.
@@ -795,7 +786,8 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "client_abi_minor=8")
+        PASS_REGULAR_EXPRESSION
+            "client_abi_minor=${KEYSHARP_DESKTOP_ABI_MINOR}")
     add_test(NAME unknown-command-rejected
         COMMAND keysharp-desktop unknown-command)
     set_tests_properties(unknown-command-rejected PROPERTIES WILL_FAIL TRUE)
@@ -807,6 +799,12 @@ if(BUILD_TESTING)
         COMMAND ${CMAKE_COMMAND}
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/provider_gate_test.cmake)
+
+    add_test(NAME provider-generation-test
+        COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DOUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/provider-generation-test
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/provider_generation_test.cmake)
 
     add_test(NAME release-layout-test
         COMMAND ${CMAKE_COMMAND}
@@ -848,9 +846,6 @@ set(CPACK_PACKAGE_FILE_NAME "keysharp-desktop-${PROJECT_VERSION}-${CMAKE_SYSTEM_
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libglib2.0-0 (>= 2.56) | libglib2.0-0t64, polkitd | policykit-1, systemd")
-file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/keysharp_desktop/client.h"
-    KEYSHARP_DESKTOP_ABI_MINOR_LINE REGEX "^#define KSD_CLIENT_ABI_MINOR ")
-string(REGEX MATCH "[0-9]+" KEYSHARP_DESKTOP_ABI_MINOR "${KEYSHARP_DESKTOP_ABI_MINOR_LINE}")
 set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-0 (= 0.${KEYSHARP_DESKTOP_ABI_MINOR})")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_BREAKS "keysharp (<< 0.0.0.17)")

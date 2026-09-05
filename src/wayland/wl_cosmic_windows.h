@@ -31,19 +31,9 @@ bool ksd_wayland_cosmic_can_focus(const ksd_wayland *connection);
 bool ksd_wayland_cosmic_can_close(const ksd_wayland *connection);
 bool ksd_wayland_cosmic_can_set_state(const ksd_wayland *connection);
 
-void ksd_wayland_cosmic_window_handles(ksd_wayland *connection,
-                                       ksd_operation_result *result);
-void ksd_wayland_cosmic_window_list(ksd_wayland *connection,
-                                    bool include_hidden,
-                                    ksd_operation_result *result);
-void ksd_wayland_cosmic_active_window(ksd_wayland *connection,
-                                      ksd_operation_result *result);
 void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
                                       uint16_t opcode, uint64_t handle,
                                       uint32_t value,
                                       ksd_operation_result *result);
-
-void ksd_wayland_cosmic_window_query(ksd_wayland *connection,
-    uint64_t handle, ksd_operation_result *result);
 
 #endif

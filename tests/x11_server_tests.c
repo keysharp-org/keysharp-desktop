@@ -98,6 +98,22 @@ static void check_window_list(ksd_x11 *connection)
     ksd_result_clear(&result);
 }
 
+/* Every object carries the same key set, so validFields is the only thing telling a consumer which values
+ * are real. A field this server actually resolved must be declared, or the caller is obliged to drop it. */
+static void assert_field_declared(const ksd_operation_result *result, const char *field)
+{
+    uint32_t length;
+    const char *body = json_body(result, &length);
+    const char *valid = memmem(body, length, "\"validFields\":[", 15u);
+    assert(valid != NULL);
+    const char *end = memchr(valid, ']', (size_t)(body + length - valid));
+    assert(end != NULL);
+    char declared[64];
+    int declared_length = snprintf(declared, sizeof(declared), "\"%s\"", field);
+    assert(declared_length > 0 && (size_t)declared_length < sizeof(declared));
+    assert(memmem(valid, (size_t)(end - valid), declared, (size_t)declared_length) != NULL);
+}
+
 static xcb_atom_t intern_in(xcb_connection_t *c, const char *name);
 
 /* Handles carry no properties, which is the entire reason they need no grant.
@@ -950,6 +966,7 @@ static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
     ksd_x11_window_active(connection, &result);
     assert_window_id(&result, client);
     assert_json_has(&result, "\"active\":true");
+    assert_field_declared(&result, "active");
     ksd_result_clear(&result);
 
     xcb_window_t popup = xcb_generate_id(owner);
@@ -1077,7 +1094,7 @@ static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
     assert_json_has(&result, "\"height\":1024");
     ksd_result_clear(&result);
     ksd_result_init(&result);
-    ksd_x11_keyboard_state(connection, &result);
+    ksd_x11_keyboard_state_since(connection, NULL, 0u, &result);
     assert_json_has(&result, "\"keymap\":");
     assert_json_has(&result, "xkb_keymap");
     ksd_result_clear(&result);

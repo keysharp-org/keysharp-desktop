@@ -4,6 +4,7 @@ foreach(provider gnome cinnamon)
 
     foreach(required
             "org.keysharp.Desktop.Provider1"
+            "io.github.keysharp.ShellExtension1"
             "PUBLIC_IFACE_XML"
             "Gio.DBusServer.new_sync"
             "Gio.DBusServerFlags.NONE"
@@ -26,6 +27,8 @@ foreach(provider gnome cinnamon)
     endforeach()
 
     foreach(forbidden
+            "io.github.keysharp.GnomeShell1"
+            "io.github.keysharp.CinnamonShell1"
             "Gio.DBusAuthObserver"
             "AUTHENTICATION_ALLOW_ANONYMOUS")
         string(FIND "${source}" "${forbidden}" position)
@@ -37,6 +40,7 @@ foreach(provider gnome cinnamon)
 
     foreach(sensitive_method
             GetWindowList
+            QueryWindow
             GetActiveWindow
             GetClipboardMimetypes
             GetClipboardContent
@@ -151,7 +155,9 @@ foreach(required
         "g_dbus_connection_get_peer_credentials(connection)"
         "g_dbus_connection_get_stream(connection)"
         "g_socket_get_credentials(socket, error)"
-        "peer_pid != (gint64)provider_pid")
+        "peer_pid != (gint64)provider_pid"
+        "request->opcode == KSD_OP_WINDOW_QUERY"
+        "\"QueryWindow\"")
     string(FIND "${provider_client}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
@@ -195,9 +201,11 @@ endforeach()
 file(READ "${SOURCE_DIR}/providers/cinnamon/extension.js" cinnamon_provider)
 string(FIND "${cinnamon_provider}" "CaptureAreaAsync" cinnamon_area)
 string(FIND "${cinnamon_provider}" "CaptureWindowAsync" cinnamon_window)
-if(NOT cinnamon_area EQUAL -1 OR cinnamon_window EQUAL -1)
+string(FIND "${cinnamon_provider}" "captureArea: null" cinnamon_area_disabled)
+if(cinnamon_area EQUAL -1 OR cinnamon_window EQUAL -1
+        OR cinnamon_area_disabled EQUAL -1)
     message(FATAL_ERROR
-        "Cinnamon must expose only its bounded in-memory window capture")
+        "Cinnamon must disable area capture and expose bounded window capture")
 endif()
 string(FIND "${cinnamon_provider}" "\n    CaptureWindow(" cinnamon_sync)
 if(NOT cinnamon_sync EQUAL -1)
@@ -351,7 +359,7 @@ file(READ "${SOURCE_DIR}/src/session_backend.c" session_backend)
 foreach(required
         "SOCK_NONBLOCK"
         "errno != EINPROGRESS"
-        "wait_for(descriptor, POLLOUT, deadline)"
+        "ksd_wait_until(descriptor, POLLOUT, deadline)"
         "SO_ERROR"
         "connect_backend(deadline)"
         "ksd_backend_session_unsupported()"

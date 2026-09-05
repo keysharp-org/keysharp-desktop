@@ -247,27 +247,6 @@ ksd_status ksd_x11_open_for_session(pid_t session_pid,
     return ksd_x11_open(canonical, authority_value, connection);
 }
 
-void ksd_x11_execute(const ksd_frame *request, pid_t session_pid,
-                     ksd_operation_result *result)
-{
-    ksd_x11 *connection = NULL;
-    ksd_status status;
-
-    if (!ksd_x11_request_valid(request)) {
-        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
-                         "invalid X11 request");
-        return;
-    }
-    status = ksd_x11_open_for_session(session_pid, &connection);
-    if (status != KSD_STATUS_OK) {
-        ksd_result_error(result, status, 0u,
-                         "could not open the X display for this session");
-        return;
-    }
-    (void)ksd_x11_execute_on(connection, request, result);
-    ksd_x11_close(connection);
-}
-
 /* Serves one request on a connection the caller keeps. Returns false only when
  * the connection itself is gone, which is the caller's cue to reopen rather
  * than to answer -- a display that went away is not the same as an operation

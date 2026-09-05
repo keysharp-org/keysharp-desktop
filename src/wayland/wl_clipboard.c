@@ -240,14 +240,9 @@ static void bytes_result(const uint8_t *value, size_t length,
 {
     ksd_buffer framed;
 
-    if (length > KSD_MAX_TEXT_BYTES) {
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "clipboard content is too large");
-        return;
-    }
-    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
-    if (!ksd_buffer_u32(&framed, (uint32_t)length)
-        || !ksd_buffer_bytes(&framed, value, length)
+    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES);
+    if (!ksd_buffer_bytes(&framed, value, length)
+        || !ksd_buffer_frame_text(&framed, KSD_MAX_TEXT_BYTES)
         || !ksd_result_copy(result, framed.data, (uint32_t)framed.length))
         ksd_result_error(result, KSD_STATUS_INTERNAL, 0u, "out of memory");
     ksd_buffer_clear(&framed);

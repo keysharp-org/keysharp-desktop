@@ -3,14 +3,11 @@
 
 #include "x11_connect.h"
 #include "operation_result.h"
-#include "protocol_io.h"
 
-void ksd_x11_json_result(ksd_buffer *out, ksd_operation_result *result);
 void ksd_x11_window_query(ksd_x11 *, uint32_t, ksd_operation_result *);
 void ksd_x11_window_children(ksd_x11 *, uint32_t, ksd_operation_result *);
 void ksd_x11_window_at_point(ksd_x11 *, int32_t, int32_t, bool, ksd_operation_result *);
 void ksd_x11_display_list(ksd_x11 *, ksd_operation_result *);
-void ksd_x11_keyboard_state(ksd_x11 *, ksd_operation_result *);
 void ksd_x11_window_set_title(ksd_x11 *, uint32_t, const uint8_t *, uint32_t, ksd_operation_result *);
 void ksd_x11_window_set_visible(ksd_x11 *, uint32_t, bool, ksd_operation_result *);
 void ksd_x11_window_redraw(ksd_x11 *, uint32_t, ksd_operation_result *);

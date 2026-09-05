@@ -27,6 +27,7 @@ var IFACE = "io.github.keysharp.KWinProvider1";
 var OP_WINDOW_LIST = 0x2010;
 var OP_WINDOW_HANDLES = 0x2013;
 var OP_WINDOW_ACTIVE = 0x2011;
+var OP_WINDOW_QUERY = 0x2014;
 var OP_WINDOW_FOCUS = 0x2020;
 var OP_WINDOW_RAISE = 0x2021;
 var OP_WINDOW_LOWER = 0x2022;
@@ -370,7 +371,9 @@ function windowJson(window) {
     if (window.internalId !== undefined) valid.push('captureId');
     if (window.resourceClass || window.desktopFileName || window.resourceName) valid.push('appId');
     if (window.pid > 0) valid.push('pid');
-    if (window.frameGeometry || window.geometry) valid.push('frame');
+    // 'client' repeats the frame rect: the scripting API exposes no separate client area, and under the
+    // client-side decorations Wayland clients use the two coincide.
+    if (window.frameGeometry || window.geometry) { valid.push('frame'); valid.push('client'); }
     if (window.minimized !== undefined) valid.push('minimized');
     if (window.maximizeMode !== undefined || window.maximized !== undefined) valid.push('maximized');
     if (window.active !== undefined) valid.push('active');
@@ -542,6 +545,13 @@ function executeJob(job) {
         return { sequence: job.sequence, status: STATUS_NOT_FOUND, body: "" };
 
     switch (job.opcode) {
+    case OP_WINDOW_QUERY:
+        return {
+            sequence: job.sequence,
+            status: STATUS_OK,
+            body: "{\"ok\":true,\"window\":" + windowJson(window) + "}"
+        };
+
     case OP_WINDOW_FOCUS:
         window.minimized = false;
         api.setActiveWindow(window);

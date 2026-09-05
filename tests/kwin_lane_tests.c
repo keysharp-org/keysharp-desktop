@@ -63,6 +63,7 @@ static void check_fast_lane_is_bounded(void)
     assert(slow == 2u);
     assert(ksd_kwin_lane_for(KSD_OP_WINDOW_LIST) == KSD_KWIN_LANE_SLOW);
     assert(ksd_kwin_lane_for(KSD_OP_WINDOW_HANDLES) == KSD_KWIN_LANE_SLOW);
+    assert(ksd_kwin_lane_for(KSD_OP_WINDOW_QUERY) == KSD_KWIN_LANE_FAST);
     assert(fast >= 10u);
 }
 

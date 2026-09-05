@@ -311,23 +311,6 @@ static uint32_t mapped_edge(uint32_t offset, uint32_t screen_length,
     return (uint32_t)((numerator + denominator - 1) / denominator);
 }
 
-static bool pwrite_all(int descriptor, const uint8_t *data, size_t length,
-                       off_t offset)
-{
-    size_t used = 0u;
-
-    while (used < length) {
-        ssize_t count = pwrite(descriptor, data + used, length - used,
-                               offset + (off_t)used);
-        if (count < 0 && errno == EINTR)
-            continue;
-        if (count <= 0)
-            return false;
-        used += (size_t)count;
-    }
-    return true;
-}
-
 static void inverse_transform(uint32_t x, uint32_t y, uint32_t width,
                               uint32_t height, uint32_t transform,
                               uint32_t *source_x, uint32_t *source_y)
@@ -712,7 +695,7 @@ done:
     return success;
 }
 
-static bool compose_segment(int target, uint32_t target_width,
+static bool compose_segment(uint8_t *target, uint32_t target_width,
                             uint32_t target_height,
                             int32_t request_x, int32_t request_y,
                             uint32_t request_width, uint32_t request_height,
@@ -730,10 +713,8 @@ static bool compose_segment(int target, uint32_t target_width,
         request_height, target_height);
     uint32_t destination_width;
     uint32_t destination_height;
-    uint8_t *destination_row;
     uint8_t *source;
     size_t source_length;
-    bool success = true;
 
     if (left > target_width)
         left = target_width;
@@ -750,14 +731,12 @@ static bool compose_segment(int target, uint32_t target_width,
     source_length = (size_t)segment->stride * segment->source_height;
     source = mmap(NULL, source_length, PROT_READ, MAP_SHARED,
                   segment->descriptor, 0);
-    destination_row = malloc((size_t)destination_width * 4u);
-    if (source == MAP_FAILED || destination_row == NULL) {
-        if (source != MAP_FAILED)
-            munmap(source, source_length);
-        free(destination_row);
+    if (source == MAP_FAILED)
         return false;
-    }
     for (uint32_t row = 0u; row < destination_height; row++) {
+        uint8_t *destination_row = target + KSD_CAPTURE_HEADER_SIZE
+            + (size_t)(top + row) * target_width * 4u
+            + (size_t)left * 4u;
         uint32_t oriented_y = segment->source_y
             + (uint32_t)(((uint64_t)row * 2u + 1u)
                 * segment->pixel_height
@@ -792,19 +771,9 @@ static bool compose_segment(int target, uint32_t target_width,
             if (segment->opaque)
                 output[3] = 0xffu;
         }
-        off_t destination_offset = (off_t)KSD_CAPTURE_HEADER_SIZE
-            + (off_t)(top + row) * (off_t)target_width * 4
-            + (off_t)left * 4;
-        if (!pwrite_all(target, destination_row,
-                        (size_t)destination_width * 4u,
-                        destination_offset)) {
-            success = false;
-            break;
-        }
     }
     munmap(source, source_length);
-    free(destination_row);
-    return success;
+    return true;
 }
 
 static bool compose_capture(int32_t x, int32_t y, uint32_t width,
@@ -821,6 +790,7 @@ static bool compose_capture(int32_t x, int32_t y, uint32_t width,
     uint64_t pixel_length;
     uint64_t total;
     uint8_t header[KSD_CAPTURE_HEADER_SIZE] = { 0 };
+    uint8_t *mapping;
     int descriptor = -1;
     int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
 
@@ -862,9 +832,18 @@ static bool compose_capture(int32_t x, int32_t y, uint32_t width,
                          "could not allocate the composed capture");
         return false;
     }
+    mapping = mmap(NULL, (size_t)total, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   descriptor, 0);
+    if (mapping == MAP_FAILED) {
+        close(descriptor);
+        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
+                         "could not map the composed capture");
+        return false;
+    }
     for (size_t index = 0u; index < count; index++)
-        if (!compose_segment(descriptor, pixel_width, pixel_height, x, y,
+        if (!compose_segment(mapping, pixel_width, pixel_height, x, y,
                              width, height, segments + index)) {
+            munmap(mapping, (size_t)total);
             close(descriptor);
             ksd_result_error(result, KSD_STATUS_INTERNAL, 0u,
                              "could not compose the captured outputs");
@@ -875,7 +854,8 @@ static bool compose_capture(int32_t x, int32_t y, uint32_t width,
     ksd_encode_u32(header + 8u, pixel_height);
     ksd_encode_u32(header + 12u, stride);
     ksd_encode_u32(header + 16u, (uint32_t)pixel_length);
-    if (!pwrite_all(descriptor, header, sizeof(header), 0)
+    memcpy(mapping, header, sizeof(header));
+    if (munmap(mapping, (size_t)total) != 0
         || fcntl(descriptor, F_ADD_SEALS, seals) != 0) {
         close(descriptor);
         ksd_result_error(result, KSD_STATUS_INTERNAL, 0u,

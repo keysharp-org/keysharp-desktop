@@ -3,6 +3,7 @@
 
 #include "kwin_envelope.h"
 #include "kwin_wire.h"
+#include "protocol_io.h"
 #include "worker_pool.h"
 
 #include <stdbool.h>
@@ -37,6 +38,12 @@ typedef enum ksd_kwin_job_state {
     KSD_KWIN_JOB_DONE,
 } ksd_kwin_job_state;
 
+typedef enum ksd_kwin_poll_outcome {
+    KSD_KWIN_POLL_ANSWERED,
+    KSD_KWIN_POLL_PARKED,
+    KSD_KWIN_POLL_REFUSED,
+} ksd_kwin_poll_outcome;
+
 typedef struct ksd_kwin_job {
     char sequence[KSD_KWIN_SEQ_HEX + 1u];
     uint16_t opcode;
@@ -67,10 +74,28 @@ typedef struct ksd_kwin_queue {
     char generation[KSD_KWIN_GENERATION_HEX + 1u];
     uint64_t next_sequence;
     uint64_t next_ticket;
+    bool parked[KSD_KWIN_LANES];
 } ksd_kwin_queue;
 
 /* generation must be exactly KSD_KWIN_GENERATION_HEX lowercase hex digits. */
 bool ksd_kwin_queue_init(ksd_kwin_queue *queue, const char *generation);
+ksd_kwin_queue *ksd_kwin_queue_create(const char *generation);
+void ksd_kwin_queue_destroy(ksd_kwin_queue *queue);
+
+bool ksd_kwin_queue_hello(ksd_kwin_queue *queue, ksd_buffer *reply);
+ksd_kwin_poll_outcome ksd_kwin_queue_poll(ksd_kwin_queue *queue,
+                                           const uint8_t *envelope,
+                                           size_t length, uint64_t now_ms,
+                                           ksd_buffer *reply);
+bool ksd_kwin_queue_poll_parked(ksd_kwin_queue *queue, ksd_kwin_lane lane,
+                                uint64_t now_ms, ksd_buffer *reply);
+bool ksd_kwin_queue_report(ksd_kwin_queue *queue, const uint8_t *envelope,
+                           size_t length, ksd_buffer *reply);
+bool ksd_kwin_queue_parked(const ksd_kwin_queue *queue, ksd_kwin_lane lane);
+bool ksd_kwin_queue_result(ksd_kwin_queue *queue, const char *sequence,
+                           uint32_t *status, const uint8_t **body,
+                           uint32_t *body_length);
+const char *ksd_kwin_queue_generation(const ksd_kwin_queue *queue);
 
 /* Submits one operation and writes its sequence. Returns false when the queue
  * is full or the opcode takes no lane, in which case nothing is stored. */

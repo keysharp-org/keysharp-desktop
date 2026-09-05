@@ -1,0 +1,307 @@
+<node>
+  <interface name="org.keysharp.Desktop.Provider1">
+
+    <!-- Returns JSON: { ok, windows: [ { id, title, appId, pid,
+         frame:{x,y,width,height}, client:{x,y,width,height},
+         active, minimized, maximized, visible, transparency } ... ] }
+         Windows are ordered bottom-to-top (index 0 = lowest z-order). -->
+    <method name="GetWindowList">
+      <arg type="b" direction="in"  name="includeHidden"/>
+      <arg type="s" direction="out" name="json"/>
+    </method>
+
+    <!-- Returns JSON: { ok, window: { ... } }. Missing handles return NotFound. -->
+    <method name="QueryWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="s" direction="out" name="json"/>
+    </method>
+
+    <!-- Returns JSON: { ok, window: { ... } | null } -->
+    <method name="GetActiveWindow">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+
+    <!-- Global pointer position in compositor coordinates. -->
+    <method name="GetCursorPosition">
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+    </method>
+
+    <!-- Work area (primary monitor minus panels/struts), in screen coordinates. -->
+    <method name="GetWorkArea">
+      <arg type="i" direction="out" name="x"/>
+      <arg type="i" direction="out" name="y"/>
+      <arg type="i" direction="out" name="width"/>
+      <arg type="i" direction="out" name="height"/>
+    </method>
+
+    <!-- Clipboard bridge: Wayland has no focus-independent clipboard access for a background app, and
+         the shell exposes no data-control protocol, so the shell (which owns the selection) reads/writes it
+         via MetaSelection and notifies of changes via the MetaSelection owner-changed signal. Content is
+         raw MIME-type <-> bytes so every format (text, image, html, uri-list, ...) round-trips. -->
+    <method name="GetClipboardMimetypes">
+      <arg type="as" direction="out" name="mimetypes"/>
+    </method>
+    <!-- Read one MIME type's bytes (async: MetaSelection.transfer_async). "" bytes = absent/empty. -->
+    <method name="GetClipboardContent">
+      <arg type="s" direction="in" name="mimetype"/>
+      <arg type="ay" direction="out" name="bytes"/>
+    </method>
+    <!-- Replace the whole selection with a single MIME type's bytes. Reachable only on the
+         root authenticated provider peer. keysharp-desktop needs no grant for it: reading
+         the selection is gated, replacing it is not. -->
+    <method name="SetClipboardContent">
+      <arg type="s" direction="in" name="mimetype"/>
+      <arg type="ay" direction="in" name="bytes"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <!-- UTF-8 text convenience (the common A_Clipboard path) is read only here; the broker
+         writes text through SetClipboardContent. -->
+    <method name="GetClipboardText">
+      <arg type="s" direction="out" name="text"/>
+    </method>
+
+    <!-- Register this client as an overlay owner. ownerKey = "pid:starttime"; busName = the caller's
+         unique D-Bus name. Lets the shell reap the caller's overlays when its process/connection dies. -->
+    <method name="RegisterHighlightOwner">
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Window handle is the stable_sequence uint32 of Meta.Window. ok = false when no such window. -->
+    <method name="FocusWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Raise the window to the top of the stack. -->
+    <method name="RaiseWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Lower the window to the bottom of the stack. -->
+    <method name="LowerWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="ReserveWindow">
+      <arg type="i" direction="in" name="pid"/>
+      <arg type="t" direction="in" name="cookie"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="ttlMs"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="GetReservedWindow">
+      <arg type="i" direction="in" name="pid"/>
+      <arg type="t" direction="in" name="cookie"/>
+      <arg type="s" direction="out" name="id"/>
+    </method>
+
+    <!-- Pass x = INT32_MIN (-2147483648) to leave position unchanged;
+         width/height <= 0 to leave size unchanged. -->
+    <method name="MoveResizeWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Same as MoveResizeWindow but the window is identified by its X11 window id
+         (get_xwindow), for X11 sessions where the caller has an XID, not a stable_sequence. -->
+    <method name="MoveResizeWindowByXid">
+      <arg type="t" direction="in" name="xid"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- state: 0 = normal, 1 = minimized, 2 = maximized. -->
+    <method name="SetWindowState">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="i" direction="in" name="state"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- above: true = keep above all others, false = clear keep-above. -->
+    <method name="SetWindowAbove">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="in" name="above"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- decorated: true = show the titlebar/frame, false = hide it. -->
+    <method name="SetWindowDecorated">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="in" name="decorated"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- opacity: 0 (fully transparent) .. 255 (fully opaque). -->
+    <method name="SetWindowOpacity">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="i" direction="in" name="opacity"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="CloseWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Force-kill the window's client, falling back to a graceful close. -->
+    <method name="KillWindow">
+      <arg type="t" direction="in" name="handle"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="SendMouseMoveAbsolute">
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseMoveRelative">
+      <arg type="i" direction="in" name="dx"/>
+      <arg type="i" direction="in" name="dy"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseButton">
+      <arg type="u" direction="in" name="button"/>
+      <arg type="b" direction="in" name="pressed"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SendMouseScroll">
+      <arg type="i" direction="in" name="delta"/>
+      <arg type="b" direction="in" name="vertical"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Capture a screen region and return raw PNG bytes. No flash, no
+         file is written. Runs entirely inside the compositor process.
+         Returns an empty array on failure. -->
+    <method name="CaptureArea">
+      <arg type="i" direction="in"  name="x"/>
+      <arg type="i" direction="in"  name="y"/>
+      <arg type="i" direction="in"  name="width"/>
+      <arg type="i" direction="in"  name="height"/>
+      <arg type="ay" direction="out" name="pngData"/>
+    </method>
+
+    <!-- Capture one window and return raw PNG bytes without writing a file.
+         handle is the stable_sequence uint32 of Meta.Window (the "id" field
+         of the window JSON). includeDecoration keeps any compositor buffer
+         margin outside the visible frame rect. Returns an empty array on
+         failure. -->
+    <method name="CaptureWindow">
+      <arg type="t" direction="in"  name="handle"/>
+      <arg type="b" direction="in"  name="includeDecoration"/>
+      <arg type="ay" direction="out" name="pngData"/>
+    </method>
+
+    <!-- Draw (or update) a click-through rectangle-outline overlay on the compositor stage. The shell
+         has no layer-shell, so the overlay lives inside the shell process. id is a caller-chosen
+         token so the same overlay can be moved/resized or hidden later; x/y/width/height are in global
+         compositor coordinates; color is an "RRGGBB" hex string; thickness is the outline width in px.
+         The overlay is non-reactive and excluded from the shell input region, so it never eats clicks. -->
+    <method name="ShowHighlight">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="s" direction="in" name="color"/>
+      <arg type="i" direction="in" name="thickness"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Remove the overlay previously created with the given id. Unknown ids are ignored. -->
+    <method name="HideHighlight">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="ShowImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="ay" direction="in" name="pngData"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="MoveImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="i" direction="in" name="width"/>
+      <arg type="i" direction="in" name="height"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <method name="HideImageOverlay">
+      <arg type="u" direction="in" name="id"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- True when the shell can draw a click-through tooltip on the caller's behalf. -->
+    <method name="SupportsTooltip">
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Draw or update a click-through tooltip. slot identifies it per owner; empty text clears it.
+         x/y are global compositor coordinates. -->
+    <method name="ShowTooltip">
+      <arg type="i" direction="in" name="slot"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="s" direction="in" name="text"/>
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Remove the tooltip in the given slot for this owner. -->
+    <method name="HideTooltip">
+      <arg type="i" direction="in" name="slot"/>
+      <arg type="s" direction="in" name="ownerKey"/>
+      <arg type="s" direction="in" name="busName"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+
+    <!-- Generic window-event stream consumed by Keysharp's WinEvent.
+         type is one of: create, close, active, title, minimize, restore, move.
+         json is the affected window's info (the same shape as GetActiveWindow's
+         window object); for "close" it carries at least { id }. -->
+    <signal name="WindowEvent">
+      <arg type="s" name="type"/>
+      <arg type="s" name="json"/>
+    </signal>
+
+    <!-- Fires on every clipboard change: text is the UTF-8 text (or ""), mimetypes lists the available MIME
+         types, so a listener can classify text/other/empty and read any format on demand. -->
+    <signal name="ClipboardChanged">
+      <arg type="s" name="text"/>
+      <arg type="as" name="mimetypes"/>
+    </signal>
+
+  </interface>
+</node>

@@ -54,7 +54,7 @@ static const char introspection[] =
     "</node>";
 
 struct ksd_kwin_bus {
-    ksd_kwin_host *host;
+    ksd_kwin_queue *queue;
     /* The unique bus owner of org.kde.KWin. Every script call is pinned to it,
      * so another process in the session cannot take the provider channel. */
     char peer[64];
@@ -173,12 +173,12 @@ static void relay_drain(ksd_kwin_bus *bus)
 
         if (!bus->inflight[index].active)
             continue;
-        if (!ksd_kwin_host_result(bus->host, bus->inflight[index].sequence,
+        if (!ksd_kwin_queue_result(bus->queue, bus->inflight[index].sequence,
                                   &status, &body, &body_length))
             continue;
         relay_answer(bus, bus->inflight[index].request_id,
                      bus->inflight[index].opcode, status, body, body_length);
-        ksd_kwin_host_release(bus->host, bus->inflight[index].sequence);
+        ksd_kwin_queue_release(bus->queue, bus->inflight[index].sequence);
         bus->inflight[index].active = false;
     }
 }
@@ -197,7 +197,7 @@ static void answer(GDBusMethodInvocation *invocation, const ksd_buffer *reply)
     g_free(text);
 }
 
-/* Completes a parked poll with whatever the host has for that lane now. Used
+/* Completes a parked poll with whatever the queue has for that lane. Used
  * both when work arrives and when the idle timer fires, so there is one path
  * that ends a park rather than two that could disagree. */
 static void release_park(ksd_kwin_bus *bus, ksd_kwin_lane lane)
@@ -213,13 +213,12 @@ static void release_park(ksd_kwin_bus *bus, ksd_kwin_lane lane)
         g_source_remove(bus->idle_source[slot]);
         bus->idle_source[slot] = 0u;
     }
-    /* Whatever the host has for this lane NOW. When work has just been queued
-     * that is a batch; when the idle timer fired it is an empty reply, which
-     * is what tells the script the lane is alive and lets it re-park. Asking
-     * the host rather than assuming is why one function ends a park: an
-     * always-idle version would queue work and then sit on it. */
+    /* Queued work produces a batch; the idle timer produces an empty reply
+     * that tells the script the lane is alive and lets it re-park. Asking the
+     * queue prevents work arriving at the timer boundary from being left
+     * waiting. */
     ksd_buffer_init(&reply, 65536u);
-    if (ksd_kwin_host_poll_parked(bus->host, lane,
+    if (ksd_kwin_queue_poll_parked(bus->queue, lane,
                                   (uint64_t)g_get_monotonic_time() / 1000u,
                                   &reply)) {
         answer(invocation, &reply);
@@ -277,7 +276,7 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
         && strcmp(bus->peer, sender) == 0
         && (hello ? generation[0] == '\0'
                   : ksd_kwin_peer_allowed(bus->peer, sender, bus->uid,
-                        bus->uid, ksd_kwin_host_generation(bus->host),
+                        bus->uid, ksd_kwin_queue_generation(bus->queue),
                         generation));
     if (!allowed) {
         g_dbus_method_invocation_return_error_literal(invocation,
@@ -289,9 +288,9 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
     (void)connection;
 
     if (g_strcmp0(method, "Hello") == 0) {
-        ok = ksd_kwin_host_hello(bus->host, &reply);
+        ok = ksd_kwin_queue_hello(bus->queue, &reply);
     } else if (g_strcmp0(method, "Report") == 0) {
-        ok = ksd_kwin_host_report(bus->host, (const uint8_t *)envelope,
+        ok = ksd_kwin_queue_report(bus->queue, (const uint8_t *)envelope,
                                   strlen(envelope), &reply);
         /* A report is the only thing that can complete a job, so it is the
          * only moment a relayed request can be answered. */
@@ -301,12 +300,12 @@ static void handle_call(GDBusConnection *connection, const gchar *sender,
         /* Events never carry a job in either direction, so an event storm
          * cannot delay dispatched work. Acknowledged and nothing more until
          * the watch surface lands. */
-        ok = ksd_kwin_host_hello(bus->host, &reply);
+        ok = ksd_kwin_queue_hello(bus->queue, &reply);
     } else if (g_strcmp0(method, "Poll") == 0) {
         ksd_kwin_poll poll;
         ksd_kwin_poll_outcome outcome;
 
-        outcome = ksd_kwin_host_poll(bus->host, (const uint8_t *)envelope,
+        outcome = ksd_kwin_queue_poll(bus->queue, (const uint8_t *)envelope,
                                      strlen(envelope),
                                      (uint64_t)g_get_monotonic_time() / 1000u,
                                      &reply);
@@ -427,15 +426,15 @@ static void on_name_lost(GDBusConnection *connection, const gchar *name,
         g_main_loop_quit(bus->loop);
 }
 
-ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay)
+ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_queue *queue, int relay)
 {
     ksd_kwin_bus *bus;
     GError *error = NULL;
 
-    if (host == NULL)
+    if (queue == NULL)
         return NULL;
     bus = g_new0(ksd_kwin_bus, 1);
-    bus->host = host;
+    bus->queue = queue;
     bus->uid = getuid();
     bus->authority = -1;
     bus->relay = relay;
@@ -488,7 +487,8 @@ bool ksd_kwin_request_text(uint16_t opcode, const uint8_t *payload,
             || ksd_decode_u32(payload + 4u) != 0u)
             return false;
         written = snprintf(text, capacity, "%u", ksd_decode_u32(payload));
-    } else if (opcode == KSD_OP_WINDOW_FOCUS
+    } else if (opcode == KSD_OP_WINDOW_QUERY
+               || opcode == KSD_OP_WINDOW_FOCUS
                || opcode == KSD_OP_WINDOW_RAISE
                || opcode == KSD_OP_WINDOW_LOWER
                || opcode == KSD_OP_WINDOW_CLOSE) {
@@ -598,7 +598,7 @@ bool ksd_kwin_response_payload(uint16_t opcode, const uint8_t *body,
     if (payload == NULL || (body == NULL && body_length != 0u))
         return false;
     if (opcode == KSD_OP_WINDOW_LIST || opcode == KSD_OP_WINDOW_HANDLES
-        || opcode == KSD_OP_WINDOW_ACTIVE) {
+        || opcode == KSD_OP_WINDOW_ACTIVE || opcode == KSD_OP_WINDOW_QUERY) {
         return body_length <= KSD_MAX_TEXT_BYTES
             && ksd_utf8_valid(body, body_length, false)
             && ksd_buffer_u32(payload, body_length)
@@ -685,7 +685,7 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
     /* Both refusals are BUSY rather than a failure: neither reached the
      * compositor, so the caller may retry safely. */
     if (slot == KSD_KWIN_MAX_JOBS
-        || !ksd_kwin_host_submit(bus->host, opcode,
+        || !ksd_kwin_queue_submit(bus->queue, opcode,
                                  (const uint8_t *)text_body, text_length,
                                  (uint64_t)g_get_monotonic_time() / 1000u,
                                  sequence)) {

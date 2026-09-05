@@ -1,14 +1,14 @@
 #ifndef KEYSHARP_DESKTOP_KWIN_BUS_H
 #define KEYSHARP_DESKTOP_KWIN_BUS_H
 
-#include "kwin_host.h"
+#include "kwin_jobs.h"
 
 #include <stdbool.h>
 
 /* The D-Bus surface the KWin script calls, and the only part of this channel
  * that touches GLib.
  *
- * Queue and envelope decisions live in ksd_kwin_host, which is pure and tested
+ * Queue and envelope decisions live in ksd_kwin_queue, which is pure and tested
  * without a bus. This transport owns the name, pins callers to the compositor's
  * canonical bus owner, reloads the installed script, hands envelopes to the
  * host, and holds parked invocations until there is something to answer with.
@@ -23,7 +23,7 @@ typedef struct ksd_kwin_bus ksd_kwin_bus;
 /* relay is the authority's end of the callback socket, or -1. Requests arrive
  * on it and answers go back out of order, because a cheap verb must not wait
  * behind an enumeration. */
-ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_host *host, int relay);
+ksd_kwin_bus *ksd_kwin_bus_start(ksd_kwin_queue *queue, int relay);
 
 /* Convert one public binary request payload to the textual body carried by the
  * KWin script envelope. Exposed for the protocol-boundary test. */
@@ -39,7 +39,7 @@ bool ksd_kwin_response_payload(uint16_t opcode, const uint8_t *body,
 /* Runs until the authority closes descriptor or the compositor changes, then
  * returns. Both are watched on the same loop rather than from another thread:
  * everything here already runs on one, and a second would need a lock around
- * the host for no gain. */
+ * the queue for no gain. */
 int ksd_kwin_bus_run(ksd_kwin_bus *bus, int descriptor);
 
 void ksd_kwin_bus_stop(ksd_kwin_bus *bus);

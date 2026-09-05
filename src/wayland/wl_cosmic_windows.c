@@ -4,6 +4,7 @@
 #include "protocol_io.h"
 #include "wl_internal.h"
 #include "wl_outputs.h"
+#include "wl_windows.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -12,9 +13,6 @@
 
 #define KSD_COSMIC_WINDOW_TIMEOUT_MS 2000
 #define KSD_COSMIC_CAPABILITY(value) (UINT32_C(1) << (value))
-#define KSD_COSMIC_STATE_MAXIMIZED (UINT32_C(1) << 0)
-#define KSD_COSMIC_STATE_MINIMIZED (UINT32_C(1) << 1)
-#define KSD_COSMIC_STATE_ACTIVATED (UINT32_C(1) << 2)
 #define KSD_COSMIC_STATE_FULLSCREEN (UINT32_C(1) << 3)
 
 static void free_geometries(ksd_cosmic_geometry *geometry)
@@ -39,7 +37,7 @@ static void handle_done(void *data,
 {
     (void)handle;
     if (data != NULL)
-        ((ksd_wl_toplevel *)data)->cosmic_ready = true;
+        ((ksd_wl_toplevel *)data)->ready = true;
 }
 
 static void handle_title(void *data,
@@ -129,7 +127,7 @@ static void handle_state(void *data,
         if (*item < 32u)
             state |= UINT32_C(1) << *item;
     }
-    toplevel->cosmic_state = state;
+    toplevel->state = state;
 }
 
 static void handle_geometry(void *data,
@@ -200,7 +198,7 @@ static void info_done(void *data, struct zcosmic_toplevel_info_v1 *info)
     for (ksd_wl_toplevel *item = connection->toplevels;
          item != NULL; item = item->next)
         if (item->cosmic_handle != NULL)
-            item->cosmic_ready = true;
+            item->ready = true;
 }
 
 static const struct zcosmic_toplevel_info_v1_listener info_listener = {
@@ -294,7 +292,7 @@ void ksd_wayland_cosmic_detach_toplevel(ksd_wl_toplevel *toplevel)
     }
     free_geometries(toplevel->cosmic_geometries);
     toplevel->cosmic_geometries = NULL;
-    toplevel->cosmic_ready = false;
+    toplevel->ready = false;
 }
 
 void ksd_wayland_cosmic_output_removed(ksd_wayland *connection,
@@ -363,63 +361,6 @@ bool ksd_wayland_cosmic_can_set_state(const ksd_wayland *connection)
             ZCOSMIC_TOPLEVEL_MANAGER_V1_CAPABILITY_MINIMIZE);
 }
 
-static bool append_json_string(ksd_buffer *out, const char *value)
-{
-    if (!ksd_buffer_bytes(out, "\"", 1u))
-        return false;
-    for (const char *at = value == NULL ? "" : value; *at != '\0'; at++) {
-        unsigned char byte = (unsigned char)*at;
-        char escape[8];
-
-        if (byte == '"' || byte == '\\') {
-            escape[0] = '\\';
-            escape[1] = (char)byte;
-            if (!ksd_buffer_bytes(out, escape, 2u))
-                return false;
-        } else if (byte < 0x20u) {
-            int written = snprintf(escape, sizeof(escape), "\\u%04x",
-                                   (unsigned)byte);
-            if (written != 6 || !ksd_buffer_bytes(out, escape, 6u))
-                return false;
-        } else if (!ksd_buffer_bytes(out, at, 1u)) {
-            return false;
-        }
-    }
-    return ksd_buffer_bytes(out, "\"", 1u);
-}
-
-static bool finish_json(ksd_buffer *json, ksd_operation_result *result)
-{
-    ksd_buffer framed;
-    bool ok;
-
-    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
-    ok = json->length <= KSD_MAX_TEXT_BYTES
-        && ksd_buffer_u32(&framed, (uint32_t)json->length)
-        && ksd_buffer_bytes(&framed, json->data, json->length)
-        && ksd_result_copy(result, framed.data, (uint32_t)framed.length);
-    ksd_buffer_clear(&framed);
-    if (!ok)
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the window result is too large");
-    return ok;
-}
-
-static bool refresh(ksd_wayland *connection, ksd_operation_result *result)
-{
-    if (!ksd_wayland_cosmic_can_list(connection)) {
-        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
-                         "COSMIC window information is unavailable");
-        return false;
-    }
-    if (!ksd_wayland_roundtrip(connection, KSD_COSMIC_WINDOW_TIMEOUT_MS)) {
-        ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
-                         "the compositor did not answer");
-        return false;
-    }
-    return true;
-}
-
 static bool resolve_geometry(ksd_wayland *connection,
                              const ksd_wl_toplevel *toplevel,
                              int32_t *x, int32_t *y,
@@ -464,25 +405,27 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
     char geometry[320];
     int id_length = snprintf(id, sizeof(id), "%llu",
                              (unsigned long long)item->id);
-    bool active = (item->cosmic_state
-        & KSD_COSMIC_STATE_ACTIVATED) != 0u;
-    bool minimized = (item->cosmic_state
-        & KSD_COSMIC_STATE_MINIMIZED) != 0u;
-    bool maximized = (item->cosmic_state
-        & (KSD_COSMIC_STATE_MAXIMIZED | KSD_COSMIC_STATE_FULLSCREEN)) != 0u;
+    bool active = (item->state
+        & KSD_WL_TOPLEVEL_STATE_ACTIVATED) != 0u;
+    bool minimized = (item->state
+        & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u;
+    bool maximized = (item->state
+        & (KSD_WL_TOPLEVEL_STATE_MAXIMIZED | KSD_COSMIC_STATE_FULLSCREEN)) != 0u;
     int32_t x;
     int32_t y;
     int32_t width;
     int32_t height;
     bool has_geometry;
+    const char *title = item->title == NULL ? "" : item->title;
+    const char *app_id = item->app_id == NULL ? "" : item->app_id;
 
     if (id_length <= 0 || (size_t)id_length >= sizeof(id)
         || !ksd_buffer_bytes(out, "{\"id\":\"", 7u)
         || !ksd_buffer_bytes(out, id, (size_t)id_length)
         || !ksd_buffer_bytes(out, "\",\"title\":", 10u)
-        || !append_json_string(out, item->title)
+        || !ksd_buffer_json_string(out, title, strlen(title), false)
         || !ksd_buffer_bytes(out, ",\"appId\":", 9u)
-        || !append_json_string(out, item->app_id))
+        || !ksd_buffer_json_string(out, app_id, strlen(app_id), false))
         return false;
     has_geometry = resolve_geometry(connection, item, &x, &y, &width, &height);
     if (has_geometry) {
@@ -519,135 +462,27 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
 static bool usable(const ksd_wl_toplevel *item)
 {
     return item != NULL && !item->closed && item->cosmic_handle != NULL
-        && item->cosmic_ready && item->identifier != NULL && item->id != 0u;
+        && item->ready && item->identifier != NULL && item->id != 0u;
 }
 
-void ksd_wayland_cosmic_window_handles(ksd_wayland *connection,
-                                       ksd_operation_result *result)
+static uint32_t state(const ksd_wl_toplevel *item)
 {
-    ksd_buffer out;
-    bool ok;
-    bool first = true;
+    uint32_t value = item->state;
 
-    if (!refresh(connection, result))
-        return;
-    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
-    ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"handles\":[", 22u);
-    for (ksd_wl_toplevel *item = connection->toplevels;
-         ok && item != NULL; item = item->next) {
-        char id[32];
-        int length;
-        if (!usable(item))
-            continue;
-        length = snprintf(id, sizeof(id), "\"%llu\"",
-                          (unsigned long long)item->id);
-        if (!first)
-            ok = ksd_buffer_bytes(&out, ",", 1u);
-        first = false;
-        ok = ok && length > 0 && (size_t)length < sizeof(id)
-            && ksd_buffer_bytes(&out, id, (size_t)length);
-    }
-    ok = ok && ksd_buffer_bytes(&out, "]}", 2u);
-    if (!ok)
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the handle list is too large");
-    else
-        (void)finish_json(&out, result);
-    ksd_buffer_clear(&out);
+    if ((value & KSD_COSMIC_STATE_FULLSCREEN) != 0u)
+        value |= KSD_WL_TOPLEVEL_STATE_MAXIMIZED;
+    return value;
 }
 
-void ksd_wayland_cosmic_window_list(ksd_wayland *connection,
-                                    bool include_hidden,
-                                    ksd_operation_result *result)
+const ksd_wayland_window_view *ksd_wayland_cosmic_window_view(void)
 {
-    ksd_buffer out;
-    bool ok;
-    bool first = true;
+    static const ksd_wayland_window_view view = {
+        .usable = usable,
+        .state = state,
+        .append_window = append_window,
+    };
 
-    if (!refresh(connection, result))
-        return;
-    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
-    ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"windows\":[", 22u);
-    for (ksd_wl_toplevel *item = connection->toplevels;
-         ok && item != NULL; item = item->next) {
-        if (!usable(item)
-            || (!include_hidden
-                && (item->cosmic_state & KSD_COSMIC_STATE_MINIMIZED) != 0u))
-            continue;
-        if (!first)
-            ok = ksd_buffer_bytes(&out, ",", 1u);
-        first = false;
-        ok = ok && append_window(&out, connection, item);
-    }
-    ok = ok && ksd_buffer_bytes(&out, "]}", 2u);
-    if (!ok)
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the window list is too large");
-    else
-        (void)finish_json(&out, result);
-    ksd_buffer_clear(&out);
-}
-
-void ksd_wayland_cosmic_active_window(ksd_wayland *connection,
-                                      ksd_operation_result *result)
-{
-    ksd_buffer out;
-    bool ok;
-    ksd_wl_toplevel *active = NULL;
-
-    if (!refresh(connection, result))
-        return;
-    for (ksd_wl_toplevel *item = connection->toplevels;
-         item != NULL; item = item->next)
-        if (usable(item)
-            && (item->cosmic_state & KSD_COSMIC_STATE_ACTIVATED) != 0u) {
-            active = item;
-            break;
-        }
-    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
-    ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"window\":", 20u)
-        && (active == NULL
-            ? ksd_buffer_bytes(&out, "null", 4u)
-            : append_window(&out, connection, active))
-        && ksd_buffer_bytes(&out, "}", 1u);
-    if (!ok)
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the active window result is too large");
-    else
-        (void)finish_json(&out, result);
-    ksd_buffer_clear(&out);
-}
-
-static ksd_wl_toplevel *find_window(ksd_wayland *connection, uint64_t id)
-{
-    for (ksd_wl_toplevel *item = connection->toplevels;
-         item != NULL; item = item->next)
-        if (usable(item) && item->id == id)
-            return item;
-    return NULL;
-}
-
-void ksd_wayland_cosmic_window_query(ksd_wayland *connection,
-    uint64_t handle, ksd_operation_result *result)
-{
-    if (!refresh(connection, result))
-        return;
-    ksd_wl_toplevel *window = find_window(connection, handle);
-    if (window == NULL) {
-        ksd_result_error(result, KSD_STATUS_NOT_FOUND, 0u,
-                         "the window no longer exists");
-        return;
-    }
-    ksd_buffer out;
-    ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
-    bool ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"window\":", 20u)
-        && append_window(&out, connection, window) && ksd_buffer_bytes(&out, "}", 1u);
-    if (ok)
-        (void)finish_json(&out, result);
-    else
-        ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
-                         "the window result is too large");
-    ksd_buffer_clear(&out);
+    return &view;
 }
 
 void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
@@ -657,14 +492,10 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
 {
     ksd_wl_toplevel *window;
 
-    if (!refresh(connection, result))
+    window = ksd_wayland_window_for_action(
+        connection, handle, ksd_wayland_cosmic_window_view(), result);
+    if (window == NULL)
         return;
-    window = find_window(connection, handle);
-    if (window == NULL) {
-        ksd_result_error(result, KSD_STATUS_NOT_FOUND, 0u,
-                         "the window no longer exists");
-        return;
-    }
     if (opcode == KSD_OP_WINDOW_FOCUS
         && ksd_wayland_cosmic_can_focus(connection)) {
         zcosmic_toplevel_manager_v1_activate(
@@ -685,12 +516,12 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
                 connection->cosmic_toplevel_manager,
                 window->cosmic_handle);
         } else {
-            if ((window->cosmic_state & KSD_COSMIC_STATE_MINIMIZED) != 0u)
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
                 zcosmic_toplevel_manager_v1_unset_minimized(
                     connection->cosmic_toplevel_manager,
                     window->cosmic_handle);
-            if ((window->cosmic_state
-                 & KSD_COSMIC_STATE_MAXIMIZED) != 0u)
+            if ((window->state
+                 & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
                 zcosmic_toplevel_manager_v1_unset_maximized(
                     connection->cosmic_toplevel_manager,
                     window->cosmic_handle);

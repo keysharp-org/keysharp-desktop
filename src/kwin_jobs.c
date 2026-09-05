@@ -16,6 +16,11 @@ static size_t lane_capacity(ksd_kwin_lane lane)
     return 0u;
 }
 
+static size_t lane_index(ksd_kwin_lane lane)
+{
+    return lane == KSD_KWIN_LANE_FAST ? 0u : 1u;
+}
+
 static bool generation_valid(const char *generation)
 {
     if (generation == NULL)
@@ -67,6 +72,30 @@ static void release_slot(ksd_kwin_job *job)
     free(job->reply);
     memset(job, 0, sizeof(*job));
     job->state = KSD_KWIN_JOB_FREE;
+}
+
+ksd_kwin_queue *ksd_kwin_queue_create(const char *generation)
+{
+    ksd_kwin_queue *queue = malloc(sizeof(*queue));
+
+    if (queue == NULL)
+        return NULL;
+    if (!ksd_kwin_queue_init(queue, generation)) {
+        free(queue);
+        return NULL;
+    }
+    return queue;
+}
+
+void ksd_kwin_queue_destroy(ksd_kwin_queue *queue)
+{
+    if (queue == NULL)
+        return;
+    for (size_t index = 0u; index < KSD_KWIN_MAX_JOBS; index++) {
+        if (queue->jobs[index].state != KSD_KWIN_JOB_FREE)
+            release_slot(queue->jobs + index);
+    }
+    free(queue);
 }
 
 bool ksd_kwin_queue_submit(ksd_kwin_queue *queue, uint16_t opcode,
@@ -151,6 +180,131 @@ size_t ksd_kwin_queue_take(ksd_kwin_queue *queue, ksd_kwin_lane lane,
         taken++;
     }
     return taken;
+}
+
+static size_t dispatch_jobs(ksd_kwin_queue *queue, ksd_kwin_lane lane,
+                            uint64_t now_ms, ksd_kwin_dispatch *dispatch)
+{
+    const ksd_kwin_job *batch[KSD_KWIN_JOBS_PER_REPLY_FAST];
+    size_t taken = ksd_kwin_queue_take(queue, lane, batch,
+                                       KSD_KWIN_JOBS_PER_REPLY_FAST);
+
+    for (size_t index = 0u; index < taken; index++) {
+        dispatch[index].sequence = batch[index]->sequence;
+        dispatch[index].opcode = batch[index]->opcode;
+        dispatch[index].budget_ms = batch[index]->deadline_ms > now_ms
+            ? (uint32_t)(batch[index]->deadline_ms - now_ms) : 0u;
+        dispatch[index].body = batch[index]->body;
+        dispatch[index].body_length = batch[index]->body_length;
+    }
+    return taken;
+}
+
+bool ksd_kwin_queue_hello(ksd_kwin_queue *queue, ksd_buffer *reply)
+{
+    return queue != NULL && reply != NULL
+        && ksd_kwin_format_report_ack(queue->generation, reply);
+}
+
+ksd_kwin_poll_outcome ksd_kwin_queue_poll(ksd_kwin_queue *queue,
+                                           const uint8_t *envelope,
+                                           size_t length, uint64_t now_ms,
+                                           ksd_buffer *reply)
+{
+    ksd_kwin_poll poll;
+    ksd_kwin_dispatch dispatch[KSD_KWIN_JOBS_PER_REPLY_FAST];
+    size_t taken;
+
+    if (queue == NULL || reply == NULL
+        || !ksd_kwin_parse_poll(envelope, length, &poll)
+        || memcmp(poll.generation, queue->generation,
+                  KSD_KWIN_GENERATION_HEX) != 0)
+        return KSD_KWIN_POLL_REFUSED;
+    taken = dispatch_jobs(queue, poll.lane, now_ms, dispatch);
+    if (taken == 0u) {
+        queue->parked[lane_index(poll.lane)] = true;
+        return KSD_KWIN_POLL_PARKED;
+    }
+    queue->parked[lane_index(poll.lane)] = false;
+    if (!ksd_kwin_format_poll_reply(queue->generation, poll.lane, 0u,
+                                    dispatch, taken, reply))
+        return KSD_KWIN_POLL_REFUSED;
+    return KSD_KWIN_POLL_ANSWERED;
+}
+
+bool ksd_kwin_queue_poll_parked(ksd_kwin_queue *queue, ksd_kwin_lane lane,
+                                uint64_t now_ms, ksd_buffer *reply)
+{
+    ksd_kwin_dispatch dispatch[KSD_KWIN_JOBS_PER_REPLY_FAST];
+    size_t taken;
+
+    if (queue == NULL || reply == NULL
+        || (lane != KSD_KWIN_LANE_FAST && lane != KSD_KWIN_LANE_SLOW))
+        return false;
+    queue->parked[lane_index(lane)] = false;
+    taken = dispatch_jobs(queue, lane, now_ms, dispatch);
+    return ksd_kwin_format_poll_reply(
+        queue->generation, lane, taken == 0u ? KSD_KWIN_IDLE_REPLY_MS : 0u,
+        taken == 0u ? NULL : dispatch, taken, reply);
+}
+
+bool ksd_kwin_queue_report(ksd_kwin_queue *queue, const uint8_t *envelope,
+                           size_t length, ksd_buffer *reply)
+{
+    ksd_kwin_report report;
+
+    if (queue == NULL || reply == NULL
+        || !ksd_kwin_parse_report(envelope, length, &report)
+        || memcmp(report.generation, queue->generation,
+                  KSD_KWIN_GENERATION_HEX) != 0)
+        return false;
+    for (size_t index = 0u; index < report.count; index++) {
+        const ksd_kwin_job *job =
+            ksd_kwin_queue_find(queue, report.done[index].sequence);
+
+        if (job == NULL || job->state != KSD_KWIN_JOB_DISPATCHED)
+            return false;
+    }
+    for (size_t index = 0u; index < report.count; index++) {
+        if (!ksd_kwin_queue_complete(queue, queue->generation,
+                                     report.done[index].sequence,
+                                     report.done[index].status,
+                                     report.done[index].body,
+                                     report.done[index].body_length))
+            return false;
+    }
+    return ksd_kwin_format_report_ack(queue->generation, reply);
+}
+
+bool ksd_kwin_queue_parked(const ksd_kwin_queue *queue, ksd_kwin_lane lane)
+{
+    if (queue == NULL || (lane != KSD_KWIN_LANE_FAST
+                          && lane != KSD_KWIN_LANE_SLOW))
+        return false;
+    return queue->parked[lane_index(lane)];
+}
+
+bool ksd_kwin_queue_result(ksd_kwin_queue *queue, const char *sequence,
+                           uint32_t *status, const uint8_t **body,
+                           uint32_t *body_length)
+{
+    const ksd_kwin_job *job;
+
+    if (queue == NULL || status == NULL || body == NULL
+        || body_length == NULL)
+        return false;
+    job = ksd_kwin_queue_find(queue, sequence);
+    if (job == NULL || job->state != KSD_KWIN_JOB_DONE)
+        return false;
+    *status = job->status;
+    *body = job->reply;
+    *body_length = job->reply_length;
+    return true;
+}
+
+const char *ksd_kwin_queue_generation(const ksd_kwin_queue *queue)
+{
+    return queue == NULL ? NULL : queue->generation;
 }
 
 bool ksd_kwin_queue_complete(ksd_kwin_queue *queue, const char *generation,

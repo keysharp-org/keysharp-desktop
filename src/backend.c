@@ -136,9 +136,7 @@ static bool entry_value(const char *entry, size_t entry_length,
     return true;
 }
 
-/* One walk of the environment, two answers. The compositor comes from
- * XDG_CURRENT_DESKTOP as before; the session type is new and is read in the
- * same pass rather than by opening /proc twice. */
+/* One environment read yields both compositor and session type. */
 static bool read_session_facts(pid_t pid, session_facts *facts)
 {
     char path[64];
@@ -371,7 +369,7 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW \
      | KSD_OPERATION_KEYBOARD_STATE \
      | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
-     | KSD_OPERATION_WINDOW_HANDLES \
+     | KSD_OPERATION_WINDOW_HANDLES | KSD_OPERATION_WINDOW_QUERY \
      | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE \
      | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_MOVE_RESIZE \
      | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY \
@@ -390,6 +388,7 @@ uint64_t ksd_backend_operations(ksd_backend backend)
     if (backend != KSD_BACKEND_GNOME && backend != KSD_BACKEND_CINNAMON)
         return 0u;
     uint64_t operations = KSD_OPERATION_WINDOW_LIST
+        | KSD_OPERATION_WINDOW_QUERY
         | KSD_OPERATION_KEYBOARD_STATE
         | KSD_OPERATION_WINDOW_ACTIVE
         | KSD_OPERATION_WINDOW_WATCH | KSD_OPERATION_WINDOW_FOCUS

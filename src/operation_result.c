@@ -105,3 +105,25 @@ bool ksd_result_copy(ksd_operation_result *result, const void *tail,
     }
     return ksd_result_take(result, copy, tail_length);
 }
+
+bool ksd_result_take_framed_text(ksd_buffer *buffer,
+                                 ksd_operation_result *result,
+                                 uint32_t failure_status,
+                                 const char *diagnostic)
+{
+    bool ok = ksd_buffer_frame_text(buffer, KSD_MAX_TEXT_BYTES);
+
+    if (ok) {
+        uint8_t *tail = buffer->data;
+        uint32_t length = (uint32_t)buffer->length;
+
+        buffer->data = NULL;
+        buffer->length = 0u;
+        buffer->capacity = 0u;
+        ok = ksd_result_take(result, tail, length);
+    }
+    ksd_buffer_clear(buffer);
+    if (!ok)
+        ksd_result_error(result, failure_status, 0u, diagnostic);
+    return ok;
+}

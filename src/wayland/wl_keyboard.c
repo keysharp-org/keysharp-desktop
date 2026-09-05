@@ -194,10 +194,9 @@ void ksd_wayland_keyboard_state_since(ksd_wayland *connection,
     }
     g_string_append(out, "]}");
     ksd_buffer framed;
-    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES + 4u);
-    if (out->len > KSD_MAX_TEXT_BYTES
-        || !ksd_buffer_u32(&framed, (uint32_t)out->len)
-        || !ksd_buffer_bytes(&framed, out->str, out->len)
+    ksd_buffer_init(&framed, KSD_MAX_TEXT_BYTES);
+    if (!ksd_buffer_bytes(&framed, out->str, out->len)
+        || !ksd_buffer_frame_text(&framed, KSD_MAX_TEXT_BYTES)
         || !ksd_result_copy(result, framed.data, (uint32_t)framed.length))
         ksd_result_error(result, KSD_STATUS_RESOURCE_EXHAUSTED, 0u,
                          "the keyboard keymap exceeds the response limit");

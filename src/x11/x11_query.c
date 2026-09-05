@@ -2,50 +2,51 @@
 
 #include "protocol.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Every name is asked for in one pass and every answer collected in a second.
- * xcb returns a cookie without waiting, so the fifteen interns cost one round
- * trip rather than fifteen; issuing and immediately awaiting each is the shape
- * xcb exists to let callers avoid. */
+/* Every name is asked for in one pass and every answer collected in a second,
+ * once for the session-lifetime connection. */
 void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
 {
     static const char *const names[] = {
-        "_NET_CLIENT_LIST", "_NET_ACTIVE_WINDOW", "_NET_WORKAREA",
+        "_NET_CLIENT_LIST", "_NET_ACTIVE_WINDOW", "_NET_CLOSE_WINDOW",
+        "_NET_MOVERESIZE_WINDOW", "_NET_WORKAREA",
         "_NET_CURRENT_DESKTOP", "_NET_WM_DESKTOP", "_NET_WM_NAME",
-        "_NET_WM_PID", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
+        "_NET_WM_PID", "WM_STATE", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
         "_NET_WM_STATE_ABOVE", "_NET_WM_STATE_MAXIMIZED_VERT",
-        "_NET_WM_STATE_MAXIMIZED_HORZ", "_NET_FRAME_EXTENTS",
-        "_NET_WM_WINDOW_OPACITY", "UTF8_STRING", "_NET_CLIENT_LIST_STACKING",
+        "_NET_WM_STATE_MAXIMIZED_HORZ", "WM_CHANGE_STATE",
+        "_NET_FRAME_EXTENTS", "_NET_WM_WINDOW_OPACITY", "_MOTIF_WM_HINTS",
+        "UTF8_STRING", "_NET_CLIENT_LIST_STACKING",
     };
     size_t count = sizeof(names) / sizeof(names[0]);
-    xcb_intern_atom_cookie_t cookies[16];
-    xcb_atom_t *fields[16];
+    xcb_intern_atom_cookie_t cookies[sizeof(names) / sizeof(names[0])];
+    xcb_atom_t *fields[sizeof(names) / sizeof(names[0])];
 
     fields[0] = &atoms->client_list;
     fields[1] = &atoms->active_window;
-    fields[2] = &atoms->work_area;
-    fields[3] = &atoms->current_desktop;
-    fields[4] = &atoms->wm_desktop;
-    fields[5] = &atoms->wm_name;
-    fields[6] = &atoms->wm_pid;
-    fields[7] = &atoms->wm_state;
-    fields[8] = &atoms->state_hidden;
-    fields[9] = &atoms->state_above;
-    fields[10] = &atoms->state_max_vert;
-    fields[11] = &atoms->state_max_horz;
-    fields[12] = &atoms->frame_extents;
-    fields[13] = &atoms->opacity;
-    fields[14] = &atoms->utf8_string;
-    fields[15] = &atoms->client_list_stacking;
+    fields[2] = &atoms->close_window;
+    fields[3] = &atoms->moveresize_window;
+    fields[4] = &atoms->work_area;
+    fields[5] = &atoms->current_desktop;
+    fields[6] = &atoms->wm_desktop;
+    fields[7] = &atoms->wm_name;
+    fields[8] = &atoms->wm_pid;
+    fields[9] = &atoms->icccm_wm_state;
+    fields[10] = &atoms->wm_state;
+    fields[11] = &atoms->state_hidden;
+    fields[12] = &atoms->state_above;
+    fields[13] = &atoms->state_max_vert;
+    fields[14] = &atoms->state_max_horz;
+    fields[15] = &atoms->change_state;
+    fields[16] = &atoms->frame_extents;
+    fields[17] = &atoms->opacity;
+    fields[18] = &atoms->motif_hints;
+    fields[19] = &atoms->utf8_string;
+    fields[20] = &atoms->client_list_stacking;
 
-    /* only_if_exists. Interning with creation would add every EWMH name to the
-     * atom table of a server that has no window manager, and would make a
-     * property that cannot exist look merely empty. */
     for (size_t index = 0u; index < count; index++)
-        cookies[index] = xcb_intern_atom(c, 1,
+        cookies[index] = xcb_intern_atom(c, 0,
             (uint16_t)strlen(names[index]), names[index]);
     for (size_t index = 0u; index < count; index++) {
         xcb_intern_atom_reply_t *reply =
@@ -117,42 +118,6 @@ bool ksd_x11_has_state(xcb_connection_t *c, const x11_atoms *atoms,
     return found;
 }
 
-static bool append_json_string(ksd_buffer *out, const char *value,
-                               size_t length, bool latin1)
-{
-    if (!ksd_buffer_bytes(out, "\"", 1u))
-        return false;
-    for (size_t index = 0u; index < length; index++) {
-        unsigned char byte = (unsigned char)value[index];
-        char escaped[8];
-        size_t pieces = 1u;
-
-        if (byte == 34u || byte == 92u) {
-            escaped[0] = '\\';
-            escaped[1] = (char)byte;
-            pieces = 2u;
-        } else if (byte < 32u || byte == 127u || (latin1 && byte >= 128u)) {
-            int written = snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
-            if (written != 6)
-                return false;
-            pieces = 6u;
-        } else {
-            escaped[0] = (char)byte;
-        }
-        if (!ksd_buffer_bytes(out, escaped, pieces))
-            return false;
-    }
-    return ksd_buffer_bytes(out, "\"", 1u);
-}
-
-bool ksd_x11_append_text(ksd_buffer *out, xcb_connection_t *c,
-                         xcb_window_t window, xcb_atom_t name,
-                         xcb_atom_t type)
-{
-    return ksd_x11_append_text_reply(out, ksd_x11_property(c, window, name, type,
-                                                         KSD_X11_MAX_TEXT / 4u));
-}
-
 static void numeric_result(ksd_operation_result *result,
                            const uint32_t *values, size_t count)
 {
@@ -191,13 +156,12 @@ void ksd_x11_cursor_position(ksd_x11 *connection, ksd_operation_result *result)
 
 void ksd_x11_work_area(ksd_x11 *connection, ksd_operation_result *result)
 {
-    x11_atoms atoms;
+    const x11_atoms *atoms = &connection->atoms;
     uint32_t desktop = 0u;
     uint32_t values[4];
 
-    ksd_x11_load_atoms(connection->connection, &atoms);
     (void)ksd_x11_cardinal(connection->connection, connection->screen->root,
-                           atoms.current_desktop, &desktop);
+                           atoms->current_desktop, &desktop);
     if (desktop > 1024u) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "the X server reported an implausible desktop");
@@ -208,7 +172,7 @@ void ksd_x11_work_area(ksd_x11 *connection, ksd_operation_result *result)
      * not publish it leaves the screen itself as the answer, which is true on
      * a bare session with no panels rather than a failure. */
     xcb_get_property_reply_t *reply = ksd_x11_property(connection->connection,
-        connection->screen->root, atoms.work_area, XCB_ATOM_CARDINAL,
+        connection->screen->root, atoms->work_area, XCB_ATOM_CARDINAL,
         (desktop + 1u) * 4u);
     int length = reply != NULL ? xcb_get_property_value_length(reply) : 0;
     size_t needed = ((size_t)desktop + 1u) * 4u * sizeof(uint32_t);
@@ -277,7 +241,7 @@ bool ksd_x11_append_text_reply(ksd_buffer *out, xcb_get_property_reply_t *reply)
     bool ok;
 
     if (reply == NULL)
-        return append_json_string(out, "", 0u, false);
+        return ksd_buffer_json_string(out, "", 0u, false);
 
     int raw = xcb_get_property_value_length(reply);
     const char *value = xcb_get_property_value(reply);
@@ -301,7 +265,7 @@ bool ksd_x11_append_text_reply(ksd_buffer *out, xcb_get_property_reply_t *reply)
         }
         if (!ksd_utf8_valid((const uint8_t *)value, length, false)) length = 0u;
     }
-    ok = append_json_string(out, value, length, latin1);
+    ok = ksd_buffer_json_string(out, value, length, latin1);
     free(reply);
     return ok;
 }

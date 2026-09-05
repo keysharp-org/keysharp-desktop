@@ -6,6 +6,7 @@ ksd_kwin_lane ksd_kwin_lane_for(uint16_t opcode)
         /* O(1) inside the script: one window looked up in its own map, and a
          * bounded number of property touches. */
         case KSD_OP_WINDOW_ACTIVE:
+        case KSD_OP_WINDOW_QUERY:
         case KSD_OP_WINDOW_FOCUS:
         case KSD_OP_WINDOW_RAISE:
         case KSD_OP_WINDOW_LOWER:
@@ -40,28 +41,9 @@ ksd_kwin_lane ksd_kwin_lane_for(uint16_t opcode)
 
 ksd_kwin_cost ksd_kwin_script_cost(uint16_t opcode)
 {
-    switch (opcode) {
-        case KSD_OP_WINDOW_ACTIVE:
-        case KSD_OP_WINDOW_FOCUS:
-        case KSD_OP_WINDOW_RAISE:
-        case KSD_OP_WINDOW_LOWER:
-        case KSD_OP_WINDOW_CLOSE:
-        case KSD_OP_WINDOW_MOVE_RESIZE:
-        case KSD_OP_WINDOW_MOVE_RESIZE_XID:
-        case KSD_OP_WINDOW_SET_STATE:
-        case KSD_OP_WINDOW_SET_OPACITY:
-        case KSD_OP_WINDOW_SET_ABOVE:
-        case KSD_OP_WINDOW_SET_DECORATED:
-        case KSD_OP_WINDOW_SET_SKIP_TASKBAR:
-        case KSD_OP_CURSOR_POSITION:
-        case KSD_OP_WORK_AREA:
-            return KSD_KWIN_COST_BOUNDED;
-
-        case KSD_OP_WINDOW_LIST:
-        case KSD_OP_WINDOW_HANDLES:
-            return KSD_KWIN_COST_UNBOUNDED;
-
-        default:
-            return KSD_KWIN_COST_NONE;
+    switch (ksd_kwin_lane_for(opcode)) {
+        case KSD_KWIN_LANE_FAST: return KSD_KWIN_COST_BOUNDED;
+        case KSD_KWIN_LANE_SLOW: return KSD_KWIN_COST_UNBOUNDED;
+        default: return KSD_KWIN_COST_NONE;
     }
 }

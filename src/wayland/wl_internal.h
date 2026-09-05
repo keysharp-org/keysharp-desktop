@@ -32,27 +32,21 @@ typedef struct ksd_cosmic_geometry {
 typedef struct ksd_wl_toplevel {
     struct ext_foreign_toplevel_handle_v1 *handle;
     struct zcosmic_toplevel_handle_v1 *cosmic_handle;
+    struct zwlr_foreign_toplevel_handle_v1 *wlr_handle;
     uint64_t id;
     char *title;
     char *app_id;
     char *identifier;
-    uint32_t cosmic_state;
-    bool cosmic_ready;
+    uint32_t state;
+    bool ready;
     bool closed;
     ksd_cosmic_geometry *cosmic_geometries;
     struct ksd_wl_toplevel *next;
 } ksd_wl_toplevel;
 
-typedef struct ksd_wlr_toplevel {
-    struct zwlr_foreign_toplevel_handle_v1 *handle;
-    uint64_t id;
-    char *title;
-    char *app_id;
-    uint32_t state;
-    bool ready;
-    bool closed;
-    struct ksd_wlr_toplevel *next;
-} ksd_wlr_toplevel;
+#define KSD_WL_TOPLEVEL_STATE_MAXIMIZED (UINT32_C(1) << 0)
+#define KSD_WL_TOPLEVEL_STATE_MINIMIZED (UINT32_C(1) << 1)
+#define KSD_WL_TOPLEVEL_STATE_ACTIVATED (UINT32_C(1) << 2)
 
 typedef struct ksd_wl_output {
     struct wl_output *output;
@@ -105,20 +99,19 @@ struct ksd_wayland {
      * and a listener added later would miss them all. */
     ksd_wl_toplevel *toplevels;
     uint32_t cosmic_capabilities;
-    ksd_wlr_toplevel *wlr_toplevels;
     ksd_wl_output *outputs;
     pid_t session_pid;
 };
 
 /* A handle remains opaque across worker and compositor restarts. */
 uint64_t ksd_wayland_new_handle(const ksd_wayland *connection);
+void ksd_wayland_replace_string(char **slot, const char *value);
 
 /* Attaches the toplevel listener. Called once, immediately after the global is
  * bound, for the reason above. */
 void ksd_wayland_toplevels_attach(ksd_wayland *connection);
 void ksd_wayland_toplevels_clear(ksd_wayland *connection);
 void ksd_wayland_wlr_toplevels_attach(ksd_wayland *connection);
-void ksd_wayland_wlr_toplevels_clear(ksd_wayland *connection);
 
 /* One round trip, bounded. wl_display_roundtrip blocks with no deadline of its
  * own, and a compositor that stops answering would park the worker for as long

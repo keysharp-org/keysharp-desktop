@@ -65,60 +65,6 @@ static bool private_directory(const char *path, uid_t owner)
         && (status.st_mode & (S_IRWXG | S_IRWXO)) == 0u;
 }
 
-static uint64_t monotonic_milliseconds(void)
-{
-    struct timespec now;
-    return clock_gettime(CLOCK_MONOTONIC, &now) == 0
-        ? (uint64_t)now.tv_sec * 1000u
-            + (uint64_t)now.tv_nsec / 1000000u
-        : 0u;
-}
-
-static bool wait_for(int descriptor, short events, uint64_t deadline)
-{
-    for (;;) {
-        uint64_t now = monotonic_milliseconds();
-        if (now == 0u || now >= deadline) {
-            errno = ETIMEDOUT;
-            return false;
-        }
-        uint64_t remaining = deadline - now;
-        struct pollfd item = { .fd = descriptor, .events = events };
-        int ready = poll(&item, 1u, remaining > (uint64_t)INT_MAX
-            ? INT_MAX : (int)remaining);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready == 0)
-            errno = ETIMEDOUT;
-        if (ready <= 0 || (item.revents & (POLLERR | POLLNVAL)) != 0)
-            return false;
-        return (item.revents & (events | POLLHUP | POLLRDHUP)) != 0;
-    }
-}
-
-static bool transfer_fixed(int descriptor, void *data, size_t length,
-                           bool write_data, uint64_t deadline)
-{
-    uint8_t *bytes = data;
-    size_t offset = 0u;
-    while (offset < length) {
-        if (!wait_for(descriptor, write_data ? POLLOUT : POLLIN, deadline))
-            return false;
-        ssize_t count = write_data
-            ? send(descriptor, bytes + offset, length - offset,
-                   MSG_DONTWAIT | MSG_NOSIGNAL)
-            : recv(descriptor, bytes + offset, length - offset,
-                   MSG_DONTWAIT);
-        if (count < 0 && (errno == EINTR || errno == EAGAIN
-                          || errno == EWOULDBLOCK))
-            continue;
-        if (count <= 0)
-            return false;
-        offset += (size_t)count;
-    }
-    return true;
-}
-
 /* Connects to one authority and checks that the far end really is the party
  * that owns the socket. `owner` runs the whole way through: it decides which
  * socket is acceptable and which peer is, and the two have to be the same
@@ -151,7 +97,7 @@ static int connect_to(const char *directory, const char *path, uid_t owner,
     if (connect(descriptor, (const struct sockaddr *)&address,
                 sizeof(address)) != 0
         && (errno != EINPROGRESS
-            || !wait_for(descriptor, POLLOUT, deadline)))
+            || !ksd_wait_until(descriptor, POLLOUT, deadline)))
         goto failed;
     if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR,
                    &socket_error, &socket_error_size) != 0
@@ -339,11 +285,12 @@ static bool register_backend(int descriptor, ksd_backend backend,
         if (!ksd_send_with_fd(descriptor, message, sizeof(message),
                               provider_fd))
             return false;
-    } else if (!transfer_fixed(descriptor, message, sizeof(message), true,
-                               deadline)) {
+    } else if (ksd_transfer_until(descriptor, message, sizeof(message), true,
+                                  deadline) != (ssize_t)sizeof(message)) {
         return false;
     }
-    return transfer_fixed(descriptor, reply, sizeof(reply), false, deadline)
+    return ksd_transfer_until(descriptor, reply, sizeof(reply), false,
+                              deadline) == (ssize_t)sizeof(reply)
         && ksd_backend_ack_parse(reply, backend, requested, accepted);
 }
 
@@ -383,11 +330,7 @@ int ksd_daemon_main(int argc, char **argv)
         attempts++;
         if (!waiting) {
             waiting = true;
-            /* Naming the thing that is actually missing. This used to mention
-             * only kwin_wayland, which on a GNOME or Cinnamon session
-             * describes a compositor the user is not running and says nothing
-             * about the extension they have not enabled -- the one cause this
-             * message exists to report. */
+            /* Name the provider because its absence is the usual cause. */
             fputs("keysharp-desktop daemon: waiting for a compositor provider."
                   " On GNOME and Cinnamon this is the keysharp shell"
                   " extension: enable it, then log out and back in. KWin needs"
@@ -397,7 +340,7 @@ int ksd_daemon_main(int argc, char **argv)
         while (nanosleep(&retry, &retry) != 0 && errno == EINTR) {
         }
     }
-    uint64_t now = monotonic_milliseconds();
+    uint64_t now = ksd_monotonic_milliseconds();
     uint64_t deadline = now == 0u
         ? 0u : now + KSD_BACKEND_REGISTRATION_TIMEOUT_MS;
     uint64_t accepted = 0u;
@@ -462,18 +405,18 @@ int ksd_daemon_main(int argc, char **argv)
         char generation[KSD_KWIN_GENERATION_HEX + 1u];
 
         if (issue_generation(generation)) {
-            ksd_kwin_host *host = ksd_kwin_host_create(generation);
-            ksd_kwin_bus *bus = host == NULL ? NULL
-                : ksd_kwin_bus_start(host, provider_pair[0]);
+            ksd_kwin_queue *queue = ksd_kwin_queue_create(generation);
+            ksd_kwin_bus *bus = queue == NULL ? NULL
+                : ksd_kwin_bus_start(queue, provider_pair[0]);
 
             if (bus != NULL) {
                 (void)ksd_kwin_bus_run(bus, descriptor);
                 ksd_kwin_bus_stop(bus);
-                ksd_kwin_host_destroy(host);
+                ksd_kwin_queue_destroy(queue);
                 close(descriptor);
                 return 1;
             }
-            ksd_kwin_host_destroy(host);
+            ksd_kwin_queue_destroy(queue);
         }
         /* Falling through to the plain loop is deliberate. Without the bus the
          * script has nothing to call, but the registration is still live and
