@@ -361,16 +361,16 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * touch the script; everything else is relayed to it over the socket the
  * daemon hands over at registration.
  *
- * WINDOW_LOWER is absent because KWin exposes raise and no lower, and the
- * script reports UNSUPPORTED rather than approximating it -- so advertising it
- * would promise something that is always refused. The reservations and the
- * watch are absent because nothing serves them yet. */
+ * Lowering uses KWin's active-window slot, with the provider selecting the
+ * requested window first. The reservations and watch are absent because
+ * nothing serves them yet. */
 #define KSD_KWIN_OPERATIONS \
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_WINDOW \
      | KSD_OPERATION_KEYBOARD_STATE \
      | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE \
      | KSD_OPERATION_WINDOW_HANDLES | KSD_OPERATION_WINDOW_QUERY \
      | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE \
+     | KSD_OPERATION_WINDOW_LOWER \
      | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_MOVE_RESIZE \
      | KSD_OPERATION_WINDOW_SET_STATE | KSD_OPERATION_WINDOW_SET_OPACITY \
      | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_SET_DECORATED \

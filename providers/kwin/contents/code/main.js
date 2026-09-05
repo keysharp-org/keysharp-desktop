@@ -308,7 +308,7 @@ function findWindow(handle) {
     return null;
 }
 
-function isMaximized(window) {
+function maximizedState(window) {
     if (window.maximizeMode !== undefined) {
         var mode = Number(window.maximizeMode);
 
@@ -318,20 +318,22 @@ function isMaximized(window) {
     if (window.maximized !== undefined)
         return window.maximized === true;
     if (typeof workspace.clientArea !== "function")
-        return false;
+        return null;
     var area;
 
     try {
         area = workspace.clientArea(KWin.MaximizeArea, window);
     } catch (error) {
-        return false;
+        return null;
     }
     if (area === null || area === undefined)
-        return false;
+        return null;
     var geometry = window.frameGeometry || window.geometry;
 
-    return geometry !== null && geometry !== undefined
-        && Math.abs(Number(geometry.x) - Number(area.x)) <= 1
+    if (geometry === null || geometry === undefined)
+        return null;
+
+    return Math.abs(Number(geometry.x) - Number(area.x)) <= 1
         && Math.abs(Number(geometry.y) - Number(area.y)) <= 1
         && Math.abs(Number(geometry.width) - Number(area.width)) <= 1
         && Math.abs(Number(geometry.height) - Number(area.height)) <= 1;
@@ -362,9 +364,21 @@ function raiseWindow(window) {
     return true;
 }
 
+function lowerWindow(window) {
+    if (typeof workspace.slotWindowLower !== "function")
+        return false;
+
+    api.setActiveWindow(window);
+    workspace.slotWindowLower();
+    return true;
+}
+
 function windowJson(window) {
     var geometry = window.frameGeometry || window.geometry
         || { x: 0, y: 0, width: 0, height: 0 };
+    var buffer = window.bufferGeometry
+        || { x: 0, y: 0, width: 0, height: 0 };
+    var maximized = maximizedState(window);
 
     var valid = ['id'];
     if (window.caption !== undefined) valid.push('title');
@@ -374,8 +388,9 @@ function windowJson(window) {
     // 'client' repeats the frame rect: the scripting API exposes no separate client area, and under the
     // client-side decorations Wayland clients use the two coincide.
     if (window.frameGeometry || window.geometry) { valid.push('frame'); valid.push('client'); }
+    if (window.bufferGeometry) valid.push('buffer');
     if (window.minimized !== undefined) valid.push('minimized');
-    if (window.maximizeMode !== undefined || window.maximized !== undefined) valid.push('maximized');
+    if (maximized !== null) valid.push('maximized');
     if (window.active !== undefined) valid.push('active');
     if (window.hidden !== undefined && window.minimized !== undefined) valid.push('visible');
     if (window.keepAbove !== undefined) valid.push('alwaysOnTop');
@@ -396,9 +411,13 @@ function windowJson(window) {
         + ",\"y\":" + String(Math.round(geometry.y))
         + ",\"width\":" + String(Math.round(geometry.width))
         + ",\"height\":" + String(Math.round(geometry.height))
+        + "},\"buffer\":{\"x\":" + String(Math.round(buffer.x))
+        + ",\"y\":" + String(Math.round(buffer.y))
+        + ",\"width\":" + String(Math.round(buffer.width))
+        + ",\"height\":" + String(Math.round(buffer.height))
         + "},\"minimized\":" + (window.minimized ? "true" : "false")
         + ",\"active\":" + (window.active ? "true" : "false")
-        + ",\"maximized\":" + (isMaximized(window) ? "true" : "false")
+        + ",\"maximized\":" + (maximized ? "true" : "false")
         + ",\"visible\":"
         + (!(window.hidden || window.minimized) ? "true" : "false")
         + ",\"alwaysOnTop\":" + (window.keepAbove ? "true" : "false")
@@ -565,10 +584,11 @@ function executeJob(job) {
         };
 
     case OP_WINDOW_LOWER:
-        /* KWin exposes no lower. Sending the window behind every other one is
-         * not the same operation and would be a worse surprise than saying so,
-         * which is why this reports unsupported rather than approximating. */
-        return { sequence: job.sequence, status: STATUS_UNSUPPORTED, body: "" };
+        return {
+            sequence: job.sequence,
+            status: lowerWindow(window) ? STATUS_OK : STATUS_UNSUPPORTED,
+            body: ""
+        };
 
     case OP_WINDOW_CLOSE:
         window.closeWindow();

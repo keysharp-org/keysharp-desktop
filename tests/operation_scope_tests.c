@@ -231,6 +231,7 @@ int main(void)
                | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_ACTIVE
                | KSD_OPERATION_WINDOW_HANDLES | KSD_OPERATION_WINDOW_QUERY
                | KSD_OPERATION_WINDOW_FOCUS | KSD_OPERATION_WINDOW_RAISE
+               | KSD_OPERATION_WINDOW_LOWER
                | KSD_OPERATION_WINDOW_CLOSE
                | KSD_OPERATION_WINDOW_MOVE_RESIZE
                | KSD_OPERATION_WINDOW_SET_STATE
@@ -239,12 +240,6 @@ int main(void)
                | KSD_OPERATION_WINDOW_SET_DECORATED
                | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR
                | KSD_OPERATION_CURSOR_POSITION | KSD_OPERATION_WORK_AREA));
-    /* LOWER stays out on purpose: KWin exposes raise and no lower, and the
-     * script answers UNSUPPORTED rather than approximating it by sending the
-     * window behind everything. Advertising it would promise a verb that is
-     * always refused. */
-    assert((ksd_backend_operations(KSD_BACKEND_KWIN)
-            & KSD_OPERATION_WINDOW_LOWER) == 0u);
     /* And every KWin verb outside the two captures takes a lane, or it would
      * be advertised with no way to reach the script. */
     for (uint32_t opcode = 0u; opcode <= UINT16_MAX; opcode++) {

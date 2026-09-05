@@ -15,6 +15,10 @@ What a session supports depends on its compositor, so check
 | Absolute pointer / cursor position | yes | cursor query | yes | yes | protocol-dependent |
 | Keyboard map/layout | XKB | - | - | - | compositor-dependent |
 
+KWin window control includes raising and lowering through its scripting API.
+KWin exposes window captions and input eligibility only as read-only state, and
+its ordinary scripting API cannot request a client redraw.
+
 X11 window events subscribe to XCB property and structure notifications on a
 dedicated worker connection. Idle subscriptions issue no window queries. Changes
 query the affected window; client-list changes update the subscription set.
