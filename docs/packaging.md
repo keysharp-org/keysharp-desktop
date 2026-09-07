@@ -54,7 +54,13 @@ The user manager can survive a logout while its graphical-session environment
 is replaced for the next login. The daemon refreshes the session-defining
 variables from that live environment while waiting and while rechecking a
 registered backend, so a restart between desktops cannot pin it to the old
-desktop identity.
+desktop identity. It reads its own session facts through `getenv`, never from
+`/proc/self/environ`: that file keeps the values the process was exec'd with
+for its whole life, and `setenv` does not rewrite it, so a resolver reading it
+would measure the stale identity against itself and never see the change.
+A manager environment naming no display of either kind is ignored rather than
+adopted, because a session that never imported its environment leaves that
+block behind and adopting it would restart the daemon on every recheck.
 
 Install and removal scripts reload the dynamic-linker cache after adding or
 removing the SONAME library. They reload systemd, enable the system socket,

@@ -201,6 +201,47 @@ static ksd_backend child_backend(const char *desktop)
     return child_resolve(&session);
 }
 
+/* THE STALE-SNAPSHOT TRAP. A systemd user manager outlives a logout, so this
+ * daemon can be older than the session it serves, and it repairs that by
+ * adopting the manager's environment with setenv(). setenv() does not rewrite
+ * /proc/self/environ, which keeps the values this process was exec'd with for
+ * its whole life. A resolver that read the snapshot for its own pid would
+ * therefore check the stale identity against itself and report the previous
+ * session's backend forever, however often the recheck loop ran. */
+static void check_live_environment_wins(void)
+{
+    session_environment session = { "X-Cinnamon", "x11", NULL, ":0" };
+
+    /* Exec'd into X11 and left alone: still X11. */
+    assert(child_resolve(&session) == KSD_BACKEND_X11);
+
+    /* Same exec-time environment, then handed a Wayland one in-process the way
+     * the manager refresh hands one over. No provider owns a name on the test
+     * bus, so the answer is NONE rather than Cinnamon; what matters is that it
+     * is no longer X11. */
+    assert(child_query(&session, "resolve-live") == (int)KSD_BACKEND_NONE);
+}
+
+/* An environment block naming no display of either kind is not a session to
+ * adopt. Sessions that never import their environment into the user manager
+ * leave exactly that block behind, and unsetting a working desktop identity on
+ * the strength of it would restart the daemon on every recheck. */
+static void check_environment_guard(void)
+{
+    static const char *const displayless[] = {
+        "XDG_CURRENT_DESKTOP=GNOME",
+        "XDG_SESSION_TYPE=wayland",
+    };
+
+    assert(setenv("XDG_CURRENT_DESKTOP", "X-Cinnamon", 1) == 0);
+    assert(setenv("XDG_SESSION_TYPE", "x11", 1) == 0);
+    assert(setenv("DISPLAY", ":0", 1) == 0);
+    assert(!ksd_backend_apply_session_environment(displayless, 2u));
+    assert(strcmp(getenv("XDG_CURRENT_DESKTOP"), "X-Cinnamon") == 0);
+    assert(strcmp(getenv("XDG_SESSION_TYPE"), "x11") == 0);
+    assert(strcmp(getenv("DISPLAY"), ":0") == 0);
+}
+
 static void check_session_type_table(void)
 {
     /* An X11 session with no provider on the bus resolves to X11. */
@@ -414,6 +455,11 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "wayland") == 0)
         return ksd_session_is_wayland_process(getpid()) ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "resolve-live") == 0) {
+        assert(setenv("XDG_SESSION_TYPE", "wayland", 1) == 0);
+        assert(setenv("WAYLAND_DISPLAY", "wayland-0", 1) == 0);
+        return (int)ksd_backend_resolve();
+    }
     assert(argc == 1);
     assert(child_backend(NULL) == KSD_BACKEND_GENERIC);
     assert(child_backend("") == KSD_BACKEND_GENERIC);
@@ -428,6 +474,8 @@ int main(int argc, char **argv)
     check_registration_mask();
     check_registration_ack();
     check_session_type_table();
+    check_live_environment_wins();
+    check_environment_guard();
     check_manager_environment_refresh();
     /* No longer zero: the generic backend serves what the shared Wayland
      * protocols allow a client outside the compositor to do. */
