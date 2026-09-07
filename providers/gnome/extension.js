@@ -1140,6 +1140,7 @@ class KeysharpExtensionCore {
                 null,   // bus_acquired_closure  (not needed; object is already exported)
                 null,   // name_acquired_closure
                 null);  // name_lost_closure
+            this._activateBroker();
         } catch (e) {
             env.logError(e, 'Keysharp: could not export D-Bus service / own name');
 
@@ -1283,6 +1284,28 @@ class KeysharpExtensionCore {
             return Number(value);
         } catch (_e) {
             return -1;
+        }
+    }
+
+    _activateBroker() {
+        try {
+            Gio.DBus.session.call(
+                'org.freedesktop.systemd1',
+                '/org/freedesktop/systemd1',
+                'org.freedesktop.systemd1.Manager',
+                'StartUnit',
+                new GLib.Variant('(ss)', ['keysharp-desktop.service', 'replace']),
+                null,
+                Gio.DBusCallFlags.NONE,
+                2000,
+                null,
+                (connection, result) => {
+                    try { connection.call_finish(result); } catch (e) {
+                        env.logError(e, 'Keysharp: could not activate desktop broker');
+                    }
+                });
+        } catch (e) {
+            env.logError(e, 'Keysharp: could not activate desktop broker');
         }
     }
 

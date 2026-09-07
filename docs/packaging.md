@@ -46,6 +46,9 @@ not socket-activated and does not accept application traffic. It holds one
 registration at a time and restarts when the compositor identity changes. A
 session with no supported compositor registers the generic backend rather than
 retrying forever, then upgrades if a supported provider appears later.
+GNOME and Cinnamon providers also start the unit through the user systemd
+manager when they load. This covers shells such as Cinnamon that do not start
+`graphical-session.target`.
 
 The user manager can survive a logout while its graphical-session environment
 is replaced for the next login. The daemon refreshes the session-defining
