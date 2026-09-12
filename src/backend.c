@@ -30,6 +30,21 @@ static GDBusConnection *get_session_bus(void)
     return session_bus;
 }
 
+static const char *environment_value(const char *const *environment,
+                                     size_t count, const char *name)
+{
+    size_t name_length = strlen(name);
+
+    for (size_t index = 0u; index < count; index++) {
+        const char *entry = environment[index];
+
+        if (entry != NULL && strncmp(entry, name, name_length) == 0
+            && entry[name_length] == '=')
+            return entry + name_length + 1u;
+    }
+    return NULL;
+}
+
 bool ksd_backend_apply_session_environment(const char *const *environment,
                                            size_t count)
 {
@@ -43,20 +58,19 @@ bool ksd_backend_apply_session_environment(const char *const *environment,
 
     if (environment == NULL && count != 0u)
         return false;
+    /* A manager block naming no display of either kind describes no graphical
+     * session, which is the shape left behind by a session that never imported
+     * its environment into the user manager. Adopting it would unset a working
+     * desktop identity, and the recheck loop would then restart this daemon on
+     * every pass for as long as that session lasted. Silence is not news. */
+    if (environment_value(environment, count, "WAYLAND_DISPLAY") == NULL
+        && environment_value(environment, count, "DISPLAY") == NULL)
+        return false;
     for (size_t name_index = 0u;
          name_index < sizeof(names) / sizeof(names[0]); name_index++) {
         const char *name = names[name_index];
-        size_t name_length = strlen(name);
-        const char *value = NULL;
+        const char *value = environment_value(environment, count, name);
 
-        for (size_t entry_index = 0u; entry_index < count; entry_index++) {
-            const char *entry = environment[entry_index];
-            if (entry != NULL && strncmp(entry, name, name_length) == 0
-                && entry[name_length] == '=') {
-                value = entry + name_length + 1u;
-                break;
-            }
-        }
         if ((value != NULL && setenv(name, value, 1) != 0)
             || (value == NULL && unsetenv(name) != 0))
             return false;
@@ -215,16 +229,52 @@ static bool entry_value(const char *entry, size_t entry_length,
     return true;
 }
 
+static ksd_backend compositor_from_desktop(const char *value)
+{
+    if (value == NULL)
+        return KSD_BACKEND_NONE;
+    if (strcasestr(value, "KDE") != NULL)
+        return KSD_BACKEND_KWIN;
+    if (strcasestr(value, "Cinnamon") != NULL)
+        return KSD_BACKEND_CINNAMON;
+    if (strcasestr(value, "GNOME") != NULL)
+        return KSD_BACKEND_GNOME;
+    return KSD_BACKEND_NONE;
+}
+
+/* This process's own facts come from the live environment, never from
+ * /proc/self/environ. A systemd user manager outlives a logout, so the daemon
+ * can be older than the session it is now serving;
+ * ksd_backend_refresh_session_environment() repairs that with setenv(), which
+ * updates getenv() and leaves untouched the exec-time snapshot that
+ * /proc/self/environ exposes. Reading the snapshot here would measure the
+ * stale identity against itself, and the recheck loop would never see the
+ * session change however often it ran. */
+static void read_own_session_facts(session_facts *facts)
+{
+    const char *type = getenv("XDG_SESSION_TYPE");
+    const char *display = getenv("WAYLAND_DISPLAY");
+
+    facts->compositor = compositor_from_desktop(getenv("XDG_CURRENT_DESKTOP"));
+    facts->session_type_x11 = type != NULL && strcasecmp(type, "x11") == 0;
+    facts->wayland_display = display != NULL && display[0] != '\0';
+}
+
 /* One environment read yields both compositor and session type. */
 static bool read_session_facts(pid_t pid, session_facts *facts)
 {
     char path[64];
     char environment[64u * 1024u + 1u];
-    int length = snprintf(path, sizeof(path), "/proc/%ld/environ", (long)pid);
+    int length;
 
     facts->compositor = KSD_BACKEND_NONE;
     facts->session_type_x11 = false;
     facts->wayland_display = false;
+    if (pid == getpid()) {
+        read_own_session_facts(facts);
+        return true;
+    }
+    length = snprintf(path, sizeof(path), "/proc/%ld/environ", (long)pid);
     if (pid <= 0 || length <= 0 || (size_t)length >= sizeof(path))
         return false;
     int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -256,14 +306,8 @@ static bool read_session_facts(pid_t pid, session_facts *facts)
             return false;
         if (entry_value(entry, entry_length, "XDG_CURRENT_DESKTOP=", 20u,
                         &value)
-            && facts->compositor == KSD_BACKEND_NONE) {
-            if (strcasestr(value, "KDE") != NULL)
-                facts->compositor = KSD_BACKEND_KWIN;
-            else if (strcasestr(value, "Cinnamon") != NULL)
-                facts->compositor = KSD_BACKEND_CINNAMON;
-            else if (strcasestr(value, "GNOME") != NULL)
-                facts->compositor = KSD_BACKEND_GNOME;
-        }
+            && facts->compositor == KSD_BACKEND_NONE)
+            facts->compositor = compositor_from_desktop(value);
         /* A whole-value match. XDG_SESSION_TYPE=x11-fallback is not an X11
          * session, and a substring test would call it one. */
         if (entry_value(entry, entry_length, "XDG_SESSION_TYPE=", 17u, &value))
