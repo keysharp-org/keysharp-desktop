@@ -520,7 +520,7 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
                 zcosmic_toplevel_manager_v1_unset_minimized(
                     connection->cosmic_toplevel_manager,
                     window->cosmic_handle);
-            if ((window->state
+            if (value == 0u && (window->state
                  & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
                 zcosmic_toplevel_manager_v1_unset_maximized(
                     connection->cosmic_toplevel_manager,

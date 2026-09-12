@@ -623,9 +623,13 @@ function executeJob(job) {
         } else if (state === 2) {
             window.minimized = false;
             window.setMaximize(true, true);
-        } else {
+        } else if (state === 3) {
+            window.minimized = false;
+        } else if (state === 0) {
             window.minimized = false;
             window.setMaximize(false, false);
+        } else {
+            return { sequence: job.sequence, status: STATUS_INVALID_REQUEST, body: "" };
         }
         return { sequence: job.sequence, status: STATUS_OK, body: "" };
 

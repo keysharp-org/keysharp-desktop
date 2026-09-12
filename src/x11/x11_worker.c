@@ -192,7 +192,7 @@ bool ksd_x11_request_valid(const ksd_frame *request)
             uint32_t value;
             uint32_t tail_reserved;
             uint32_t ceiling = request->opcode == KSD_OP_WINDOW_SET_STATE
-                ? 2u : (request->opcode == KSD_OP_WINDOW_SET_OPACITY
+                ? 3u : (request->opcode == KSD_OP_WINDOW_SET_OPACITY
                         ? 255u : 1u);
             return ksd_cursor_u64(&cursor, &handle)
                 && ksd_cursor_u32(&cursor, &value)

@@ -124,7 +124,7 @@
       <arg type="b" direction="out" name="ok"/>
     </method>
 
-    <!-- state: 0 = normal, 1 = minimized, 2 = maximized. -->
+    <!-- state: 0 = normal, 1 = minimized, 2 = maximized, 3 = unminimized (preserve maximization). -->
     <method name="SetWindowState">
       <arg type="t" direction="in" name="handle"/>
       <arg type="i" direction="in" name="state"/>

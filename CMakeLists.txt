@@ -816,6 +816,12 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR})
     set_tests_properties(provider-syntax-test PROPERTIES SKIP_RETURN_CODE 77)
 
+    find_program(KSD_NODE_EXECUTABLE node)
+    if(KSD_NODE_EXECUTABLE)
+        add_test(NAME window-state-tests COMMAND ${KSD_NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/window_state_tests.js)
+    endif()
+
     add_test(NAME portable-compatibility-tests
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/portable_compatibility_tests.sh
             ${CMAKE_CURRENT_SOURCE_DIR})

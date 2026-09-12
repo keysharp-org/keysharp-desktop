@@ -220,6 +220,9 @@ static const uint8_t geometry_payload[] = {
 static const uint8_t value_payload[16] = {
     LE64(TEST_HANDLE), LE32(1u),
 };
+static const uint8_t unminimize_payload[16] = {
+    LE64(TEST_HANDLE), LE32(3u),
+};
 static const uint8_t point_payload[16] = {
     LE32(UINT32_C(0xfffffffe)), LE32(3u), LE32(1u),
 };
@@ -358,6 +361,8 @@ SIMPLE_CALL(window_move_resize_xid,
                                error))
 SIMPLE_CALL(window_set_state,
     ksd_window_set_state(connection, TEST_HANDLE, 1u, error))
+SIMPLE_CALL(window_unminimize,
+    ksd_window_set_state(connection, TEST_HANDLE, KSD_WINDOW_STATE_UNMINIMIZED, error))
 SIMPLE_CALL(window_set_opacity,
     ksd_window_set_opacity(connection, TEST_HANDLE, 1u, error))
 SIMPLE_CALL(window_set_above,
@@ -482,6 +487,8 @@ static const round_trip_case round_trip_cases[] = {
                  geometry_payload, RESPONSE_EMPTY),
     PAYLOAD_CASE(window_set_state, KSD_OP_WINDOW_SET_STATE, value_payload,
                  RESPONSE_EMPTY),
+    PAYLOAD_CASE(window_unminimize, KSD_OP_WINDOW_SET_STATE, unminimize_payload,
+                 RESPONSE_EMPTY),
     PAYLOAD_CASE(window_set_opacity, KSD_OP_WINDOW_SET_OPACITY, value_payload,
                  RESPONSE_EMPTY),
     PAYLOAD_CASE(window_set_above, KSD_OP_WINDOW_SET_ABOVE, value_payload,
@@ -515,7 +522,7 @@ static const round_trip_case round_trip_cases[] = {
     WATCH_CASE(clipboard_watch_subscribe, KSD_OP_CLIPBOARD_WATCH),
 };
 
-_Static_assert(sizeof(round_trip_cases) / sizeof(round_trip_cases[0]) == 49u,
+_Static_assert(sizeof(round_trip_cases) / sizeof(round_trip_cases[0]) == 50u,
                "every request-producing client API needs a round-trip case");
 
 static void write_round_trip_response(int descriptor,

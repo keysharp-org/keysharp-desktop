@@ -90,7 +90,7 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
                 && ksd_cursor_u32(&cursor, &value)
                 && ksd_cursor_u32(&cursor, &reserved)
                 && ksd_cursor_finished(&cursor) && handle != 0u
-                && value <= 2u && reserved == 0u;
+                && value <= 3u && reserved == 0u;
         }
         case KSD_OP_WINDOW_LIST: {
             uint32_t include_hidden;

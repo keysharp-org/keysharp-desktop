@@ -1210,10 +1210,15 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     assert(next_client_message(wm, active, data));
     assert(data[0] == 2u);
 
-    /* A state outside the three this verb defines is refused rather than
-     * passed to the manager as an unknown number. */
+    /* Unminimize must not send a request to remove the maximize atoms. */
     ksd_result_init(&result);
     ksd_x11_window_set_state(connection, window, 3u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    assert(!next_client_message(wm, wm_state, data));
+
+    ksd_result_init(&result);
+    ksd_x11_window_set_state(connection, window, 4u, &result);
     assert(result.status == KSD_STATUS_INVALID_REQUEST);
     ksd_result_clear(&result);
 

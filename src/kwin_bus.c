@@ -518,7 +518,7 @@ bool ksd_kwin_request_text(uint16_t opcode, const uint8_t *payload,
             return false;
         value = ksd_decode_u32(payload + 8u);
         maximum = opcode == KSD_OP_WINDOW_SET_OPACITY ? 255u
-            : opcode == KSD_OP_WINDOW_SET_STATE ? 2u : 1u;
+            : opcode == KSD_OP_WINDOW_SET_STATE ? 3u : 1u;
         if (value > maximum)
             return false;
         written = snprintf(text, capacity, "%llu %u",

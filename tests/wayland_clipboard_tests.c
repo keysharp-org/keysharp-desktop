@@ -317,6 +317,7 @@ static void bind_list(struct wl_client *client, void *data, uint32_t version,
 typedef struct test_cosmic_toplevel {
     struct wl_resource *foreign;
     struct wl_resource *info;
+    uint32_t states;
 } test_cosmic_toplevel;
 
 static struct wl_resource *cosmic_output_resource;
@@ -337,18 +338,34 @@ static const struct zcosmic_toplevel_handle_v1_interface cosmic_handle_impl = {
     .destroy = cosmic_handle_destroy,
 };
 
-static void cosmic_send_state(struct wl_resource *handle, uint32_t state)
+static uint32_t update_test_states(struct wl_array *states, uint32_t mask,
+                                   uint32_t state, bool enabled)
+{
+    if (state < 32u)
+        mask = enabled ? mask | (UINT32_C(1) << state) : mask & ~(UINT32_C(1) << state);
+    wl_array_init(states);
+    for (uint32_t bit = 0u; bit < 32u; bit++)
+        if ((mask & (UINT32_C(1) << bit)) != 0u) {
+            uint32_t *slot = wl_array_add(states, sizeof(*slot));
+            assert(slot != NULL);
+            *slot = bit;
+        }
+    return mask;
+}
+
+static void cosmic_change_state(struct wl_resource *handle, uint32_t state,
+                                 bool enabled)
 {
     struct wl_array states;
-
-    wl_array_init(&states);
-    if (state < 32u) {
-        uint32_t *slot = wl_array_add(&states, sizeof(*slot));
-        assert(slot != NULL);
-        *slot = state;
-    }
+    test_cosmic_toplevel *window = wl_resource_get_user_data(handle);
+    window->states = update_test_states(&states, window->states, state, enabled);
     zcosmic_toplevel_handle_v1_send_state(handle, &states);
     wl_array_release(&states);
+}
+
+static void cosmic_send_state(struct wl_resource *handle, uint32_t state)
+{
+    cosmic_change_state(handle, state, true);
 }
 
 static void cosmic_info_stop(struct wl_client *client,
@@ -455,7 +472,7 @@ static void cosmic_manager_unset_maximized(struct wl_client *client,
     test_cosmic_toplevel *state = cosmic_state(toplevel);
     (void)client;
     (void)resource;
-    cosmic_send_state(toplevel, UINT32_MAX);
+    cosmic_change_state(toplevel, ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED, false);
     zcosmic_toplevel_info_v1_send_done(state->info);
 }
 
@@ -475,7 +492,11 @@ static void cosmic_manager_unset_minimized(struct wl_client *client,
                                            struct wl_resource *resource,
                                            struct wl_resource *toplevel)
 {
-    cosmic_manager_unset_maximized(client, resource, toplevel);
+    test_cosmic_toplevel *state = cosmic_state(toplevel);
+    (void)client;
+    (void)resource;
+    cosmic_change_state(toplevel, ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED, false);
+    zcosmic_toplevel_info_v1_send_done(state->info);
 }
 
 static void cosmic_manager_set_fullscreen(struct wl_client *client,
@@ -570,19 +591,22 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version,
 
 /* ------------------------------------------ wlroots foreign toplevels -- */
 
-static void wlr_send_state(struct wl_resource *resource, uint32_t state)
+static void wlr_change_state(struct wl_resource *resource, uint32_t state,
+                              bool enabled)
 {
     struct wl_array states;
+    uint32_t mask = (uint32_t)(uintptr_t)wl_resource_get_user_data(resource);
 
-    wl_array_init(&states);
-    if (state < 32u) {
-        uint32_t *slot = wl_array_add(&states, sizeof(*slot));
-        if (slot != NULL)
-            *slot = state;
-    }
+    mask = update_test_states(&states, mask, state, enabled);
+    wl_resource_set_user_data(resource, (void *)(uintptr_t)mask);
     zwlr_foreign_toplevel_handle_v1_send_state(resource, &states);
     zwlr_foreign_toplevel_handle_v1_send_done(resource);
     wl_array_release(&states);
+}
+
+static void wlr_send_state(struct wl_resource *resource, uint32_t state)
+{
+    wlr_change_state(resource, state, true);
 }
 
 static void wlr_set_maximized(struct wl_client *client,
@@ -597,7 +621,7 @@ static void wlr_unset_maximized(struct wl_client *client,
                                 struct wl_resource *resource)
 {
     (void)client;
-    wlr_send_state(resource, UINT32_MAX);
+    wlr_change_state(resource, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED, false);
 }
 
 static void wlr_set_minimized(struct wl_client *client,
@@ -612,7 +636,7 @@ static void wlr_unset_minimized(struct wl_client *client,
                                 struct wl_resource *resource)
 {
     (void)client;
-    wlr_send_state(resource, UINT32_MAX);
+    wlr_change_state(resource, ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED, false);
 }
 
 static void wlr_activate(struct wl_client *client,
@@ -1594,6 +1618,35 @@ static void check_window_query(const char *socket_name, const char *mode)
     stop_server(child);
 }
 
+static void check_unminimize(ksd_wayland *connection, uint64_t handle)
+{
+    ksd_operation_result result;
+    ksd_result_init(&result);
+    ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE, handle, 1u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+    ksd_wayland_window_query(connection, handle, &result);
+    assert(result.status == KSD_STATUS_OK);
+    uint32_t length = ksd_decode_u32(result.tail);
+    const char *body = (const char *)result.tail + 4u;
+    assert(memmem(body, length, "\"minimized\":true", 16u) != NULL);
+    assert(memmem(body, length, "\"maximized\":true", 16u) != NULL);
+    ksd_result_clear(&result);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE, handle, 3u, &result);
+        assert(result.status == KSD_STATUS_OK);
+        ksd_result_clear(&result);
+        ksd_wayland_window_query(connection, handle, &result);
+        assert(result.status == KSD_STATUS_OK);
+        length = ksd_decode_u32(result.tail);
+        body = (const char *)result.tail + 4u;
+        assert(memmem(body, length, "\"minimized\":false", 17u) != NULL);
+        assert(memmem(body, length, "\"maximized\":true", 16u) != NULL);
+        ksd_result_clear(&result);
+    }
+}
+
 static void check_wlr_windows(const char *socket_name)
 {
     ksd_wayland *connection = NULL;
@@ -1636,6 +1689,8 @@ static void check_wlr_windows(const char *socket_name)
     body = (const char *)result.tail + 4u;
     assert(memmem(body, length, "\"maximized\":true", 16u) != NULL);
     ksd_result_clear(&result);
+
+    check_unminimize(connection, second);
 
     ksd_result_init(&result);
     ksd_wayland_window_action(connection, KSD_OP_WINDOW_CLOSE, second, 0u,
@@ -1729,6 +1784,8 @@ static void check_cosmic_windows(const char *socket_name)
     assert(memmem(body, length, "\"maximized\":true",
                   sizeof("\"maximized\":true") - 1u) != NULL);
     ksd_result_clear(&result);
+
+    check_unminimize(connection, second);
 
     ksd_result_init(&result);
     ksd_wayland_window_action(connection, KSD_OP_WINDOW_CLOSE, second, 0u,

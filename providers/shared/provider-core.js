@@ -128,6 +128,7 @@ const PUBLIC_IFACE_XML = `
 const STATE_NORMAL    = 0;
 const STATE_MINIMIZED = 1;
 const STATE_MAXIMIZED = 2;
+const STATE_UNMINIMIZED = 3;
 
 // Sentinel used by MoveResizeWindow to mean "don't change this axis".
 const INT32_MIN = -2147483648;
@@ -1098,10 +1099,15 @@ class KeysharpExtensionCore {
                 if (win.minimized)
                     win.unminimize();
                 win.maximize(env.maximizeFlags);
-            } else {
+            } else if (state === STATE_UNMINIMIZED) {
+                if (win.minimized)
+                    win.unminimize();
+            } else if (state === STATE_NORMAL) {
                 if (win.minimized)
                     win.unminimize();
                 win.unmaximize(env.maximizeFlags);
+            } else {
+                return false;
             }
             return true;
         } catch (_e) {

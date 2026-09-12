@@ -1676,7 +1676,7 @@ ksd_status ksd_window_set_state(ksd_connection *connection, uint64_t handle,
                                 uint32_t state, ksd_error *error)
 {
     return request_window_value(connection, KSD_OP_WINDOW_SET_STATE,
-                                handle, state, 2u, error);
+                                handle, state, KSD_WINDOW_STATE_UNMINIMIZED, error);
 }
 
 ksd_status ksd_window_set_opacity(ksd_connection *connection,

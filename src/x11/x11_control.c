@@ -231,7 +231,7 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
 {
     const x11_atoms *atoms = &connection->atoms;
 
-    if (state > 2u) {
+    if (state > 3u) {
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
                          "that is not a window state this service sets");
         return;
@@ -254,12 +254,12 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
             send_to_root(c, connection->screen, window,
                          atoms->active_window, data);
         } else {
-            /* Restoring is both: dropping the maximized atoms, and mapping the
-             * window, which is what un-minimizes it. A window that was neither
-             * is unharmed by either. */
-            change_state(c, connection->screen, atoms, window,
-                         KSD_NET_WM_STATE_REMOVE, atoms->state_max_vert,
-                         atoms->state_max_horz);
+            /* Mapping unminimizes independently of focus-stealing policy.
+             * Only Normal clears the saved maximized state. */
+            if (state == 0u)
+                change_state(c, connection->screen, atoms, window,
+                             KSD_NET_WM_STATE_REMOVE, atoms->state_max_vert,
+                             atoms->state_max_horz);
             xcb_map_window(c, window);
             uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
             send_to_root(c, connection->screen, window,

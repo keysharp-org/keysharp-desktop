@@ -246,7 +246,7 @@ void ksd_wayland_wlr_window_action(ksd_wayland *connection, uint16_t opcode,
         } else {
             if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
                 zwlr_foreign_toplevel_handle_v1_unset_minimized(window->wlr_handle);
-            if ((window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
+            if (value == 0u && (window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
                 zwlr_foreign_toplevel_handle_v1_unset_maximized(window->wlr_handle);
         }
     } else {

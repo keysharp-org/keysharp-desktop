@@ -145,6 +145,17 @@ activation. These calls require WindowControl, including on X11.
 
 ## Generic Wayland compositors
 
+`ksd_window_set_state` accepts `KSD_WINDOW_STATE_NORMAL` (0),
+`KSD_WINDOW_STATE_MINIMIZED` (1), `KSD_WINDOW_STATE_MAXIMIZED` (2), and
+`KSD_WINDOW_STATE_UNMINIMIZED` (3). Normal clears both minimization and
+maximization; Unminimized clears only minimization, preserving maximization
+and full screen. The unminimize operation uses X11 mapping, the shell's
+unminimize operation, or the wlroots/COSMIC `unset_minimized` request, rather
+than depending on activation. It requires WindowControl and the
+`KSD_OPERATION_WINDOW_SET_STATE` capability. Older client libraries and services reject state 3;
+do not retry it as Normal, which changes the requested behavior.
+The `list-windows` example accepts `--unminimize HANDLE` for an explicit target.
+
 A Wayland session without a dedicated provider reports
 `KSD_BACKEND_GENERIC`. It is a working, dynamically probed backend:
 `available_operations` contains only the operations supported by the

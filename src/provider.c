@@ -940,7 +940,7 @@ static void execute_window(uid_t uid, pid_t pid, pid_t provider_pid,
     }
     if (request->opcode == KSD_OP_WINDOW_SET_STATE) {
         method = "SetWindowState";
-        if (value > 2u)
+        if (value > 3u)
             method = NULL;
     } else if (request->opcode == KSD_OP_WINDOW_SET_OPACITY) {
         method = "SetWindowOpacity";

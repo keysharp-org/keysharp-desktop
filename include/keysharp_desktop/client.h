@@ -454,6 +454,13 @@ KSD_API ksd_status ksd_window_move_resize_xid(ksd_connection *connection,
                                       uint64_t xid,
                                       int32_t x, int32_t y, uint32_t width,
                                       uint32_t height, ksd_error *error);
+/* Normal clears minimization and maximization. Unminimized clears only
+ * minimization, preserving maximization and full screen. Older services
+ * reject Unminimized with KSD_STATUS_INVALID_REQUEST. */
+#define KSD_WINDOW_STATE_NORMAL 0u
+#define KSD_WINDOW_STATE_MINIMIZED 1u
+#define KSD_WINDOW_STATE_MAXIMIZED 2u
+#define KSD_WINDOW_STATE_UNMINIMIZED 3u
 KSD_API ksd_status ksd_window_set_state(ksd_connection *connection,
                                 uint64_t handle,
                                 uint32_t state, ksd_error *error);
