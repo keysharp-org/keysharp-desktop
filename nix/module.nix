@@ -13,6 +13,12 @@ in
   options.services.keysharp-desktop = {
     enable = lib.mkEnableOption "Keysharp desktop integration broker";
 
+    autoEnableExtension = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Enable the GNOME or Cinnamon extension once per user and desktop, preserving later user changes.";
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = defaultPackage;
@@ -75,6 +81,16 @@ in
         ];
         LockPersonality = true;
       };
+    };
+
+    environment.etc."xdg/autostart/keysharp-desktop-enable-extension.desktop" = lib.mkIf cfg.autoEnableExtension {
+      text = ''
+        [Desktop Entry]
+        Type=Application
+        Name=Keysharp desktop extension setup
+        NoDisplay=true
+        Exec=${pkgs.runtimeShell} ${./enable-extension.sh} ${cfg.package}/bin/keysharp-desktop ${pkgs.coreutils}/bin
+      '';
     };
 
     systemd.user.services.keysharp-desktop = {

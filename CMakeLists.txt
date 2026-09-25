@@ -667,6 +667,10 @@ if(BUILD_TESTING)
         keysharp-desktop-common PkgConfig::GIO)
     add_test(NAME enable-extension-tests COMMAND enable-extension-tests)
 
+    add_test(NAME nix-extension-activation-test
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/nix_extension_activation_test.sh
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
     add_executable(install-mode-tests tests/install_mode_tests.c)
     target_link_libraries(install-mode-tests PRIVATE keysharp-desktop-common)
     add_test(NAME install-mode-tests COMMAND install-mode-tests)

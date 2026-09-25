@@ -40,6 +40,9 @@ combined setup attempt this step for the account running sudo. KWin and other
 compositors do not need this extension step. Available operations vary by compositor;
 see [platform support](platforms.md).
 
+The NixOS module enables the extension once for each user at their first graphical
+login after installation. A later manual disable remains in effect.
+
 ## Check and repair
 
 ```sh

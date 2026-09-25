@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "keysharp-permissions": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788591063,
+        "narHash": "sha256-FCVcLQ86bR88NQn8QqJZtUyoeHquihnLG4W5742CQgs=",
+        "owner": "keysharp-org",
+        "repo": "keysharp-permissions",
+        "rev": "b8f31942dd2c286608d390634a9916bffce55ddf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "keysharp-org",
+        "repo": "keysharp-permissions",
+        "rev": "b8f31942dd2c286608d390634a9916bffce55ddf",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1786862985,
+        "narHash": "sha256-FBJRXmbGXiSUDvYEbfLYRkckayyZ6SK1UEqhCrIZ2Cs=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e5bdc4a41d4c072fe1e3787eaa0320a384741d44",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e5bdc4a41d4c072fe1e3787eaa0320a384741d44",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "keysharp-permissions": "keysharp-permissions",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
