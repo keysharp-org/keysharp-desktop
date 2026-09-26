@@ -421,7 +421,7 @@ foreach(forbidden
     endif()
 endforeach()
 file(READ "${SOURCE_DIR}/src/local_capture.c" local_capture)
-string(FIND "${local_capture}" "strcmp(basename, \"kwin_wayland\") == 0"
+string(FIND "${local_capture}" "ksd_provider_executable_matches(executable, \"kwin_wayland\")"
     capture_executable_gate)
 if(capture_executable_gate EQUAL -1)
     message(FATAL_ERROR

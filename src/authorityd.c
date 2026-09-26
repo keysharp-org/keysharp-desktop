@@ -17,6 +17,7 @@
 #include "permission_domain.h"
 #include "protocol_io.h"
 #include "provider.h"
+#include "provider_executable.h"
 #include "roles.h"
 #include "transport.h"
 
@@ -511,7 +512,6 @@ static bool trusted_provider_process(uint32_t backend,
     const char *expected = backend == KSD_BACKEND_KWIN ? "kwin_wayland"
         : backend == KSD_BACKEND_GNOME ? "gnome-shell"
         : backend == KSD_BACKEND_CINNAMON ? "cinnamon" : NULL;
-    const char *basename;
     struct stat status;
 
     if (expected == NULL || identity == NULL || identity->pid <= 0
@@ -520,9 +520,7 @@ static bool trusted_provider_process(uint32_t backend,
         || !S_ISREG(status.st_mode) || status.st_uid != 0u
         || (status.st_mode & (S_IWGRP | S_IWOTH)) != 0u)
         return false;
-    basename = strrchr(identity->executable, '/');
-    basename = basename == NULL ? identity->executable : basename + 1u;
-    return strcmp(basename, expected) == 0;
+    return ksd_provider_executable_matches(identity->executable, expected);
 }
 
 static uint64_t registered_operations(authority_state *state, uid_t uid,

@@ -1,4 +1,5 @@
 #include "provider.h"
+#include "provider_executable.h"
 
 #include "protocol.h"
 #include "transport.h"
@@ -212,9 +213,7 @@ static bool provider_peer_valid(GDBusConnection *connection, uid_t uid,
         return false;
     }
     executable[executable_length] = '\0';
-    const char *basename = strrchr(executable, '/');
-    basename = basename == NULL ? executable : basename + 1u;
-    if (strcmp(basename, expected) != 0) {
+    if (!ksd_provider_executable_matches(executable, expected)) {
         g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
                             "desktop provider executable is invalid");
         return false;

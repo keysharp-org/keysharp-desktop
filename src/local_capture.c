@@ -1,5 +1,6 @@
 #include "local_capture.h"
 #include "install_mode.h"
+#include "provider_executable.h"
 
 #include "protocol.h"
 #include "transport.h"
@@ -155,9 +156,7 @@ bool ksd_local_capture_kwin_process_trusted(uid_t expected_uid, pid_t pid)
         || (executable_status.st_mode & (S_IWGRP | S_IWOTH)) != 0)
         return false;
     executable[executable_length] = '\0';
-    const char *basename = strrchr(executable, '/');
-    basename = basename == NULL ? executable : basename + 1u;
-    return strcmp(basename, "kwin_wayland") == 0;
+    return ksd_provider_executable_matches(executable, "kwin_wayland");
 }
 
 static bool yama_ptracer_exception_available(void)

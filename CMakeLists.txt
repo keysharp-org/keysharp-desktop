@@ -531,6 +531,11 @@ if(BUILD_TESTING)
     add_test(NAME provider-xml-tests
         COMMAND provider-xml-tests ${CMAKE_CURRENT_SOURCE_DIR})
 
+    add_executable(provider-executable-tests tests/provider_executable_tests.c)
+    target_include_directories(provider-executable-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME provider-executable-tests COMMAND provider-executable-tests)
+
     add_executable(request-chunk-tests tests/request_chunk_tests.c)
     target_link_libraries(request-chunk-tests PRIVATE
         keysharp-desktop-common)
