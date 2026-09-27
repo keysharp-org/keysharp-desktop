@@ -4,6 +4,7 @@
 #include "protocol_io.h"
 #include "wl_internal.h"
 #include "wl_outputs.h"
+#include "wl_windows.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -529,13 +530,12 @@ static bool image_format(const image_copy_state *state, uint32_t *format,
     return true;
 }
 
-static bool capture_output_image_copy(
-    ksd_wayland *connection, ksd_wl_output *output,
+static bool capture_source_image_copy(
+    ksd_wayland *connection, struct ext_image_capture_source_v1 *source,
     int32_t local_x, int32_t local_y, uint32_t logical_width,
     uint32_t logical_height, uint32_t output_width, uint32_t output_height,
     captured_segment *segment, ksd_operation_result *result)
 {
-    struct ext_image_capture_source_v1 *source = NULL;
     struct ext_image_copy_capture_session_v1 *session = NULL;
     struct ext_image_copy_capture_frame_v1 *frame = NULL;
     struct wl_shm_pool *pool = NULL;
@@ -553,8 +553,6 @@ static bool capture_output_image_copy(
     bool success = false;
     int descriptor = -1;
 
-    source = ext_output_image_capture_source_manager_v1_create_source(
-        connection->output_source_manager, output->output);
     if (source != NULL)
         session = ext_image_copy_capture_manager_v1_create_session(
             connection->image_copy_manager, source, 0u);
@@ -637,7 +635,7 @@ static bool capture_output_image_copy(
     }
     if (!state.ready || state.failed || state.transform > 7u) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "the compositor could not capture this output");
+                         "the compositor could not capture this source");
         goto done;
     }
     if (state.transform == WL_OUTPUT_TRANSFORM_90
@@ -649,6 +647,10 @@ static bool capture_output_image_copy(
     } else {
         oriented_width = state.width;
         oriented_height = state.height;
+    }
+    if (output_width == 0u && output_height == 0u) {
+        output_width = logical_width = oriented_width;
+        output_height = logical_height = oriented_height;
     }
     segment->source_x = mapped_edge((uint32_t)local_x, output_width,
                                     oriented_width);
@@ -870,6 +872,39 @@ static bool compose_capture(int32_t x, int32_t y, uint32_t width,
     return true;
 }
 
+void ksd_wayland_capture_window(ksd_wayland *connection, const char *identifier,
+                                ksd_operation_result *result)
+{
+    captured_segment segment = { .descriptor = -1 };
+    if (connection == NULL || identifier == NULL || identifier[0] == '\0') {
+        ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
+                         "invalid Wayland window capture request");
+        return;
+    }
+    if (connection->toplevel_manager != NULL || connection->toplevel_list == NULL
+        || connection->shm == NULL || connection->toplevel_source_manager == NULL
+        || connection->image_copy_manager == NULL) {
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "the compositor does not support window capture");
+        return;
+    }
+    struct ext_foreign_toplevel_handle_v1 *window =
+        ksd_wayland_window_capture_handle(connection, identifier, result);
+    if (window == NULL)
+        return;
+    struct ext_image_capture_source_v1 *source =
+        ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
+            connection->toplevel_source_manager, window);
+    if (!capture_source_image_copy(connection, source, 0, 0, 0u, 0u, 0u, 0u,
+                                   &segment, result))
+        return;
+    segment.width = segment.pixel_width;
+    segment.height = segment.pixel_height;
+    (void)compose_capture(0, 0, segment.width, segment.height, &segment, 1u,
+                          result);
+    close(segment.descriptor);
+}
+
 void ksd_wayland_capture_area(ksd_wayland *connection, int32_t x, int32_t y,
                               uint32_t width, uint32_t height,
                               ksd_operation_result *result)
@@ -935,7 +970,9 @@ void ksd_wayland_capture_area(ksd_wayland *connection, int32_t x, int32_t y,
                 (int32_t)(left - output_x),
                 (int32_t)(top - output_y), segment->width,
                 segment->height, segment, result)
-            : capture_output_image_copy(connection, output,
+            : capture_source_image_copy(connection,
+                ext_output_image_capture_source_manager_v1_create_source(
+                    connection->output_source_manager, output->output),
                 (int32_t)(left - output_x),
                 (int32_t)(top - output_y), segment->width,
                 segment->height, (uint32_t)output_width,

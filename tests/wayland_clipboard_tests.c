@@ -16,6 +16,7 @@
 #include "wl_pointer.h"
 #include "wl_connect.h"
 #include "wl_windows.h"
+#include "wl_worker.h"
 #include "wl_keyboard.h"
 
 #include <assert.h>
@@ -1015,6 +1016,32 @@ static void bind_output_source(struct wl_client *client, void *data,
                                    NULL);
 }
 
+static void toplevel_source_create(struct wl_client *client,
+                                   struct wl_resource *manager, uint32_t id,
+                                   struct wl_resource *toplevel)
+{
+    assert(strcmp(wl_resource_get_class(toplevel),
+                  "ext_foreign_toplevel_handle_v1") == 0);
+    output_source_create(client, manager, id, toplevel);
+}
+
+static const struct ext_foreign_toplevel_image_capture_source_manager_v1_interface
+toplevel_source_impl = {
+    .create_source = toplevel_source_create,
+    .destroy = output_source_destroy,
+};
+
+static void bind_toplevel_source(struct wl_client *client, void *data,
+                                 uint32_t version, uint32_t id)
+{
+    (void)data;
+    struct wl_resource *resource = wl_resource_create(
+        client, &ext_foreign_toplevel_image_capture_source_manager_v1_interface,
+        version < 1u ? (int)version : 1, id);
+    assert(resource != NULL);
+    wl_resource_set_implementation(resource, &toplevel_source_impl, NULL, NULL);
+}
+
 typedef struct test_image_frame {
     struct wl_resource *buffer;
 } test_image_frame;
@@ -1383,7 +1410,8 @@ static void run_server(const char *socket_name, int ready)
                     &zwlr_virtual_pointer_manager_v1_interface, 2, NULL,
                     bind_pointer_manager) == NULL)
             _exit(1);
-    } else if (mode != NULL && strcmp(mode, "image-copy") == 0) {
+    } else if (mode != NULL && (strcmp(mode, "image-copy") == 0
+                                || strcmp(mode, "image-copy-wlr") == 0)) {
         if (wl_display_init_shm(display) != 0
             || wl_display_add_shm_format(display,
                                          WL_SHM_FORMAT_ABGR8888) == NULL
@@ -1396,8 +1424,19 @@ static void run_server(const char *socket_name, int ready)
                     &ext_output_image_capture_source_manager_v1_interface,
                     1, NULL, bind_output_source) == NULL
             || wl_global_create(display,
+                    &ext_foreign_toplevel_list_v1_interface, 1, NULL,
+                    bind_list) == NULL
+            || wl_global_create(display,
+                    &ext_foreign_toplevel_image_capture_source_manager_v1_interface,
+                    1, NULL, bind_toplevel_source) == NULL
+            || wl_global_create(display,
                     &ext_image_copy_capture_manager_v1_interface, 1, NULL,
                     bind_image_copy) == NULL)
+            _exit(1);
+        if (strcmp(mode, "image-copy-wlr") == 0
+            && wl_global_create(display,
+                    &zwlr_foreign_toplevel_manager_v1_interface, 3, NULL,
+                    bind_wlr_manager) == NULL)
             _exit(1);
     } else if (mode != NULL && strcmp(mode, "wlr") == 0) {
         if (wl_global_create(display,
@@ -1753,6 +1792,7 @@ static void check_cosmic_windows(const char *socket_name)
                   "\"frame\":{\"x\":1,\"y\":0,\"width\":2,\"height\":1}",
                   sizeof("\"frame\":{\"x\":1,\"y\":0,\"width\":2,\"height\":1}")
                       - 1u) != NULL);
+    assert(memmem(body, length, "\"captureId\":\"id-one\"", 20u) != NULL);
     ksd_result_clear(&result);
 
     ksd_result_init(&result);
@@ -1838,15 +1878,25 @@ static void check_screencopy(const char *socket_name)
     stop_server(child);
 }
 
-static void check_image_copy(const char *socket_name)
+static void check_image_copy(const char *socket_name, bool wlr)
 {
     ksd_wayland *connection = NULL;
     ksd_operation_result result;
-    pid_t child = start_server(socket_name, "image-copy");
+    pid_t child = start_server(socket_name, wlr ? "image-copy-wlr" : "image-copy");
     uint8_t capture[52];
 
     assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
     assert(ksd_wayland_supported(connection).screencopy);
+    assert(ksd_wayland_supported(connection).toplevel_capture == !wlr);
+    if (wlr) {
+        ksd_result_init(&result);
+        ksd_wayland_capture_window(connection, "id-one", &result);
+        assert(result.status == KSD_STATUS_UNSUPPORTED);
+        ksd_result_clear(&result);
+        ksd_wayland_close(connection);
+        stop_server(child);
+        return;
+    }
     ksd_result_init(&result);
     ksd_wayland_capture_area(connection, 1, 0, 2u, 1u, &result);
     assert(result.status == KSD_STATUS_OK);
@@ -1866,6 +1916,46 @@ static void check_image_copy(const char *socket_name)
         assert(capture[offset + 2u] == 0x33u);
         assert(capture[offset + 3u] == 0x7fu);
     }
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_wayland_window_list(connection, false, &result);
+    assert(result.status == KSD_STATUS_OK);
+    assert(memmem(result.tail, result.tail_length, "\"captureId\":\"id-one\"", 20u) != NULL);
+    ksd_result_clear(&result);
+    ksd_wayland_close(connection);
+    connection = NULL;
+    assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+    ksd_result_init(&result);
+    uint8_t payload[] = { 0, 0, 0, 0, 6u, 0, 0, 0, 'i', 'd', '-', 'o', 'n', 'e' };
+    ksd_frame request = {
+        .opcode = KSD_OP_CAPTURE_WINDOW,
+        .payload = payload,
+        .payload_length = sizeof(payload),
+    };
+    assert(ksd_wayland_execute_on(connection, &request, &result));
+    assert(result.status == KSD_STATUS_OK);
+    uint8_t window_capture[20u + 8u * 4u * 4u];
+    assert(result.tail_length == sizeof(window_capture));
+    assert(pread(result.payload_fd, window_capture, sizeof(window_capture), 0)
+           == (ssize_t)sizeof(window_capture));
+    assert(ksd_decode_u32(window_capture + 4u) == 8u);
+    assert(ksd_decode_u32(window_capture + 8u) == 4u);
+    for (size_t offset = 20u; offset < sizeof(window_capture); offset += 4u) {
+        assert(window_capture[offset] == 0x11u);
+        assert(window_capture[offset + 1u] == 0x22u);
+        assert(window_capture[offset + 2u] == 0x33u);
+        assert(window_capture[offset + 3u] == 0x7fu);
+    }
+    ksd_result_clear(&result);
+    payload[0] = 2u;
+    assert(!ksd_wayland_request_valid(&request));
+    payload[0] = 1u;
+    assert(ksd_wayland_request_valid(&request));
+    request.payload_length--;
+    assert(!ksd_wayland_request_valid(&request));
+    ksd_result_init(&result);
+    ksd_wayland_capture_window(connection, "closed-window", &result);
+    assert(result.status == KSD_STATUS_NOT_FOUND);
     ksd_result_clear(&result);
     ksd_wayland_close(connection);
     stop_server(child);
@@ -2039,7 +2129,8 @@ int main(void)
     check_wlr_windows(socket_name);
     check_cosmic_windows(socket_name);
     check_screencopy(socket_name);
-    check_image_copy(socket_name);
+    check_image_copy(socket_name, false);
+    check_image_copy(socket_name, true);
     check_absolute_pointer(socket_name);
     check_empty(socket_name);
     check_silent(socket_name);

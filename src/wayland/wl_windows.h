@@ -6,6 +6,7 @@
 #include "wl_connect.h"
 
 struct ksd_wl_toplevel;
+struct ext_foreign_toplevel_handle_v1;
 
 typedef struct ksd_wayland_window_view {
     bool (*usable)(const struct ksd_wl_toplevel *toplevel);
@@ -19,6 +20,8 @@ const ksd_wayland_window_view *ksd_wayland_cosmic_window_view(void);
 struct ksd_wl_toplevel *ksd_wayland_window_for_action(
     ksd_wayland *connection, uint64_t handle,
     const ksd_wayland_window_view *view, ksd_operation_result *result);
+struct ext_foreign_toplevel_handle_v1 *ksd_wayland_window_capture_handle(
+    ksd_wayland *connection, const char *identifier, ksd_operation_result *result);
 
 /* ext-foreign-toplevel-list is the portable enumeration floor. Optional
  * wlroots and COSMIC protocols add state, active-window lookup and the actions

@@ -72,6 +72,12 @@ static void registry_global(void *data, struct wl_registry *registry,
             registry, name,
             &ext_output_image_capture_source_manager_v1_interface, 1u);
     } else if (strcmp(interface,
+                      ext_foreign_toplevel_image_capture_source_manager_v1_interface.name)
+                   == 0 && connection->toplevel_source_manager == NULL) {
+        connection->toplevel_source_manager = wl_registry_bind(
+            registry, name,
+            &ext_foreign_toplevel_image_capture_source_manager_v1_interface, 1u);
+    } else if (strcmp(interface,
                       ext_image_copy_capture_manager_v1_interface.name) == 0
                && connection->image_copy_manager == NULL) {
         connection->image_copy_manager = wl_registry_bind(
@@ -384,6 +390,9 @@ void ksd_wayland_close(ksd_wayland *connection)
     if (connection->output_source_manager != NULL)
         ext_output_image_capture_source_manager_v1_destroy(
             connection->output_source_manager);
+    if (connection->toplevel_source_manager != NULL)
+        ext_foreign_toplevel_image_capture_source_manager_v1_destroy(
+            connection->toplevel_source_manager);
     if (connection->shm != NULL)
         wl_shm_destroy(connection->shm);
     ksd_wayland_pointer_clear(connection);
@@ -443,6 +452,12 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
         && (connection->screencopy_manager != NULL
             || (connection->output_source_manager != NULL
                 && connection->image_copy_manager != NULL));
+    /* The preferred wlroots window list has no stable capture identifiers. */
+    features.toplevel_capture = connection->toplevel_manager == NULL
+        && connection->shm != NULL
+        && connection->toplevel_list != NULL
+        && connection->toplevel_source_manager != NULL
+        && connection->image_copy_manager != NULL;
     bool hypr = ksd_wayland_hypr_available(connection->session_pid);
     features.absolute_pointer = (connection->virtual_pointer != NULL
         && connection->outputs != NULL) || hypr;

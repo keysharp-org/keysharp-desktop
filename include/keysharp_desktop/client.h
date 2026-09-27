@@ -370,6 +370,8 @@ KSD_API ksd_status ksd_capture_area(ksd_connection *connection,
  * for screenshot portals, which do not accept an arbitrary rectangle. */
 KSD_API ksd_status ksd_capture_desktop(ksd_connection *connection,
                                ksd_capture *capture, ksd_error *error);
+/* Pass the window JSON captureId on KWin and generic Wayland, or id on other
+ * backends. Generic Wayland captures the compositor's fixed window extent. */
 KSD_API ksd_status ksd_capture_window(ksd_connection *connection,
                               const char *window_id,
                               uint32_t include_decoration,

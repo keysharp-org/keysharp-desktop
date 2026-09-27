@@ -36,6 +36,22 @@ static bool display_name_valid(const char *name)
     return strchr(name, '/') == NULL && strcmp(name, ".") != 0
         && strcmp(name, "..") != 0;
 }
+
+static bool capture_window_identifier(ksd_cursor *cursor, char identifier[129])
+{
+    uint32_t flags;
+    uint32_t length;
+    const uint8_t *bytes;
+    if (!ksd_cursor_u32(cursor, &flags) || flags > 1u
+        || !ksd_cursor_u32(cursor, &length) || length == 0u || length > 128u
+        || !ksd_cursor_bytes(cursor, length, &bytes)
+        || !ksd_cursor_finished(cursor) || !ksd_utf8_valid(bytes, length, false))
+        return false;
+    memcpy(identifier, bytes, length);
+    identifier[length] = '\0';
+    return true;
+}
+
 bool ksd_wayland_request_valid(const ksd_frame *request)
 {
     ksd_cursor cursor;
@@ -121,6 +137,10 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
                 && (int64_t)x + width <= INT32_MAX
                 && (int64_t)y + height <= INT32_MAX;
         }
+        case KSD_OP_CAPTURE_WINDOW: {
+            char identifier[129];
+            return capture_window_identifier(&cursor, identifier);
+        }
         case KSD_OP_MOUSE_MOVE_ABSOLUTE: {
             int32_t x;
             int32_t y;
@@ -190,6 +210,14 @@ bool ksd_wayland_execute_on(struct ksd_wayland *connection,
         case KSD_OP_CAPTURE_DESKTOP:
             ksd_portal_capture_desktop(result);
             break;
+        case KSD_OP_CAPTURE_WINDOW: {
+            ksd_cursor cursor;
+            char identifier[129];
+            ksd_cursor_init(&cursor, request->payload, request->payload_length);
+            (void)capture_window_identifier(&cursor, identifier);
+            ksd_wayland_capture_window(connection, identifier, result);
+            break;
+        }
         case KSD_OP_WINDOW_LIST:
         {
             ksd_cursor cursor;

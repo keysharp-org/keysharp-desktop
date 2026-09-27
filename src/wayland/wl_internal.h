@@ -84,6 +84,7 @@ struct ksd_wayland {
     struct zwlr_foreign_toplevel_manager_v1 *toplevel_manager;
     struct zwlr_screencopy_manager_v1 *screencopy_manager;
     struct ext_output_image_capture_source_manager_v1 *output_source_manager;
+    struct ext_foreign_toplevel_image_capture_source_manager_v1 *toplevel_source_manager;
     struct ext_image_copy_capture_manager_v1 *image_copy_manager;
     struct zxdg_output_manager_v1 *xdg_output_manager;
     struct wl_shm *shm;

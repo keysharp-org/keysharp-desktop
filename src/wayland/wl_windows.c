@@ -218,13 +218,15 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
         && ksd_buffer_json_string(out, id, (size_t)length, false)
         && ksd_buffer_bytes(out, ",\"compositorId\":", 16u)
         && ksd_buffer_json_string(out, identifier, strlen(identifier), false)
+        && ksd_buffer_bytes(out, ",\"captureId\":", 13u)
+        && ksd_buffer_json_string(out, identifier, strlen(identifier), false)
         && ksd_buffer_bytes(out, ",\"title\":", 9u)
         && ksd_buffer_json_string(out, title, strlen(title), false)
         && ksd_buffer_bytes(out, ",\"appId\":", 9u)
         && ksd_buffer_json_string(out, app_id, strlen(app_id), false)
         && ksd_buffer_bytes(out,
-            ",\"validFields\":[\"id\",\"compositorId\",\"title\",\"appId\"]}",
-            sizeof(",\"validFields\":[\"id\",\"compositorId\",\"title\",\"appId\"]}") - 1u);
+            ",\"validFields\":[\"id\",\"compositorId\",\"captureId\",\"title\",\"appId\"]}",
+            sizeof(",\"validFields\":[\"id\",\"compositorId\",\"captureId\",\"title\",\"appId\"]}") - 1u);
 }
 
 static bool generic_usable(const ksd_wl_toplevel *item)
@@ -319,6 +321,18 @@ void ksd_wayland_window_query(ksd_wayland *connection, uint64_t handle,
         (void)ksd_result_take_framed_text(&out, result,
             KSD_STATUS_RESOURCE_EXHAUSTED, "the window result is too large");
     ksd_buffer_clear(&out);
+}
+
+struct ext_foreign_toplevel_handle_v1 *ksd_wayland_window_capture_handle(
+    ksd_wayland *connection, const char *identifier, ksd_operation_result *result)
+{
+    if (!refresh(connection, connection->toplevel_list == NULL ? NULL : &generic_view, result))
+        return NULL;
+    for (ksd_wl_toplevel *window = connection->toplevels; window != NULL; window = window->next)
+        if (generic_usable(window) && strcmp(window->identifier, identifier) == 0)
+            return window->handle;
+    ksd_result_error(result, KSD_STATUS_NOT_FOUND, 0u, "the window no longer exists");
+    return NULL;
 }
 
 void ksd_wayland_window_handles(ksd_wayland *connection,

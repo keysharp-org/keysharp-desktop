@@ -87,6 +87,7 @@ static void check_capture_mask_matches_dispatch(void)
                                || opcodes[index] == KSD_OP_CAPTURE_WINDOW))
                 || (backend == KSD_BACKEND_GENERIC
                     && (opcodes[index] == KSD_OP_CAPTURE_AREA
+                        || opcodes[index] == KSD_OP_CAPTURE_WINDOW
                         || opcodes[index] == KSD_OP_CAPTURE_DESKTOP))
                 || ksd_provider_capture_supported((ksd_backend)backend,
                                                   opcodes[index]);

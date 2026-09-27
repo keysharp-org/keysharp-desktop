@@ -61,6 +61,11 @@ the protocols the live compositor actually advertises:
   geometry.
 - wlroots screencopy or standard `ext-image-copy-capture-v1` supplies area
   capture, including mixed-scale output composition.
+- The foreign-toplevel source in `ext-image-capture-source-v1` with image-copy capture
+  supplies window pixels independently of overlapping windows. Pass the
+  window's `captureId`; numeric query handles belong to a different connection.
+  This is not advertised when the preferred wlroots window list is used,
+  because that protocol has no compatible capture identifiers.
 - The desktop screenshot portal supplies whole-desktop capture. This is a
   separate operation because the portal cannot honor an arbitrary rectangle.
 - wlroots virtual-pointer supplies absolute motion; authenticated Hyprland IPC

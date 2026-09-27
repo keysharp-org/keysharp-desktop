@@ -470,6 +470,7 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * pid. */
 #define KSD_GENERIC_OPERATIONS \
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_DESKTOP \
+     | KSD_OPERATION_CAPTURE_WINDOW \
      | KSD_OPERATION_WINDOW_QUERY \
      | KSD_OPERATION_KEYBOARD_STATE \
      | KSD_OPERATION_MOUSE_MOVE_ABSOLUTE \

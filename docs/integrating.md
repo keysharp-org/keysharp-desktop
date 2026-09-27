@@ -72,7 +72,12 @@ mask is backend-dependent. Cursor position and work area are available through
 the GNOME, Cinnamon, KWin, and X11 backends.
 
 `ksd_capture_window` takes the `id` field of the window JSON as its
-`window_id`, except on KWin where it takes the optional `captureId` field. It
+`window_id`, except on KWin and generic Wayland where it takes the optional
+`captureId` field. On generic Wayland this is the compositor's stable foreign
+toplevel identifier, allowing the capture worker to resolve the same window
+on its separate connection. Numeric query handles cannot be used for capture.
+Generic Wayland returns the compositor's fixed window extent; its capture
+protocol does not offer an `include_decoration` choice. It
 returns the window's own pixels, so a client-side-decorated
 window carries alpha in its corners, while `ksd_capture_area` returns the
 opaque composited stage. Compare colours within one path, never across both.
@@ -272,8 +277,8 @@ the documented fields they need and ignore unknown fields. Common fields are
 `id`, `title`, `appId`, `pid`, `frame`, `client`, `active`, `minimized`,
 `maximized`, `visible`, `alwaysOnTop`, `decorated`, and
 `onCurrentWorkspace`. Rectangles contain `x`, `y`, `width`, and `height`.
-KWin also supplies `captureId`, its opaque ScreenShot2 identifier; use `id`
-for control operations and `captureId` only with window capture.
+KWin and the generic Wayland foreign-toplevel list also supply `captureId`;
+use `id` for control operations and `captureId` only with window capture.
 
 Snapshots may include `validFields`, the fields known for that specific window.
 An omitted field is unknown; zero, false, or an empty legacy placeholder does

@@ -31,6 +31,7 @@ typedef struct ksd_wayland_features {
     bool toplevel_close;
     bool toplevel_state;
     bool screencopy;
+    bool toplevel_capture;
     bool absolute_pointer;
     bool cursor_position;
     bool keyboard_keymap;

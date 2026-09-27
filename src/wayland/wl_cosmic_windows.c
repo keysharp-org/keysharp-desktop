@@ -425,7 +425,9 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
         || !ksd_buffer_bytes(out, "\",\"title\":", 10u)
         || !ksd_buffer_json_string(out, title, strlen(title), false)
         || !ksd_buffer_bytes(out, ",\"appId\":", 9u)
-        || !ksd_buffer_json_string(out, app_id, strlen(app_id), false))
+        || !ksd_buffer_json_string(out, app_id, strlen(app_id), false)
+        || !ksd_buffer_bytes(out, ",\"captureId\":", 13u)
+        || !ksd_buffer_json_string(out, item->identifier, strlen(item->identifier), false))
         return false;
     has_geometry = resolve_geometry(connection, item, &x, &y, &width, &height);
     if (has_geometry) {
@@ -450,9 +452,9 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
             maximized ? sizeof(",\"maximized\":true") - 1u
                       : sizeof(",\"maximized\":false") - 1u)
         && ksd_buffer_bytes(out,
-            ",\"validFields\":[\"id\",\"title\",\"appId\",\"active\","
+            ",\"validFields\":[\"id\",\"captureId\",\"title\",\"appId\",\"active\","
             "\"minimized\",\"maximized\"",
-            sizeof(",\"validFields\":[\"id\",\"title\",\"appId\",\"active\","
+            sizeof(",\"validFields\":[\"id\",\"captureId\",\"title\",\"appId\",\"active\","
                    "\"minimized\",\"maximized\"") - 1u)
         && (!has_geometry || ksd_buffer_bytes(out, ",\"frame\"",
                                     sizeof(",\"frame\"") - 1u))

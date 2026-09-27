@@ -190,6 +190,8 @@ static uint64_t probe_generic_operations(void)
         operations |= KSD_OPERATION_WINDOW_SET_STATE;
     if (features.screencopy)
         operations |= KSD_OPERATION_CAPTURE_AREA;
+    if (features.toplevel_capture)
+        operations |= KSD_OPERATION_CAPTURE_WINDOW;
     if (ksd_portal_capture_available())
         operations |= KSD_OPERATION_CAPTURE_DESKTOP;
     if (features.absolute_pointer)

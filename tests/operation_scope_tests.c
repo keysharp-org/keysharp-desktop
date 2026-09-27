@@ -259,6 +259,7 @@ int main(void)
      * implements some subset, and the daemon narrows this at registration. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC)
            == (KSD_OPERATION_CAPTURE_AREA
+               | KSD_OPERATION_CAPTURE_WINDOW
                | KSD_OPERATION_WINDOW_QUERY
                | KSD_OPERATION_KEYBOARD_STATE
                | KSD_OPERATION_CAPTURE_DESKTOP
