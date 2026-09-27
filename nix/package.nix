@@ -6,7 +6,7 @@
   dbus,
   glib,
   polkit,
-  xorg,
+  libxcb,
   libxkbcommon,
   wayland,
   wayland-scanner,
@@ -34,7 +34,7 @@ stdenv.mkDerivation {
   # as glib. libxcb carries both the xcb and xcb-shm pkg-config files.
   buildInputs = [
     glib
-    xorg.libxcb
+    libxcb
     libxkbcommon
     wayland
     wayland-protocols
@@ -61,7 +61,9 @@ stdenv.mkDerivation {
   doCheck = true;
   checkPhase = ''
     runHook preCheck
-    ctest --output-on-failure
+    ksdTestRuntime=$(mktemp -d)
+    XDG_RUNTIME_DIR="$ksdTestRuntime" ctest --output-on-failure
+    rm -rf "$ksdTestRuntime"
     runHook postCheck
   '';
 
