@@ -23,7 +23,7 @@ extern "C" {
 
 #define KSD_CLIENT_ABI_MAJOR 0u
 /* Unknown backend, operation and scope values are delivered verbatim. */
-#define KSD_CLIENT_ABI_MINOR 8u
+#define KSD_CLIENT_ABI_MINOR 9u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -354,6 +354,8 @@ KSD_API ksd_status ksd_lease_next(ksd_connection *connection,
                           uint32_t *revoked_scopes, ksd_error *error);
 KSD_API uint32_t ksd_lease_granted_scopes(
     const ksd_connection *connection);
+KSD_API ksd_status ksd_lease_refresh(ksd_connection *connection,
+                          uint32_t *granted_scopes, ksd_error *error);
 
 KSD_API ksd_status ksd_permissions_list(ksd_connection *connection,
                                 ksd_permission_visitor visitor,

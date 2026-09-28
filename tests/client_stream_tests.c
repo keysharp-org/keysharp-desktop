@@ -790,5 +790,47 @@ int main(void)
     assert(revoked == (KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE));
     ksd_disconnect(lease);
     close(lease_sockets[1]);
+
+    /* A refresh applies the revocations that have already arrived and never
+     * waits for one. A fresh connection numbers its first request 1, so the
+     * grant can be answered before it is asked for. */
+    int refresh_sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                      refresh_sockets) == 0);
+    ksd_connection *refreshing =
+        ksd_client_test_adopt_descriptor(refresh_sockets[0]);
+    assert(refreshing != NULL);
+    ksd_client_test_set_role(refreshing, KSD_ROLE_AUTHORIZATION_LEASE);
+    const uint32_t both = KSD_SCOPE_SCREEN_CAPTURE | KSD_SCOPE_WINDOW_CONTROL;
+    const ksd_frame authorize_request = {
+        .opcode = KSD_OP_AUTHORIZE,
+        .request_id = 1u,
+    };
+    uint8_t grant_tail[8] = { 0 };
+    ksd_encode_u32(grant_tail, both);
+    write_ok_response(refresh_sockets[1], &authorize_request, grant_tail,
+                      sizeof(grant_tail), false);
+    uint32_t granted = 0u;
+    ksd_error_init(&error);
+    assert(ksd_authorize(refreshing, KSD_AUTH_REQUEST, both, &granted, &error)
+           == KSD_STATUS_OK);
+    assert(granted == both);
+
+    granted = 0u;
+    ksd_error_init(&error);
+    assert(ksd_lease_refresh(refreshing, &granted, &error) == KSD_STATUS_OK);
+    assert(granted == both);
+
+    ksd_encode_u32(revoked_payload, KSD_SCOPE_SCREEN_CAPTURE);
+    assert(ksd_frame_write(refresh_sockets[1], &revoked_event));
+    ksd_error_init(&error);
+    assert(ksd_lease_refresh(refreshing, &granted, &error) == KSD_STATUS_OK);
+    assert(granted == KSD_SCOPE_WINDOW_CONTROL);
+    assert(ksd_lease_granted_scopes(refreshing) == KSD_SCOPE_WINDOW_CONTROL);
+
+    close(refresh_sockets[1]);
+    ksd_error_init(&error);
+    assert(ksd_lease_refresh(refreshing, &granted, &error) != KSD_STATUS_OK);
+    ksd_disconnect(refreshing);
     return 0;
 }

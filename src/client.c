@@ -563,7 +563,10 @@ static bool apply_revoked_event(ksd_connection *connection,
     uint32_t revoked = ksd_decode_u32(frame->payload);
     if (revoked == 0u)
         return false;
-    connection->granted_scopes &= ~revoked;
+    /* Atomic because ksd_lease_refresh reads the grants without the lock
+     * while a request on another thread holds it. */
+    __atomic_and_fetch(&connection->granted_scopes, ~revoked,
+                       __ATOMIC_RELAXED);
     if (revoked_scopes != NULL)
         *revoked_scopes = revoked;
     return true;
@@ -952,30 +955,34 @@ ksd_status ksd_authorize(ksd_connection *connection,
         return invalid_argument(error, "invalid authorization request");
     ksd_encode_u16(payload, (uint16_t)mode);
     ksd_encode_u32(payload + 4u, requested_scopes);
-    ksd_status status = request(connection, KSD_OP_AUTHORIZE,
-                                payload, sizeof(payload), &response, error);
-    if (status != KSD_STATUS_OK) {
-        response_clear(&response);
-        return status;
+    /* The grant is stored before the lock is released, so a revocation read
+     * by the next caller is applied after it rather than overwritten by it. */
+    pthread_mutex_lock(&connection->mutex);
+    ksd_status status = request_locked(connection, KSD_OP_AUTHORIZE,
+                                       payload, sizeof(payload), &response,
+                                       error);
+    if (status == KSD_STATUS_OK) {
+        ksd_cursor cursor;
+        uint32_t granted;
+        uint32_t reserved;
+        ksd_cursor_init(&cursor, response.tail, response.tail_length);
+        if ((response.frame.flags & KSD_FLAG_MORE) != 0u
+            || !ksd_cursor_u32(&cursor, &granted)
+            || !ksd_cursor_u32(&cursor, &reserved)
+            || !ksd_cursor_finished(&cursor) || reserved != 0u) {
+            errno = EPROTO;
+            status = system_failure(connection, error,
+                "desktop service returned invalid authorization");
+        } else {
+            granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
+            __atomic_store_n(&connection->granted_scopes, granted,
+                             __ATOMIC_RELAXED);
+            *granted_scopes = granted;
+        }
     }
-    ksd_cursor cursor;
-    uint32_t granted;
-    uint32_t reserved;
-    ksd_cursor_init(&cursor, response.tail, response.tail_length);
-    if ((response.frame.flags & KSD_FLAG_MORE) != 0u
-        || !ksd_cursor_u32(&cursor, &granted)
-        || !ksd_cursor_u32(&cursor, &reserved)
-        || !ksd_cursor_finished(&cursor) || reserved != 0u) {
-        response_clear(&response);
-        errno = EPROTO;
-        return system_failure(connection, error,
-                              "desktop service returned invalid authorization");
-    }
-    granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
-    connection->granted_scopes = granted;
-    *granted_scopes = granted;
+    pthread_mutex_unlock(&connection->mutex);
     response_clear(&response);
-    return KSD_STATUS_OK;
+    return status;
 }
 
 ksd_status ksd_ping(ksd_connection *connection, ksd_error *error)
@@ -997,7 +1004,8 @@ ksd_status ksd_ping(ksd_connection *connection, ksd_error *error)
 
 uint32_t ksd_connection_granted_scopes(const ksd_connection *connection)
 {
-    return connection == NULL ? 0u : connection->granted_scopes;
+    return connection == NULL ? 0u
+        : __atomic_load_n(&connection->granted_scopes, __ATOMIC_RELAXED);
 }
 
 ksd_operations ksd_connection_available_operations(
@@ -1014,7 +1022,7 @@ ksd_backend ksd_connection_backend(const ksd_connection *connection)
 uint32_t ksd_lease_granted_scopes(const ksd_connection *connection)
 {
     return connection != NULL && connection->role == KSD_ROLE_AUTHORIZATION_LEASE
-        ? connection->granted_scopes : 0u;
+        ? __atomic_load_n(&connection->granted_scopes, __ATOMIC_RELAXED) : 0u;
 }
 
 static void raw_hash_to_text(const uint8_t raw[32], char hash[65])
@@ -2324,6 +2332,69 @@ ksd_status ksd_lease_next(ksd_connection *connection, uint32_t timeout_ms,
         errno = EPROTO;
         status = system_failure(connection, error,
                                 "authorization lease sent invalid event");
+    }
+    pthread_mutex_unlock(&connection->mutex);
+    return status;
+}
+
+/* A frame whose first bytes have arrived is already on its way, so finishing
+ * it is not a wait on the service. */
+#define KSD_LEASE_FRAME_TIMEOUT_MS 1000u
+
+ksd_status ksd_lease_refresh(ksd_connection *connection,
+                             uint32_t *granted_scopes, ksd_error *error)
+{
+    if (connection == NULL || granted_scopes == NULL || !valid_error(error)
+        || connection->role != KSD_ROLE_AUTHORIZATION_LEASE)
+        return invalid_argument(error, "invalid authorization lease refresh");
+    /* A request in flight on this connection reads every frame that arrives
+     * before its answer and applies any revocation among them, so the grants
+     * as they stand are current. */
+    if (pthread_mutex_trylock(&connection->mutex) != 0) {
+        *granted_scopes = __atomic_load_n(&connection->granted_scopes,
+                                          __ATOMIC_RELAXED);
+        reset_error(error);
+        return KSD_STATUS_OK;
+    }
+    ksd_status status = KSD_STATUS_OK;
+    if (connection->descriptor < 0) {
+        errno = ENOTCONN;
+        status = system_failure(connection, error,
+                                "authorization lease has ended");
+    }
+    while (status == KSD_STATUS_OK) {
+        struct pollfd item = {
+            .fd = connection->descriptor,
+            .events = POLLIN,
+        };
+        int ready = poll(&item, 1u, 0);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready == 0)
+            break;
+        if (ready < 0 || (item.revents & POLLIN) == 0) {
+            if (ready > 0)
+                errno = ECONNRESET;
+            status = system_failure(connection, error,
+                                    "authorization lease has ended");
+            break;
+        }
+        ksd_frame frame = { 0 };
+        status = read_event_locked(connection, KSD_LEASE_FRAME_TIMEOUT_MS,
+                                   KSD_OP_SESSION_REVOKED, &frame, NULL, error);
+        if (status == KSD_STATUS_REVOKED) {
+            status = KSD_STATUS_OK;
+        } else if (status == KSD_STATUS_OK) {
+            ksd_frame_clear(&frame);
+            errno = EPROTO;
+            status = system_failure(connection, error,
+                                    "authorization lease sent invalid event");
+        }
+    }
+    if (status == KSD_STATUS_OK) {
+        *granted_scopes = __atomic_load_n(&connection->granted_scopes,
+                                          __ATOMIC_RELAXED);
+        reset_error(error);
     }
     pthread_mutex_unlock(&connection->mutex);
     return status;

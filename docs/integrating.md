@@ -227,6 +227,16 @@ unknown status or malformed result invalidates the connection.
 Use separate connections for concurrency. Watch timeouts are 1 through 60000
 milliseconds. Finite lease timeouts make shutdown straightforward.
 
+A caller that only needs its grants at the moment it acts does not have to
+wait on the lease at all. `ksd_lease_refresh`, from `ksd_client_abi_minor() >= 9`,
+applies the revocations that have already arrived and reports the scopes the
+lease still holds, without waiting. It can be called from any thread, including
+while another thread is asking for more scopes on the same lease with
+`ksd_authorize`: that request applies any revocation that arrives before its
+answer, so the refresh reports the grants as they stand instead of waiting for
+it. A lease the service has ended is reported as a failure, after which the
+connection is closed.
+
 One connection carries one request at a time, and the service answers each on
 that connection's own thread. A capture holds its thread for as long as the
 capture takes, which on a large window can be seconds, so **a caller that wants

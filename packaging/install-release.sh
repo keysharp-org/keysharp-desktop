@@ -6,7 +6,7 @@ export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
 expected_client_abi_major=0
-expected_client_abi_minor=8
+expected_client_abi_minor=9
 
 skip_compatible=false
 
