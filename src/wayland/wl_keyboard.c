@@ -94,7 +94,8 @@ static void modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
 {
     /* This worker has no focused surface. Seat keymaps are global, whereas
      * these masks describe a client's keyboard focus and cannot establish
-     * the globally active group or lock state. */
+     * the globally active group or lock state. Hyprland IPC reports the
+     * group instead. */
     (void)data; (void)keyboard; (void)serial;
     (void)depressed; (void)latched; (void)locked; (void)group;
 }
@@ -157,6 +158,34 @@ static void json_string(GString *out, const char *text)
     g_string_append_c(out, '"');
 }
 
+bool ksd_wayland_keyboard_group(struct xkb_keymap *keymap,
+                                const struct ksd_hypr_layout *layout,
+                                uint32_t *group)
+{
+    const char *name;
+
+    if (keymap == NULL || layout == NULL
+        || layout->index >= xkb_keymap_num_layouts(keymap))
+        return false;
+    name = xkb_keymap_layout_get_name(keymap, layout->index);
+    if (name == NULL || strcmp(name, layout->name) != 0)
+        return false;
+    *group = layout->index;
+    return true;
+}
+
+/* Hyprland keeps a layout per keyboard and sends clients the keymap and group
+ * of the one it marks main. A single-layout keymap has no group to choose, so
+ * it costs no request. */
+static bool hypr_group(ksd_wayland *connection, uint32_t *group)
+{
+    ksd_hypr_layout layout;
+
+    return connection->hypr && xkb_keymap_num_layouts(connection->keymap) > 1u
+        && ksd_wayland_hypr_active_layout(connection->session_pid, &layout)
+        && ksd_wayland_keyboard_group(connection->keymap, &layout, group);
+}
+
 void ksd_wayland_keyboard_state(ksd_wayland *connection,
                                 ksd_operation_result *result)
 {
@@ -174,16 +203,21 @@ void ksd_wayland_keyboard_state_since(ksd_wayland *connection,
     }
     bool unchanged = length == 64u && revision != NULL
         && memcmp(revision, connection->keymap_revision, 64u) == 0;
+    uint32_t group = 0u;
+    bool has_group = hypr_group(connection, &group);
     GString *out = g_string_new("{\"ok\":true,\"validFields\":[");
     if (!unchanged)
         g_string_append(out, "\"keymap\",");
-    g_string_append(out, "\"layouts\",\"mapRevision\"]");
+    g_string_append(out, has_group ? "\"layouts\",\"mapRevision\",\"group\"]"
+                                   : "\"layouts\",\"mapRevision\"]");
     if (!unchanged) {
         g_string_append(out, ",\"keymap\":");
         json_string(out, connection->keymap_text);
     }
     g_string_append(out, ",\"mapRevision\":");
     json_string(out, connection->keymap_revision);
+    if (has_group)
+        g_string_append_printf(out, ",\"group\":%u", group);
     g_string_append(out, ",\"layouts\":[");
     xkb_layout_index_t count = xkb_keymap_num_layouts(connection->keymap);
     for (xkb_layout_index_t index = 0u; index < count; index++) {

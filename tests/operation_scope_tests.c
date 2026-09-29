@@ -254,8 +254,10 @@ int main(void)
         assert(ksd_kwin_lane_for((uint16_t)opcode) != KSD_KWIN_LANE_NONE);
     }
 
-    /* The generic Wayland ceiling: what the shared protocols make possible
-     * for a client on the OUTSIDE of a compositor. Any given compositor
+    /* The generic Wayland ceiling: what the shared protocols, plus Hyprland
+     * IPC for geometry, restacking, hit-testing, opacity, keeping a window
+     * above, the owning process, the work area and window events, make
+     * possible for a client outside a compositor. Any given compositor
      * implements some subset, and the daemon narrows this at registration. */
     assert(ksd_backend_operations(KSD_BACKEND_GENERIC)
            == (KSD_OPERATION_CAPTURE_AREA
@@ -268,21 +270,22 @@ int main(void)
                | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES
                | KSD_OPERATION_WINDOW_ACTIVE | KSD_OPERATION_WINDOW_FOCUS
                | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_SET_STATE
+               | KSD_OPERATION_WINDOW_MOVE_RESIZE | KSD_OPERATION_WINDOW_RAISE
+               | KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_AT_POINT
+               | KSD_OPERATION_WINDOW_KILL | KSD_OPERATION_WINDOW_SET_OPACITY
+               | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_WATCH
+               | KSD_OPERATION_DISPLAY_LIST | KSD_OPERATION_WORK_AREA
                | KSD_OPERATION_CLIPBOARD_MIMETYPES
                | KSD_OPERATION_CLIPBOARD_CONTENT
                | KSD_OPERATION_CLIPBOARD_TEXT));
-    /* The operations that are impossible here, not merely unwritten, each because no
-     * Wayland protocol provides it: no client may restack another client's
-     * window, set its geometry, set its opacity, keep it above, change its
-     * decoration, learn a pid to signal, or correlate a toplevel to the
-     * process that will create it. Pinned so that adding one later has to be a
-     * deliberate act with a protocol behind it rather than an oversight. */
+    /* The operations that are impossible here, not merely unwritten, because
+     * neither a Wayland protocol nor a supported compositor channel provides
+     * them: changing another client's decoration or taskbar state, or
+     * correlating a toplevel to the process that will create it. Pinned so
+     * that adding one later has to be a deliberate act with a protocol behind
+     * it rather than an oversight. */
     assert((ksd_backend_operations(KSD_BACKEND_GENERIC)
-            & (KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_KILL
-               | KSD_OPERATION_WINDOW_MOVE_RESIZE
-               | KSD_OPERATION_WINDOW_MOVE_RESIZE_XID
-               | KSD_OPERATION_WINDOW_SET_OPACITY
-               | KSD_OPERATION_WINDOW_SET_ABOVE
+            & (KSD_OPERATION_WINDOW_MOVE_RESIZE_XID
                | KSD_OPERATION_WINDOW_SET_DECORATED
                | KSD_OPERATION_WINDOW_SET_SKIP_TASKBAR
                | KSD_OPERATION_WINDOW_RESERVE

@@ -12,6 +12,7 @@
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "wl_connect.h"
+#include "wl_hypr.h"
 
 #include <wayland-client.h>
 
@@ -33,6 +34,7 @@ typedef struct ksd_wl_toplevel {
     struct ext_foreign_toplevel_handle_v1 *handle;
     struct zcosmic_toplevel_handle_v1 *cosmic_handle;
     struct zwlr_foreign_toplevel_handle_v1 *wlr_handle;
+    struct ksd_wayland *connection;
     uint64_t id;
     char *title;
     char *app_id;
@@ -41,6 +43,18 @@ typedef struct ksd_wl_toplevel {
     bool ready;
     bool closed;
     ksd_cosmic_geometry *cosmic_geometries;
+    /* Joined from Hyprland IPC on each refresh, by identifier. The restore
+     * workspace survives refreshes so a minimized window returns where it
+     * was rather than to whichever workspace is active. */
+    ksd_hypr_client hypr;
+    bool hypr_known;
+    bool hypr_has_restore;
+    int64_t hypr_restore_workspace;
+    char hypr_restore_name[KSD_HYPR_WORKSPACE_CAPACITY];
+    /* Where explicit raises and lowers left this window; zero when none has. */
+    int64_t hypr_stack_stamp;
+    /* 0..255, or -1 when Hyprland did not report it. */
+    int32_t hypr_opacity;
     struct ksd_wl_toplevel *next;
 } ksd_wl_toplevel;
 
@@ -62,6 +76,13 @@ typedef struct ksd_wl_output {
     int32_t logical_y;
     int32_t logical_width;
     int32_t logical_height;
+    int32_t physical_width_mm;
+    int32_t physical_height_mm;
+    int32_t refresh_mhz;
+    /* wl_output v4 names take precedence over xdg-output ones, which only
+     * matter to compositors that predate them. */
+    char name[64];
+    bool name_from_output;
     bool current_mode;
     bool logical_position;
     bool logical_size;
@@ -102,10 +123,30 @@ struct ksd_wayland {
     uint32_t cosmic_capabilities;
     ksd_wl_output *outputs;
     pid_t session_pid;
+    /* The Wayland compositor's pid, and whether the Hyprland instance the
+     * session names is that compositor. Hyprland IPC is used only then. */
+    pid_t compositor_pid;
+    bool hypr;
+    /* Derives window handles from compositor identifiers, so every connection
+     * to one compositor instance names a window the same way. Unset when the
+     * instance could not be identified; handles are then random. */
+    uint8_t handle_salt[32];
+    bool handle_salt_ready;
+    /* Orders explicit restacking on Hyprland, whose IPC reports no stack. */
+    int64_t hypr_stack_sequence;
+    char hypr_last_active[KSD_HYPR_ID_CAPACITY];
+    /* Whether the toplevels' opacity was read since the last refresh; read
+     * lazily because only window listings need it. */
+    bool hypr_opacity_fresh;
 };
 
-/* A handle remains opaque across worker and compositor restarts. */
+/* A handle remains opaque across worker and compositor restarts; one derived
+ * from an identifier is the same in every worker of one compositor instance. */
 uint64_t ksd_wayland_new_handle(const ksd_wayland *connection);
+/* The handle for a compositor identifier, or 0 when none can be derived or
+ * it would collide with a live one. */
+uint64_t ksd_wayland_handle_for_identifier(const ksd_wayland *connection,
+                                           const char *identifier);
 void ksd_wayland_replace_string(char **slot, const char *value);
 
 /* Attaches the toplevel listener. Called once, immediately after the global is
@@ -121,6 +162,9 @@ bool ksd_wayland_roundtrip(ksd_wayland *connection, int timeout_ms);
 bool ksd_wayland_dispatch_until(ksd_wayland *connection,
                                 bool (*complete)(void *), void *data,
                                 int timeout_ms);
+/* Reads and dispatches what the display socket already holds, without
+ * waiting. For a caller that polls the socket itself. */
+bool ksd_wayland_dispatch_ready(ksd_wayland *connection);
 
 /* Reads everything a peer writes into a pipe, to a ceiling, with a deadline.
  * Both the clipboard read path and anything else that takes a descriptor from

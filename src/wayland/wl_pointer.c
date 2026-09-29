@@ -101,7 +101,8 @@ void ksd_wayland_move_absolute(ksd_wayland *connection, int32_t x, int32_t y,
                          "invalid absolute pointer request");
         return;
     }
-    if (ksd_wayland_hypr_move(connection->session_pid, x, y)) {
+    if (connection->hypr
+        && ksd_wayland_hypr_move(connection->session_pid, x, y)) {
         (void)ksd_result_take(result, NULL, 0u);
         return;
     }

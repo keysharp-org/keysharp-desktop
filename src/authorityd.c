@@ -1582,14 +1582,22 @@ static bool watch_cancelled(void *user_data)
         || (session->granted_scopes & context->scope) != context->scope;
 }
 
-static bool start_x11_watch(authority_session *session,
-                            const ksd_frame *request, watch_context *context)
+/* X11 and generic Wayland serve window events from a dedicated display
+ * worker; the shell providers push them over the session bus. */
+static bool watch_uses_display_worker(uint32_t backend)
+{
+    return backend == KSD_BACKEND_X11 || backend == KSD_BACKEND_GENERIC;
+}
+
+static bool start_display_watch(authority_session *session,
+                                const ksd_frame *request,
+                                watch_context *context)
 {
     int worker_fd = ksd_capture_worker_spawn(&session->identity, session->gid,
-        context->snapshot->identity.pid, KSD_BACKEND_X11);
+        context->snapshot->identity.pid, session->backend);
     if (worker_fd < 0)
         return forward_response(session, request, KSD_STATUS_UNAVAILABLE, 0u,
-                                 "could not start the X11 event worker", NULL, 0u, false);
+                                 "could not start the window event worker", NULL, 0u, false);
     ksd_frame reply = { 0 };
     bool ready = ksd_frame_write(worker_fd, request)
         && ksd_frame_read(worker_fd, public_magic, KSD_PROTOCOL_MAJOR,
@@ -1601,7 +1609,7 @@ static bool start_x11_watch(authority_session *session,
     if (status != KSD_STATUS_OK) {
         close(worker_fd);
         return forward_response(session, request, KSD_STATUS_UNAVAILABLE, 0u,
-                                 "X11 window events are unavailable", NULL, 0u, false);
+                                 "window events are unavailable", NULL, 0u, false);
     }
     bool ok = !watch_cancelled(context)
         && forward_response(session, request, KSD_STATUS_OK, 0u, NULL, NULL, 0u, false);
@@ -1646,8 +1654,8 @@ static bool start_watch(authority_session *session,
         .snapshot = snapshot,
         .scope = scope,
     };
-    if (session->backend == KSD_BACKEND_X11)
-        return start_x11_watch(session, request, &context);
+    if (watch_uses_display_worker(session->backend))
+        return start_display_watch(session, request, &context);
     if (!forward_response(session, request, KSD_STATUS_OK, 0u,
                           NULL, NULL, 0u, false))
         return false;
@@ -1805,7 +1813,7 @@ static bool execute_operation(authority_session *session,
         || request->opcode == KSD_OP_CLIPBOARD_WATCH) {
         bool ok;
 
-        if (session->backend != KSD_BACKEND_X11
+        if (!watch_uses_display_worker(session->backend)
             && !backend_snapshot_provider_valid(&backend)) {
             release_backend_snapshot(&backend);
             return forward_response(session, request,

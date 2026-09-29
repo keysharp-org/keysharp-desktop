@@ -188,6 +188,22 @@ static uint64_t probe_generic_operations(void)
         operations |= KSD_OPERATION_WINDOW_CLOSE;
     if (features.toplevel_state)
         operations |= KSD_OPERATION_WINDOW_SET_STATE;
+    if (features.toplevel_geometry)
+        operations |= KSD_OPERATION_WINDOW_MOVE_RESIZE
+            | KSD_OPERATION_WINDOW_RAISE | KSD_OPERATION_WINDOW_LOWER
+            | KSD_OPERATION_WINDOW_AT_POINT;
+    if (features.toplevel_kill)
+        operations |= KSD_OPERATION_WINDOW_KILL;
+    if (features.toplevel_opacity)
+        operations |= KSD_OPERATION_WINDOW_SET_OPACITY;
+    if (features.toplevel_above)
+        operations |= KSD_OPERATION_WINDOW_SET_ABOVE;
+    if (features.toplevel_events)
+        operations |= KSD_OPERATION_WINDOW_WATCH;
+    if (features.display_list)
+        operations |= KSD_OPERATION_DISPLAY_LIST;
+    if (features.work_area)
+        operations |= KSD_OPERATION_WORK_AREA;
     if (features.screencopy)
         operations |= KSD_OPERATION_CAPTURE_AREA;
     if (features.toplevel_capture)
@@ -233,6 +249,51 @@ static bool issue_generation(char out[KSD_KWIN_GENERATION_HEX + 1u])
         out[index * 2u + 1u] = digits[bytes[index] & 0x0fu];
     }
     out[KSD_KWIN_GENERATION_HEX] = '\0';
+    return true;
+}
+
+/* The authority reads the session from this process's exec-time environment,
+ * which setenv() never rewrites, so only a restart adopts a different one. Its
+ * values are kept from before the first refresh rewrites them, and an empty
+ * value counts as absent, as the refresh counts it. */
+static const char *const session_identity[] = {
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+};
+#define KSD_SESSION_IDENTITY_COUNT \
+    (sizeof(session_identity) / sizeof(session_identity[0]))
+static char *exec_identity[KSD_SESSION_IDENTITY_COUNT];
+
+static const char *identity_value(const char *name)
+{
+    const char *value = getenv(name);
+
+    return value != NULL && value[0] != 0 ? value : NULL;
+}
+
+static void keep_exec_identity(void)
+{
+    for (size_t index = 0u; index < KSD_SESSION_IDENTITY_COUNT; index++) {
+        const char *value = identity_value(session_identity[index]);
+
+        exec_identity[index] = value == NULL ? NULL : strdup(value);
+    }
+}
+
+/* Whether the session the user manager now names is the one this process was
+ * started into. Call after a refresh, which adopts the manager's values. */
+static bool exec_environment_current(void)
+{
+    for (size_t index = 0u; index < KSD_SESSION_IDENTITY_COUNT; index++) {
+        const char *own = exec_identity[index];
+        const char *live = identity_value(session_identity[index]);
+
+        if ((own == NULL) != (live == NULL)
+            || (own != NULL && strcmp(own, live) != 0))
+            return false;
+    }
     return true;
 }
 
@@ -312,7 +373,34 @@ int ksd_daemon_main(int argc, char **argv)
     ksd_backend backend;
     bool waiting = false;
     unsigned attempts = 0u;
+    keep_exec_identity();
     (void)ksd_backend_refresh_session_environment();
+    /* Started with the user manager, before any compositor imported its
+     * environment: some sessions never activate graphical-session.target, so
+     * this is the only start they get. Wait for one, then restart into it. A
+     * shell provider is found by its bus name and needs no display, so one
+     * appearing ends the wait as well. */
+    if (exec_identity[0] == NULL && exec_identity[1] == NULL) {
+        struct timespec retry = {
+            .tv_sec = KSD_BACKEND_STARTUP_RETRY_SECONDS,
+        };
+        bool imported;
+
+        fputs("keysharp-desktop daemon: waiting for a graphical session to"
+              " import its environment into the user manager\n", stderr);
+        while (!(imported = ksd_backend_refresh_session_environment())
+               && ksd_backend_resolve() == KSD_BACKEND_NONE) {
+            struct timespec remaining = retry;
+
+            while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+            }
+        }
+        if (imported) {
+            fputs("keysharp-desktop daemon: a graphical session started;"
+                  " restarting to adopt its environment\n", stderr);
+            return 1;
+        }
+    }
     while ((backend = ksd_backend_resolve()) == KSD_BACKEND_NONE) {
         struct timespec retry = {
             .tv_sec = KSD_BACKEND_STARTUP_RETRY_SECONDS,
@@ -438,10 +526,10 @@ int ksd_daemon_main(int argc, char **argv)
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready == 0) {
-            if (backend_is_current(backend))
+            if (backend_is_current(backend) && exec_environment_current())
                 continue;
-            fputs("keysharp-desktop daemon: compositor changed; restarting"
-                  " the session backend\n", stderr);
+            fputs("keysharp-desktop daemon: compositor or session changed;"
+                  " restarting the session backend\n", stderr);
             break;
         }
         if (ready < 0 || (item.revents

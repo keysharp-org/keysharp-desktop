@@ -96,7 +96,10 @@ in
     systemd.user.services.keysharp-desktop = {
       description = "Keysharp desktop broker";
       after = [ "graphical-session.target" ];
-      wantedBy = [ "graphical-session.target" ];
+      # default.target too: compositors started without a session manager,
+      # such as Hyprland without UWSM, never activate graphical-session.target.
+      # The daemon then waits for the session to import its environment.
+      wantedBy = [ "graphical-session.target" "default.target" ];
       partOf = [ "graphical-session.target" ];
       serviceConfig = {
         Type = "simple";

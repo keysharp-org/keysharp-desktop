@@ -2,16 +2,22 @@
 #include "wl_outputs.h"
 #include "wl_pointer.h"
 #include "wl_hypr.h"
+#include "wl_hypr_windows.h"
+#include "wl_displays.h"
 #include "wl_cosmic_windows.h"
 #include "wl_keyboard.h"
 #include "transport.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <glib.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -331,6 +337,101 @@ uint64_t ksd_wayland_new_handle(const ksd_wayland *connection)
     return 0u;
 }
 
+/* The compositor instance: its pid and start time, which together never
+ * recur. Identifiers are unique only within one instance, so they are hashed
+ * with this to keep a restarted compositor's windows from inheriting
+ * handles. */
+static void derive_handle_salt(ksd_wayland *connection)
+{
+    struct ucred peer;
+    socklen_t length = sizeof(peer);
+    char path[64];
+    char stat[1024];
+    char *field;
+    ssize_t count;
+    int descriptor;
+    unsigned long long start_time = 0u;
+    GChecksum *checksum;
+    gsize digest_length = sizeof(connection->handle_salt);
+    char text[96];
+    int text_length;
+
+    if (getsockopt(wl_display_get_fd(connection->display), SOL_SOCKET,
+                   SO_PEERCRED, &peer, &length) != 0
+        || length != sizeof(peer) || peer.pid <= 0)
+        return;
+    connection->compositor_pid = peer.pid;
+    if (snprintf(path, sizeof(path), "/proc/%ld/stat", (long)peer.pid) <= 0)
+        return;
+    descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0)
+        return;
+    count = read(descriptor, stat, sizeof(stat) - 1u);
+    close(descriptor);
+    if (count <= 0)
+        return;
+    stat[count] = 0;
+    /* The command name may hold spaces and parentheses; fields resume after
+     * the last one. Start time is field 22, the 20th after that. */
+    field = strrchr(stat, ')');
+    for (int index = 0; field != NULL && index < 20; index++)
+        field = strchr(field + 1, ' ');
+    if (field == NULL || sscanf(field + 1, "%llu", &start_time) != 1)
+        return;
+    text_length = snprintf(text, sizeof(text),
+                           "keysharp-desktop/wayland-handle/1:%ld:%llu",
+                           (long)peer.pid, start_time);
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    if (checksum == NULL || text_length <= 0)
+        return;
+    g_checksum_update(checksum, (const guchar *)text, (gssize)text_length);
+    g_checksum_get_digest(checksum, connection->handle_salt, &digest_length);
+    g_checksum_free(checksum);
+    connection->handle_salt_ready =
+        digest_length == sizeof(connection->handle_salt);
+}
+
+/* The session's environment names a Hyprland instance, which need not be the
+ * compositor this connection reached, as with one on another seat. */
+static void bind_hypr(ksd_wayland *connection)
+{
+    connection->hypr = connection->compositor_pid > 0
+        && ksd_wayland_hypr_pid(connection->session_pid)
+            == connection->compositor_pid;
+}
+
+uint64_t ksd_wayland_handle_for_identifier(const ksd_wayland *connection,
+                                           const char *identifier)
+{
+    GChecksum *checksum;
+    uint8_t digest[32];
+    gsize digest_length = sizeof(digest);
+    uint64_t value = 0u;
+
+    if (connection == NULL || !connection->handle_salt_ready
+        || identifier == NULL)
+        return 0u;
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    if (checksum == NULL)
+        return 0u;
+    g_checksum_update(checksum, connection->handle_salt,
+                      sizeof(connection->handle_salt));
+    g_checksum_update(checksum, (const guchar *)identifier,
+                      (gssize)strlen(identifier));
+    g_checksum_get_digest(checksum, digest, &digest_length);
+    g_checksum_free(checksum);
+    if (digest_length != sizeof(digest))
+        return 0u;
+    for (size_t index = 0u; index < 8u; index++)
+        value |= (uint64_t)digest[index] << (index * 8u);
+    value &= INT64_MAX;
+    for (const ksd_wl_toplevel *item = connection->toplevels;
+         value != 0u && item != NULL; item = item->next)
+        if (item->id == value && !item->closed)
+            return 0u;
+    return value;
+}
+
 ksd_status ksd_wayland_open(const char *display, ksd_wayland **out)
 {
     ksd_wayland *connection;
@@ -350,6 +451,9 @@ ksd_status ksd_wayland_open(const char *display, ksd_wayland **out)
         free(connection);
         return KSD_STATUS_UNAVAILABLE;
     }
+    /* Before the registry: identifiers arrive during its round trips. */
+    derive_handle_salt(connection);
+    bind_hypr(connection);
     connection->registry = wl_display_get_registry(connection->display);
     if (connection->registry == NULL) {
         wl_display_disconnect(connection->display);
@@ -414,8 +518,10 @@ void ksd_wayland_close(ksd_wayland *connection)
 
 void ksd_wayland_set_session_pid(ksd_wayland *connection, pid_t session_pid)
 {
-    if (connection != NULL && session_pid > 0)
+    if (connection != NULL && session_pid > 0) {
         connection->session_pid = session_pid;
+        bind_hypr(connection);
+    }
 }
 
 pid_t ksd_wayland_session_pid(const ksd_wayland *connection)
@@ -445,6 +551,19 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
         || ksd_wayland_cosmic_can_close(connection);
     features.toplevel_state = connection->toplevel_manager != NULL
         || ksd_wayland_cosmic_can_set_state(connection);
+    /* Hyprland IPC serves the whole window group over the portable list. */
+    bool hypr_windows = ksd_wayland_hypr_windows_available(connection);
+    features.toplevel_active |= hypr_windows;
+    features.toplevel_focus |= hypr_windows;
+    features.toplevel_close |= hypr_windows;
+    features.toplevel_state |= hypr_windows;
+    features.toplevel_geometry = hypr_windows;
+    features.toplevel_kill = hypr_windows;
+    features.toplevel_opacity = hypr_windows;
+    features.toplevel_above = hypr_windows;
+    features.toplevel_events = hypr_windows && connection->handle_salt_ready;
+    features.display_list = ksd_wayland_display_list_available(connection);
+    features.work_area = ksd_wayland_work_area_available(connection);
     features.toplevel_control = features.toplevel_focus
         && features.toplevel_close && features.toplevel_state;
     features.screencopy = connection->shm != NULL
@@ -452,13 +571,15 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
         && (connection->screencopy_manager != NULL
             || (connection->output_source_manager != NULL
                 && connection->image_copy_manager != NULL));
-    /* The preferred wlroots window list has no stable capture identifiers. */
-    features.toplevel_capture = connection->toplevel_manager == NULL
+    /* The wlroots window list, preferred where there is no IPC join, has no
+     * stable capture identifiers. */
+    features.toplevel_capture = (connection->toplevel_manager == NULL
+            || hypr_windows)
         && connection->shm != NULL
         && connection->toplevel_list != NULL
         && connection->toplevel_source_manager != NULL
         && connection->image_copy_manager != NULL;
-    bool hypr = ksd_wayland_hypr_available(connection->session_pid);
+    bool hypr = connection->hypr;
     features.absolute_pointer = (connection->virtual_pointer != NULL
         && connection->outputs != NULL) || hypr;
     features.cursor_position = hypr;
@@ -470,4 +591,28 @@ bool ksd_wayland_connection_failed(const ksd_wayland *connection)
 {
     return connection == NULL || connection->display == NULL
         || wl_display_get_error(connection->display) != 0;
+}
+
+bool ksd_wayland_dispatch_ready(ksd_wayland *connection)
+{
+    struct pollfd item;
+
+    if (connection == NULL || connection->display == NULL)
+        return false;
+    while (wl_display_prepare_read(connection->display) != 0)
+        if (wl_display_dispatch_pending(connection->display) < 0)
+            return false;
+    if (wl_display_flush(connection->display) < 0 && errno != EAGAIN) {
+        wl_display_cancel_read(connection->display);
+        return false;
+    }
+    item.fd = wl_display_get_fd(connection->display);
+    item.events = POLLIN;
+    item.revents = 0;
+    if (poll(&item, 1u, 0) <= 0 || (item.revents & POLLIN) == 0) {
+        wl_display_cancel_read(connection->display);
+        return (item.revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+    }
+    return wl_display_read_events(connection->display) >= 0
+        && wl_display_dispatch_pending(connection->display) >= 0;
 }

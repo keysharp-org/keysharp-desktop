@@ -9,9 +9,11 @@
 #include "wl_capture.h"
 #include "wl_pointer.h"
 #include "wl_hypr.h"
+#include "wl_displays.h"
 #include "wl_windows.h"
 #include "wl_keyboard.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #define KSD_WL_DISPLAY_CAPACITY 256u
@@ -86,8 +88,13 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
             return request->payload_length == 0u;
         case KSD_OP_WINDOW_ACTIVE:
         case KSD_OP_CURSOR_POSITION:
+        case KSD_OP_DISPLAY_LIST:
+        case KSD_OP_WORK_AREA:
             return request->payload_length == 0u;
         case KSD_OP_WINDOW_FOCUS:
+        case KSD_OP_WINDOW_RAISE:
+        case KSD_OP_WINDOW_LOWER:
+        case KSD_OP_WINDOW_KILL:
         case KSD_OP_WINDOW_CLOSE: {
             uint64_t handle;
             return ksd_cursor_u64(&cursor, &handle)
@@ -107,6 +114,51 @@ bool ksd_wayland_request_valid(const ksd_frame *request)
                 && ksd_cursor_u32(&cursor, &reserved)
                 && ksd_cursor_finished(&cursor) && handle != 0u
                 && value <= 3u && reserved == 0u;
+        }
+        case KSD_OP_WINDOW_SET_OPACITY: {
+            uint64_t handle;
+            uint32_t value;
+            uint32_t reserved;
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_u32(&cursor, &value)
+                && ksd_cursor_u32(&cursor, &reserved)
+                && ksd_cursor_finished(&cursor) && handle != 0u
+                && value <= 255u && reserved == 0u;
+        }
+        case KSD_OP_WINDOW_SET_ABOVE: {
+            uint64_t handle;
+            uint32_t value;
+            uint32_t reserved;
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_u32(&cursor, &value)
+                && ksd_cursor_u32(&cursor, &reserved)
+                && ksd_cursor_finished(&cursor) && handle != 0u
+                && value <= 1u && reserved == 0u;
+        }
+        case KSD_OP_WINDOW_MOVE_RESIZE: {
+            uint64_t handle;
+            int32_t x;
+            int32_t y;
+            uint32_t width;
+            uint32_t height;
+            return ksd_cursor_u64(&cursor, &handle)
+                && ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && ksd_cursor_u32(&cursor, &width)
+                && ksd_cursor_u32(&cursor, &height)
+                && ksd_cursor_finished(&cursor) && handle != 0u
+                && width <= (uint32_t)INT16_MAX && height <= (uint32_t)INT16_MAX
+                && (x != INT32_MIN || y != INT32_MIN || width != 0u
+                    || height != 0u);
+        }
+        case KSD_OP_WINDOW_AT_POINT: {
+            int32_t x;
+            int32_t y;
+            uint32_t deepest;
+            uint32_t zero;
+            return ksd_cursor_i32(&cursor, &x) && ksd_cursor_i32(&cursor, &y)
+                && ksd_cursor_u32(&cursor, &deepest)
+                && ksd_cursor_u32(&cursor, &zero) && deepest <= 1u
+                && zero == 0u && ksd_cursor_finished(&cursor);
         }
         case KSD_OP_WINDOW_LIST: {
             uint32_t include_hidden;
@@ -240,6 +292,9 @@ bool ksd_wayland_execute_on(struct ksd_wayland *connection,
             ksd_wayland_active_window(connection, result);
             break;
         case KSD_OP_WINDOW_FOCUS:
+        case KSD_OP_WINDOW_RAISE:
+        case KSD_OP_WINDOW_LOWER:
+        case KSD_OP_WINDOW_KILL:
         case KSD_OP_WINDOW_CLOSE: {
             ksd_cursor cursor;
             uint64_t handle = 0u;
@@ -250,6 +305,14 @@ bool ksd_wayland_execute_on(struct ksd_wayland *connection,
                                        result);
             break;
         }
+        case KSD_OP_DISPLAY_LIST:
+            ksd_wayland_display_list(connection, result);
+            break;
+        case KSD_OP_WORK_AREA:
+            ksd_wayland_work_area(connection, result);
+            break;
+        case KSD_OP_WINDOW_SET_OPACITY:
+        case KSD_OP_WINDOW_SET_ABOVE:
         case KSD_OP_WINDOW_SET_STATE: {
             ksd_cursor cursor;
             uint64_t handle = 0u;
@@ -262,6 +325,29 @@ bool ksd_wayland_execute_on(struct ksd_wayland *connection,
                                        value, result);
             break;
         }
+        case KSD_OP_WINDOW_MOVE_RESIZE: {
+            ksd_cursor cursor;
+            uint64_t handle = 0u;
+            int32_t x = 0;
+            int32_t y = 0;
+            uint32_t width = 0u;
+            uint32_t height = 0u;
+            ksd_cursor_init(&cursor, request->payload,
+                            request->payload_length);
+            (void)ksd_cursor_u64(&cursor, &handle);
+            (void)ksd_cursor_i32(&cursor, &x);
+            (void)ksd_cursor_i32(&cursor, &y);
+            (void)ksd_cursor_u32(&cursor, &width);
+            (void)ksd_cursor_u32(&cursor, &height);
+            ksd_wayland_window_move_resize(connection, handle, x, y, width,
+                                           height, result);
+            break;
+        }
+        case KSD_OP_WINDOW_AT_POINT:
+            ksd_wayland_window_at_point(connection,
+                (int32_t)ksd_decode_u32(request->payload),
+                (int32_t)ksd_decode_u32(request->payload + 4u), result);
+            break;
         case KSD_OP_CAPTURE_AREA: {
             ksd_cursor cursor;
             int32_t x = 0;

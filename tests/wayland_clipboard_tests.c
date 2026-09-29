@@ -1649,9 +1649,18 @@ static void check_window_query(const char *socket_name, const char *mode)
     assert(result.status == KSD_STATUS_NOT_FOUND);
     ksd_result_clear(&result);
     ksd_wayland_close(connection);
+    /* A handle derived from an identifier names the same window on every
+     * connection to one compositor instance, which is what lets a separate
+     * event worker agree with the query worker. The wlroots list carries no
+     * identifier, so its handles stay private to the connection. */
     assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
     ksd_wayland_window_query(connection, second, &result);
-    assert(result.status == KSD_STATUS_NOT_FOUND);
+    if (strcmp(mode, "wlr") == 0)
+        assert(result.status == KSD_STATUS_NOT_FOUND);
+    else {
+        assert(result.status == KSD_STATUS_OK);
+        assert(window_handle_at(&result, 0u) == second);
+    }
     ksd_result_clear(&result);
     ksd_wayland_close(connection);
     stop_server(child);

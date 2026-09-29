@@ -101,17 +101,19 @@ capture on a `kwin_wayland` session and falls back to `KSD_BACKEND_GENERIC` on
 KDE X11; GNOME Shell and
 Cinnamon provide window operations and events, clipboard reads and events, pointer
 control, cursor position and work area, with in-memory area and window capture on GNOME. Every
-other compositor registers `KSD_BACKEND_GENERIC`, which now serves what the shared Wayland
-protocols allow a client OUTSIDE the compositor to do: the three clipboard reads over
-ext-data-control-v1, and the window list over ext-foreign-toplevel-list-v1. That is a
+other compositor registers `KSD_BACKEND_GENERIC`, which serves what the shared Wayland
+protocols allow a client OUTSIDE the compositor to do -- the three clipboard reads over
+ext-data-control-v1, the window list over ext-foreign-toplevel-list-v1, and window state
+and control where wlroots or COSMIC protocols provide them -- plus what a compositor
+channel of its own adds, which today means Hyprland IPC: geometry, restacking,
+hit-testing, opacity, keep-above, kill, window events and the work area. That is a
 ceiling, not a promise -- the daemon probes what its compositor actually advertises and
 narrows the registration to it, so a client is told what it can really have.
 
-Nothing beyond that may be inferred, and the gap is not laziness. Nine operations are
-impossible for a client on the outside: no Wayland protocol lets one client restack
-another's window, set its geometry or opacity, keep it above, change its decoration, learn
-a pid to signal, or correlate a toplevel to the process about to create it. There is also
-no way to ask which window has focus, which is why there is no active-window verb here.
+Nothing beyond that may be inferred, and the gap is not laziness. Without such a channel no
+Wayland protocol lets one client restack another's window, set its geometry or opacity,
+keep it above or learn a pid to signal, and nothing at all lets it change another's
+decoration or correlate a toplevel to the process about to create it.
 
 This service manages the six desktop scopes plus the shared `INPUT_CONTROL` used by
 pointer calls. `INPUT_MONITORING` is a canonical shared value that this service does not

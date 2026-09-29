@@ -137,7 +137,7 @@ endif()
 file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.socket" authority_socket)
 foreach(required
         "PartOf=graphical-session.target"
-        "WantedBy=graphical-session.target"
+        "WantedBy=graphical-session.target default.target"
         "Restart=on-failure"
         "NoNewPrivileges=true"
         "PrivateTmp=false"

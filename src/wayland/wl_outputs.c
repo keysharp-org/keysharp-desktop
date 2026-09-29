@@ -5,6 +5,7 @@
 
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void output_geometry(void *data, struct wl_output *proxy, int32_t x,
                             int32_t y, int32_t physical_width,
@@ -15,9 +16,9 @@ static void output_geometry(void *data, struct wl_output *proxy, int32_t x,
     ksd_wl_output *output = data;
 
     (void)proxy;
-    (void)physical_width;
-    (void)physical_height;
     (void)subpixel;
+    output->physical_width_mm = physical_width > 0 ? physical_width : 0;
+    output->physical_height_mm = physical_height > 0 ? physical_height : 0;
     (void)make;
     (void)model;
     output->x = x;
@@ -33,9 +34,9 @@ static void output_mode(void *data, struct wl_output *proxy, uint32_t flags,
     ksd_wl_output *output = data;
 
     (void)proxy;
-    (void)refresh;
     if ((flags & WL_OUTPUT_MODE_CURRENT) == 0u)
         return;
+    output->refresh_mhz = refresh > 0 ? refresh : 0;
     output->mode_width = width;
     output->mode_height = height;
     output->current_mode = width > 0 && height > 0;
@@ -55,11 +56,25 @@ static void output_scale(void *data, struct wl_output *proxy, int32_t factor)
     ((ksd_wl_output *)data)->scale = factor > 0 ? factor : 1;
 }
 
+/* A name that does not fit is dropped rather than cut, because a cut name
+ * could match a different monitor. */
+static void store_name(ksd_wl_output *output, const char *name, bool primary)
+{
+    size_t length;
+
+    if (name == NULL || (output->name_from_output && !primary))
+        return;
+    length = strlen(name);
+    if (length == 0u || length >= sizeof(output->name))
+        return;
+    memcpy(output->name, name, length + 1u);
+    output->name_from_output = primary;
+}
+
 static void output_name(void *data, struct wl_output *proxy, const char *name)
 {
-    (void)data;
     (void)proxy;
-    (void)name;
+    store_name(data, name, true);
 }
 
 static void output_description(void *data, struct wl_output *proxy,
@@ -110,9 +125,8 @@ static void xdg_done(void *data, struct zxdg_output_v1 *proxy)
 static void xdg_name(void *data, struct zxdg_output_v1 *proxy,
                      const char *name)
 {
-    (void)data;
     (void)proxy;
-    (void)name;
+    store_name(data, name, false);
 }
 
 static void xdg_description(void *data, struct zxdg_output_v1 *proxy,

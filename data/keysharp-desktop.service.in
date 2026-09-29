@@ -24,4 +24,7 @@ Restart=on-failure
 RestartSec=2s
 
 [Install]
-WantedBy=graphical-session.target
+# default.target too: compositors started without a session manager, such as
+# Hyprland without UWSM, never activate graphical-session.target. The daemon
+# then waits for the session to import its environment.
+WantedBy=graphical-session.target default.target

@@ -4,6 +4,7 @@
 #include "protocol.h"
 #include "local_capture.h"
 #include "wl_connect.h"
+#include "wl_watch.h"
 #include "wl_worker.h"
 #include "x11_connect.h"
 #include "x11_worker.h"
@@ -1218,6 +1219,16 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
             && request.payload_length == 0u) {
             ok = ksd_x11_watch_run(connection, KSD_CAPTURE_WORKER_FD,
                                    request.request_id);
+            (void)alarm(0u);
+            ksd_result_clear(&result);
+            free(body);
+            break;
+        }
+        if (connection != NULL && backend == KSD_BACKEND_GENERIC
+            && request.opcode == KSD_OP_WINDOW_WATCH
+            && request.payload_length == 0u) {
+            ok = ksd_wayland_watch_run(connection, KSD_CAPTURE_WORKER_FD,
+                                       request.request_id);
             (void)alarm(0u);
             ksd_result_clear(&result);
             free(body);

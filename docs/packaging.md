@@ -48,7 +48,10 @@ session with no supported compositor registers the generic backend rather than
 retrying forever, then upgrades if a supported provider appears later.
 GNOME and Cinnamon providers also start the unit through the user systemd
 manager when they load. This covers shells such as Cinnamon that do not start
-`graphical-session.target`.
+`graphical-session.target`. The unit is wanted by `default.target` as well, for
+compositors started without a session manager, such as Hyprland without UWSM:
+started before a session has imported `WAYLAND_DISPLAY` or `DISPLAY`, the
+daemon waits for one and then restarts into it.
 
 The user manager can survive a logout while its graphical-session environment
 is replaced for the next login. The daemon refreshes the session-defining

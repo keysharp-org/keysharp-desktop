@@ -30,6 +30,13 @@ typedef struct ksd_wayland_features {
     bool toplevel_focus;
     bool toplevel_close;
     bool toplevel_state;
+    bool toplevel_geometry;
+    bool toplevel_kill;
+    bool toplevel_opacity;
+    bool toplevel_above;
+    bool toplevel_events;
+    bool display_list;
+    bool work_area;
     bool screencopy;
     bool toplevel_capture;
     bool absolute_pointer;

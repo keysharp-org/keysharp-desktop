@@ -296,8 +296,11 @@ endforeach()
 add_library(keysharp-desktop-wayland STATIC
     src/wayland/portal_capture.c
     src/wayland/wl_connect.c
+    src/wayland/wl_displays.c
     src/wayland/wl_cosmic_windows.c
     src/wayland/wl_hypr.c
+    src/wayland/wl_hypr_windows.c
+    src/wayland/wl_watch.c
     src/wayland/wl_keyboard.c
     src/wayland/wl_clipboard.c
     src/wayland/wl_capture.c
@@ -720,6 +723,11 @@ if(BUILD_TESTING)
         PkgConfig::WAYLAND_SERVER)
     add_test(NAME wayland-clipboard-tests COMMAND wayland-clipboard-tests)
     set_tests_properties(wayland-clipboard-tests PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(hypr-ipc-tests tests/hypr_ipc_tests.c)
+    target_link_libraries(hypr-ipc-tests PRIVATE
+        keysharp-desktop-wayland keysharp-desktop-common)
+    add_test(NAME hypr-ipc-tests COMMAND hypr-ipc-tests)
 
     add_executable(portal-capture-tests tests/portal_capture_tests.c)
     target_link_libraries(portal-capture-tests PRIVATE

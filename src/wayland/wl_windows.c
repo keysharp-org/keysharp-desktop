@@ -3,6 +3,7 @@
 #include "protocol_io.h"
 #include "wl_internal.h"
 #include "wl_cosmic_windows.h"
+#include "wl_hypr_windows.h"
 #include "wl_wlr_windows.h"
 
 #include <stdio.h>
@@ -78,10 +79,20 @@ static void toplevel_identifier(void *data,
     ksd_wl_toplevel *toplevel = data;
 
     (void)handle;
-    /* Preserve the compositor's identifier separately from our opaque numeric
-     * handle so reconnects cannot accidentally reuse a control/query target. */
-    if (toplevel != NULL)
+    /* The handle is derived from the identifier and the compositor instance,
+     * so every worker connected to that instance names the window alike and
+     * a restarted compositor's windows cannot inherit it. The placeholder it
+     * replaces is never seen: a toplevel is unusable until it has an
+     * identifier. */
+    if (toplevel != NULL) {
+        uint64_t derived;
+
         ksd_wayland_replace_string(&toplevel->identifier, identifier);
+        derived = ksd_wayland_handle_for_identifier(toplevel->connection,
+                                                    identifier);
+        if (derived != 0u)
+            toplevel->id = derived;
+    }
 }
 
 static const struct ext_foreign_toplevel_handle_v1_listener handle_listener = {
@@ -118,6 +129,7 @@ static void list_toplevel(void *data, struct ext_foreign_toplevel_list_v1 *list,
         return;
     }
     fresh->handle = handle;
+    fresh->connection = connection;
     fresh->id = ksd_wayland_new_handle(connection);
     if (fresh->id == 0u) {
         ext_foreign_toplevel_handle_v1_destroy(handle);
@@ -250,6 +262,10 @@ static const ksd_wayland_window_view *window_view(ksd_wayland *connection)
 {
     if (connection == NULL)
         return NULL;
+    /* Ahead of the wlroots list, whose handles carry no identifier to join
+     * the IPC facts to and no capture identifier either. */
+    if (ksd_wayland_hypr_windows_available(connection))
+        return ksd_wayland_hypr_window_view();
     if (connection->toplevel_manager != NULL)
         return ksd_wayland_wlr_window_view();
     if (ksd_wayland_cosmic_can_list(connection))
@@ -257,9 +273,9 @@ static const ksd_wayland_window_view *window_view(ksd_wayland *connection)
     return connection->toplevel_list == NULL ? NULL : &generic_view;
 }
 
-static bool refresh(ksd_wayland *connection,
-                    const ksd_wayland_window_view *view,
-                    ksd_operation_result *result)
+bool ksd_wayland_windows_refresh(ksd_wayland *connection,
+                                 const ksd_wayland_window_view *view,
+                                 ksd_operation_result *result)
 {
     if (view == NULL) {
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
@@ -272,6 +288,9 @@ static bool refresh(ksd_wayland *connection,
         return false;
     }
     sweep_closed(connection);
+    if (view == ksd_wayland_hypr_window_view()
+        && !ksd_wayland_hypr_windows_refresh(connection, result))
+        return false;
     return true;
 }
 
@@ -291,7 +310,7 @@ struct ksd_wl_toplevel *ksd_wayland_window_for_action(
 {
     ksd_wl_toplevel *window;
 
-    if (!refresh(connection, view, result))
+    if (!ksd_wayland_windows_refresh(connection, view, result))
         return NULL;
     window = find_window(connection, handle, view);
     if (window == NULL)
@@ -326,7 +345,7 @@ void ksd_wayland_window_query(ksd_wayland *connection, uint64_t handle,
 struct ext_foreign_toplevel_handle_v1 *ksd_wayland_window_capture_handle(
     ksd_wayland *connection, const char *identifier, ksd_operation_result *result)
 {
-    if (!refresh(connection, connection->toplevel_list == NULL ? NULL : &generic_view, result))
+    if (!ksd_wayland_windows_refresh(connection, connection->toplevel_list == NULL ? NULL : &generic_view, result))
         return NULL;
     for (ksd_wl_toplevel *window = connection->toplevels; window != NULL; window = window->next)
         if (generic_usable(window) && strcmp(window->identifier, identifier) == 0)
@@ -343,7 +362,7 @@ void ksd_wayland_window_handles(ksd_wayland *connection,
     bool ok;
     bool first = true;
 
-    if (!refresh(connection, view, result))
+    if (!ksd_wayland_windows_refresh(connection, view, result))
         return;
     ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
     ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"handles\":[", 22u);
@@ -380,7 +399,7 @@ void ksd_wayland_window_list(ksd_wayland *connection, bool include_hidden,
     bool ok;
     bool first = true;
 
-    if (!refresh(connection, view, result))
+    if (!ksd_wayland_windows_refresh(connection, view, result))
         return;
     ksd_buffer_init(&out, KSD_MAX_TEXT_BYTES);
     ok = ksd_buffer_bytes(&out, "{\"ok\":true,\"windows\":[", 22u);
@@ -418,7 +437,7 @@ void ksd_wayland_active_window(ksd_wayland *connection,
                          "this compositor does not expose an active window");
         return;
     }
-    if (!refresh(connection, view, result))
+    if (!ksd_wayland_windows_refresh(connection, view, result))
         return;
     for (ksd_wl_toplevel *item = connection->toplevels;
          item != NULL; item = item->next) {
@@ -447,7 +466,10 @@ void ksd_wayland_window_action(ksd_wayland *connection, uint16_t opcode,
                                uint64_t handle, uint32_t value,
                                ksd_operation_result *result)
 {
-    if (connection != NULL && connection->toplevel_manager != NULL)
+    if (ksd_wayland_hypr_windows_available(connection))
+        ksd_wayland_hypr_window_action(connection, opcode, handle, value,
+                                       result);
+    else if (connection != NULL && connection->toplevel_manager != NULL)
         ksd_wayland_wlr_window_action(connection, opcode, handle, value,
                                       result);
     else if (ksd_wayland_cosmic_can_list(connection))
@@ -456,4 +478,27 @@ void ksd_wayland_window_action(ksd_wayland *connection, uint16_t opcode,
     else
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
                          "this compositor does not control foreign windows");
+}
+
+void ksd_wayland_window_move_resize(ksd_wayland *connection, uint64_t handle,
+                                    int32_t x, int32_t y, uint32_t width,
+                                    uint32_t height,
+                                    ksd_operation_result *result)
+{
+    if (ksd_wayland_hypr_windows_available(connection))
+        ksd_wayland_hypr_window_move_resize(connection, handle, x, y, width,
+                                            height, result);
+    else
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "this compositor does not place foreign windows");
+}
+
+void ksd_wayland_window_at_point(ksd_wayland *connection, int32_t x, int32_t y,
+                                 ksd_operation_result *result)
+{
+    if (ksd_wayland_hypr_windows_available(connection))
+        ksd_wayland_hypr_window_at_point(connection, x, y, result);
+    else
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "this compositor does not report window geometry");
 }

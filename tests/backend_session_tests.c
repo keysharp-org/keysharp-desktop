@@ -324,7 +324,7 @@ static void check_registration_mask(void)
     assert(ksd_backend_registration_mask(KSD_BACKEND_GENERIC, version, 0u,
                                          ~UINT64_C(0), &mask));
     assert(mask == ksd_backend_operations(KSD_BACKEND_GENERIC));
-    assert((mask & KSD_OPERATION_WINDOW_MOVE_RESIZE) == 0u);
+    assert((mask & KSD_OPERATION_WINDOW_SET_DECORATED) == 0u);
 
     /* A daemon that probed its compositor and found no data-control protocol
      * says so, and is believed. This is the case the registration mask exists

@@ -38,9 +38,11 @@ static const char *environment_value(const char *const *environment,
     for (size_t index = 0u; index < count; index++) {
         const char *entry = environment[index];
 
+        /* An empty value names nothing, so it counts as absent. */
         if (entry != NULL && strncmp(entry, name, name_length) == 0
             && entry[name_length] == '=')
-            return entry + name_length + 1u;
+            return entry[name_length + 1u] != 0 ? entry + name_length + 1u
+                                                : NULL;
     }
     return NULL;
 }
@@ -54,6 +56,7 @@ bool ksd_backend_apply_session_environment(const char *const *environment,
         "WAYLAND_DISPLAY",
         "DISPLAY",
         "XAUTHORITY",
+        "HYPRLAND_INSTANCE_SIGNATURE",
     };
 
     if (environment == NULL && count != 0u)
@@ -464,10 +467,11 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * what is actually advertised and narrows this at registration, which is
  * exactly what the withhold-only registration mask exists for.
  *
- * Everything absent here is absent because none of the supported protocols
- * provides it. A client on the outside of a Wayland compositor still cannot
- * restack another client's window, set its geometry or opacity, or learn its
- * pid. */
+ * Geometry, restacking, hit-testing, opacity, keeping a window above, the
+ * owning process, the work area and window events come only from a compositor
+ * channel outside the shared protocols, which today means Hyprland IPC.
+ * Decoration and taskbar state remain out of reach from outside a Wayland
+ * compositor. */
 #define KSD_GENERIC_OPERATIONS \
     (KSD_OPERATION_CAPTURE_AREA | KSD_OPERATION_CAPTURE_DESKTOP \
      | KSD_OPERATION_CAPTURE_WINDOW \
@@ -478,6 +482,11 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
      | KSD_OPERATION_WINDOW_LIST | KSD_OPERATION_WINDOW_HANDLES \
      | KSD_OPERATION_WINDOW_ACTIVE | KSD_OPERATION_WINDOW_FOCUS \
      | KSD_OPERATION_WINDOW_CLOSE | KSD_OPERATION_WINDOW_SET_STATE \
+     | KSD_OPERATION_WINDOW_MOVE_RESIZE | KSD_OPERATION_WINDOW_RAISE \
+     | KSD_OPERATION_WINDOW_LOWER | KSD_OPERATION_WINDOW_AT_POINT \
+     | KSD_OPERATION_WINDOW_KILL | KSD_OPERATION_WINDOW_SET_OPACITY \
+     | KSD_OPERATION_WINDOW_SET_ABOVE | KSD_OPERATION_WINDOW_WATCH \
+     | KSD_OPERATION_DISPLAY_LIST | KSD_OPERATION_WORK_AREA \
      | KSD_OPERATION_CLIPBOARD_MIMETYPES \
      | KSD_OPERATION_CLIPBOARD_CONTENT | KSD_OPERATION_CLIPBOARD_TEXT)
 

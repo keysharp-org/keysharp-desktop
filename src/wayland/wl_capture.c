@@ -4,6 +4,7 @@
 #include "protocol_io.h"
 #include "wl_internal.h"
 #include "wl_outputs.h"
+#include "wl_hypr_windows.h"
 #include "wl_windows.h"
 
 #include <errno.h>
@@ -881,7 +882,11 @@ void ksd_wayland_capture_window(ksd_wayland *connection, const char *identifier,
                          "invalid Wayland window capture request");
         return;
     }
-    if (connection->toplevel_manager != NULL || connection->toplevel_list == NULL
+    /* The wlroots list carries no capture identifiers, so window capture
+     * needs the portable list to be the one clients were given. */
+    if ((connection->toplevel_manager != NULL
+            && !ksd_wayland_hypr_windows_available(connection))
+        || connection->toplevel_list == NULL
         || connection->shm == NULL || connection->toplevel_source_manager == NULL
         || connection->image_copy_manager == NULL) {
         ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
