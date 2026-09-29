@@ -330,13 +330,17 @@ function addClickThroughChrome(actor) {
 
 function makeImageContent(content, frame, sameSize) {
     if (content && sameSize && typeof content.set_area === 'function') {
+        // frame.area is the part that changed. One without extent means the texture already holds the right
+        // pixels and only the actor's geometry moved.
+        if (frame.area.width <= 0 || frame.area.height <= 0)
+            return content;
         try {
             const area = new CinnamonCairoGI.RectangleInt();
-            area.x = 0;
-            area.y = 0;
-            area.width = frame.width;
-            area.height = frame.height;
-            if (content.set_area(frame.pixels, frame.format, area, frame.rowStride))
+            area.x = frame.area.x;
+            area.y = frame.area.y;
+            area.width = frame.area.width;
+            area.height = frame.area.height;
+            if (content.set_area(frame.areaPixels, frame.format, area, frame.rowStride))
                 return content;
         } catch (_e) {
         }

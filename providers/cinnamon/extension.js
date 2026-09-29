@@ -331,13 +331,17 @@ function addClickThroughChrome(actor) {
 
 function makeImageContent(content, frame, sameSize) {
     if (content && sameSize && typeof content.set_area === 'function') {
+        // frame.area is the part that changed. One without extent means the texture already holds the right
+        // pixels and only the actor's geometry moved.
+        if (frame.area.width <= 0 || frame.area.height <= 0)
+            return content;
         try {
             const area = new CinnamonCairoGI.RectangleInt();
-            area.x = 0;
-            area.y = 0;
-            area.width = frame.width;
-            area.height = frame.height;
-            if (content.set_area(frame.pixels, frame.format, area, frame.rowStride))
+            area.x = frame.area.x;
+            area.y = frame.area.y;
+            area.width = frame.area.width;
+            area.height = frame.area.height;
+            if (content.set_area(frame.areaPixels, frame.format, area, frame.rowStride))
                 return content;
         } catch (_e) {
         }
@@ -853,7 +857,6 @@ const PROVIDER_OBJECT_PATH = '/org/keysharp/DesktopProvider';
 const PROVIDER_SOCKET_NAME = env.providerSocketName;
 const OBJECT_PATH = env.objectPath;
 const MAX_CLIPBOARD_BYTES = 16 * 1024 * 1024;
-const MAX_OVERLAY_PNG_BYTES = 16 * 1024 * 1024;
 const MAX_OVERLAY_DIMENSION = 8192;
 const MAX_OVERLAY_PIXELS = 16 * 1024 * 1024;
 const MAX_OVERLAYS_PER_OWNER = 64;
@@ -923,7 +926,12 @@ const PUBLIC_IFACE_XML = `
       <arg type="i" direction="in" name="y"/>
       <arg type="i" direction="in" name="width"/>
       <arg type="i" direction="in" name="height"/>
-      <arg type="ay" direction="in" name="pngData"/>
+      <arg type="h" direction="in" name="frame"/>
+      <arg type="t" direction="in" name="frameSerial"/>
+      <arg type="i" direction="in" name="pixelWidth"/>
+      <arg type="i" direction="in" name="pixelHeight"/>
+      <arg type="i" direction="in" name="stride"/>
+      <arg type="(iiii)" direction="in" name="damage"/>
       <arg type="b" direction="out" name="ok"/>
     </method>
     <method name="MoveImageOverlay">
@@ -1459,7 +1467,14 @@ class KeysharpExtensionCore {
     RegisterHighlightOwnerAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_registerHighlightOwner', 0, 1); }
     ShowHighlightAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_showHighlight', 1, 2); }
     HideHighlightAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_hideHighlight', 1, 2); }
-    ShowImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_showImageOverlay', 1, 2); }
+    // Needs the message itself, for its descriptor list, so it cannot go through _returnOwnedOverlayBoolean.
+    ShowImageOverlayAsync(params, invocation) {
+        let ok = false;
+        if (this._overlayCallerMatches(params, invocation, 1, 2)) {
+            try { ok = Boolean(this._showImageOverlay(invocation, ...params)); } catch (_e) {}
+        }
+        invocation.return_value(new GLib.Variant('(b)', [ok]));
+    }
     MoveImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_moveImageOverlay', 1, 2); }
     HideImageOverlayAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_hideImageOverlay', 1, 2); }
     ShowTooltipAsync(params, invocation) { this._returnOwnedOverlayBoolean(params, invocation, '_showTooltip', 1, 2); }
@@ -2282,29 +2297,105 @@ class KeysharpExtensionCore {
         return true;
     }
 
-    _showImageOverlay(id, ownerKey, busName, x, y, width, height, pngData) {
+    // The frame is memory the client shares rather than pixels it sends: the message carries a descriptor of
+    // the client's buffer, mapped once per buffer serial, and every later frame is one texture upload of the
+    // damaged rectangle straight out of that mapping. Nothing is decoded and nothing sizeable is allocated per
+    // frame, which is what keeps this process's garbage collector out of the way of an animation: a collection
+    // here blocks every JS callback, method calls included, and the client sees its frames dropped.
+    _showImageOverlay(invocation, id, ownerKey, busName, x, y, width, height, frameIndex,
+                      frameSerial, pixelWidth, pixelHeight, stride, damage) {
+        let fd = -1;
         try {
             const owner = this._parseOverlayOwner(ownerKey);
             const key = this._overlayKey(id, owner.key);
 
             this._cancelOverlayReconnectTimer(owner.key);
 
-            // Empty pixels = a clear request.
-            if (!pngData || pngData.length === 0 || width < 1 || height < 1)
-                return this._clearImageOverlay(key);
-
             if (!this._validOverlayGeometry(width, height)
-                || pngData.length > MAX_OVERLAY_PNG_BYTES
-                || !this._overlayQuotaAvailable(owner.key,
-                                                this._imageOverlays.has(key)))
+                || !this._validOverlayGeometry(pixelWidth, pixelHeight)
+                || !Number.isSafeInteger(stride) || stride < pixelWidth * 4
+                || stride * pixelHeight > MAX_OVERLAY_PIXELS * 4
+                || !this._overlayQuotaAvailable(owner.key, this._imageOverlays.has(key)))
                 return false;
 
+            const list = invocation.get_message().get_unix_fd_list();
+            if (!list || !Number.isInteger(frameIndex) || frameIndex < 0
+                || frameIndex >= list.get_length())
+                return false;
+            fd = list.get(frameIndex);
+
+            const area = this._frameArea(damage, pixelWidth, pixelHeight);
             return this._presentImageOverlay(key, owner, busName, x, y, width, height,
-                () => this._decodeImageFrame(pngData));
+                entry => this._mapFrame(entry, fd, String(frameSerial), pixelWidth, pixelHeight, stride, area));
         } catch (e) {
             env.logError(e, 'Keysharp: ShowImageOverlay failed');
             return false;
+        } finally {
+            // The mapping keeps the memory; the descriptor was only the way to reach it.
+            if (fd >= 0)
+                try { GLib.close(fd); } catch (_e) {}
         }
+    }
+
+    // The damaged rectangle, clipped to the frame. A rectangle without area is a frame whose pixels have not
+    // changed, which a client sends when only the actor's geometry did.
+    _frameArea(damage, pixelWidth, pixelHeight) {
+        const [x, y, width, height] = Array.isArray(damage) && damage.length === 4
+            ? damage.map(Number) : [0, 0, pixelWidth, pixelHeight];
+        if (![x, y, width, height].every(Number.isInteger) || width <= 0 || height <= 0)
+            return {x: 0, y: 0, width: 0, height: 0};
+        const left = Math.max(0, x);
+        const top = Math.max(0, y);
+        const right = Math.min(pixelWidth, x + width);
+        const bottom = Math.min(pixelHeight, y + height);
+        return right > left && bottom > top
+            ? {x: left, y: top, width: right - left, height: bottom - top}
+            : {x: 0, y: 0, width: 0, height: 0};
+    }
+
+    _mapFrame(entry, fd, serial, width, height, stride, area) {
+        let shared = entry ? entry.shared : null;
+        let remapped = false;
+
+        if (!shared || shared.serial !== serial || shared.width !== width
+            || shared.height !== height || shared.stride !== stride) {
+            let mapped = null;
+            try {
+                mapped = GLib.MappedFile.new_from_fd(fd, false);
+            } catch (_e) {
+                return null;
+            }
+            // A short mapping would have the texture upload read past its end.
+            if (mapped.get_length() < stride * height)
+                return null;
+            const bytes = mapped.get_bytes();
+            shared = {
+                serial, mapped, bytes, width, height, stride,
+                // A view onto the mapping rather than a copy of it, so this stays cheap at video rates.
+                pixels: bytes.toArray(),
+            };
+            if (entry)
+                entry.shared = shared;
+            remapped = true;
+        }
+
+        // A buffer the actor has not been drawn from yet is uploaded whole, whatever the client marked.
+        if (remapped)
+            area = {x: 0, y: 0, width, height};
+
+        return {
+            pixels: shared.pixels,
+            bytes: shared.bytes,
+            // Cairo's ARGB32, which is what the client draws into: premultiplied BGRA on little-endian.
+            format: Cogl.PixelFormat.BGRA_8888_PRE,
+            width,
+            height,
+            rowStride: stride,
+            area,
+            areaPixels: area.x === 0 && area.y === 0
+                ? shared.pixels : shared.pixels.subarray(area.y * stride + area.x * 4),
+            shared,
+        };
     }
 
     // An empty frame is how a client asks for the overlay to go away.
@@ -2317,22 +2408,17 @@ class KeysharpExtensionCore {
         return true;
     }
 
-    // The shared tail of both Show paths: makeFrame() produces the pixels -- decoded, or mapped out of the
-    // client's shared buffer -- and everything from there on is one actor, created once and updated after.
+    // makeFrame() maps the client's buffer for the entry, and everything from there on is one actor, created
+    // once and updated after.
     _presentImageOverlay(key, owner, busName, x, y, width, height, makeFrame) {
         const bus = String(busName || '');
         const existing = this._imageOverlays.get(key);
         const frame = makeFrame(existing);
 
-        if (!frame || !this._validOverlayGeometry(frame.width, frame.height)
-            || frame.rowStride < frame.width * 3
-            || frame.rowStride * frame.height > MAX_OVERLAY_PIXELS * 4)
+        if (!frame)
             return false;
-        const decodedBytes = Math.max(frame.rowStride * frame.height,
-                                      frame.width * frame.height * 4);
-        if (!Number.isSafeInteger(decodedBytes)
-            || !this._overlayBytesAvailable(owner.key, decodedBytes,
-                                             existing))
+        const frameBytes = frame.rowStride * frame.height;
+        if (!this._overlayBytesAvailable(owner.key, frameBytes, existing))
             return false;
 
         if (existing && existing.actor) {
@@ -2341,7 +2427,7 @@ class KeysharpExtensionCore {
                 existing.ownerPid = owner.pid;
                 existing.ownerStartTime = owner.startTime;
                 existing.busName = bus;
-                existing.decodedBytes = decodedBytes;
+                existing.frameBytes = frameBytes;
                 this._ensureOverlayCleanupTimer();
                 return true;
             } catch (_e) {
@@ -2358,7 +2444,8 @@ class KeysharpExtensionCore {
             ownerPid: owner.pid,
             ownerStartTime: owner.startTime,
             busName: bus,
-            decodedBytes: decodedBytes,
+            frameBytes: frameBytes,
+            shared: frame.shared,
         });
         this._ensureOverlayCleanupTimer();
         return true;
@@ -2539,18 +2626,18 @@ class KeysharpExtensionCore {
         return ownerCount < MAX_OVERLAYS_PER_OWNER;
     }
 
-    _overlayBytesAvailable(ownerKey, decodedBytes, existing) {
+    _overlayBytesAvailable(ownerKey, frameBytes, existing) {
         let total = 0;
         let ownerTotal = 0;
         for (const entry of this._imageOverlays.values()) {
-            const bytes = entry.decodedBytes || 0;
+            const bytes = entry.frameBytes || 0;
             total += bytes;
             if (entry.ownerKey === ownerKey)
                 ownerTotal += bytes;
         }
-        const previous = existing ? existing.decodedBytes || 0 : 0;
-        return total - previous + decodedBytes <= MAX_OVERLAY_BYTES_TOTAL
-            && ownerTotal - previous + decodedBytes
+        const previous = existing ? existing.frameBytes || 0 : 0;
+        return total - previous + frameBytes <= MAX_OVERLAY_BYTES_TOTAL
+            && ownerTotal - previous + frameBytes
                 <= MAX_OVERLAY_BYTES_PER_OWNER;
     }
 
@@ -2798,41 +2885,6 @@ class KeysharpExtensionCore {
 
         if (!this._hasAnyOverlays())
             this._stopOverlayCleanupTimer();
-    }
-
-    _decodeImageFrame(pngData) {
-        const data = pngData instanceof Uint8Array
-            ? pngData : new Uint8Array(pngData || []);
-        if (data.length < 33 || data.length > MAX_OVERLAY_PNG_BYTES)
-            throw new Error('Invalid PNG overlay image.');
-        const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-        if (!signature.every((value, index) => data[index] === value)
-            || String.fromCharCode.apply(null, data.slice(12, 16)) !== 'IHDR')
-            throw new Error('Invalid PNG overlay image.');
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        const width = view.getUint32(16, false);
-        const height = view.getUint32(20, false);
-        if (view.getUint32(8, false) !== 13
-            || !this._validOverlayGeometry(width, height))
-            throw new Error('Invalid PNG overlay dimensions.');
-        const loader = GdkPixbuf.PixbufLoader.new();
-        loader.write(data);
-        loader.close();
-        const pixbuf = loader.get_pixbuf();
-
-        if (!pixbuf || pixbuf.get_width() !== width
-            || pixbuf.get_height() !== height
-            || pixbuf.get_rowstride() * height > MAX_OVERLAY_PIXELS * 4)
-            throw new Error('Could not decode PNG overlay image.');
-
-        return {
-            pixbuf, // keeps the borrowed pixel array alive until the texture copy completes
-            pixels: pixbuf.get_pixels(),
-            format: pixbuf.get_has_alpha() ? Cogl.PixelFormat.RGBA_8888 : Cogl.PixelFormat.RGB_888,
-            width: pixbuf.get_width(),
-            height: pixbuf.get_height(),
-            rowStride: pixbuf.get_rowstride(),
-        };
     }
 
     _updateImageActor(actor, frame, x, y, width, height) {

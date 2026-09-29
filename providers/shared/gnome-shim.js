@@ -392,24 +392,29 @@ function addClickThroughChrome(actor) {
 
 function makeImageContent(content, frame, sameSize) {
     if (content && sameSize) {
+        // frame.area is the part that changed. One without extent means the texture already holds the right
+        // pixels and only the actor's geometry moved.
+        const {x, y, width, height} = frame.area;
+        if (width <= 0 || height <= 0)
+            return content;
+        const pixels = frame.areaPixels;
         try {
             let updated = false;
             if (SHELL_MAJOR >= 48 && typeof content.get_texture === 'function') {
                 const texture = content.get_texture();
                 if (texture && typeof texture.set_region === 'function') {
-                    updated = texture.set_region(0, 0, 0, 0,
-                        frame.width, frame.height, frame.width, frame.height,
-                        frame.format, frame.rowStride, frame.pixels);
+                    updated = texture.set_region(0, 0, x, y, width, height, width, height,
+                        frame.format, frame.rowStride, pixels);
                     if (updated)
                         content.invalidate();
                 }
             } else if (typeof content.set_area === 'function') {
                 const area = new GnomeCairoGI.RectangleInt();
-                area.x = 0;
-                area.y = 0;
-                area.width = frame.width;
-                area.height = frame.height;
-                updated = content.set_area(frame.pixels, frame.format, area,
+                area.x = x;
+                area.y = y;
+                area.width = width;
+                area.height = height;
+                updated = content.set_area(pixels, frame.format, area,
                     frame.rowStride);
             }
             if (updated)
@@ -424,7 +429,7 @@ function makeImageContent(content, frame, sameSize) {
             preferredHeight: frame.height,
         });
         const context = global.stage.context.get_backend().get_cogl_context();
-        image.set_bytes(context, frame.pixbuf.read_pixel_bytes(), frame.format,
+        image.set_bytes(context, frame.bytes, frame.format,
             frame.width, frame.height, frame.rowStride);
         return image;
     }
