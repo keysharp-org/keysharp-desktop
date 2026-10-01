@@ -110,3 +110,29 @@ dependencies through `dpkg-shlibdeps`. Its preinstall guard rejects unmanaged
 CI builds and tests x64 and arm64, consumes the staged CMake and pkg-config
 metadata, validates exported symbols and provider sources, assembles Debian
 and portable artifacts, and runs `nix flake check --no-write-lock-file`.
+
+## Launchpad PPA
+
+Each release is also uploaded to `ppa:descolada/keysharp`, which carries Keysharp
+and keysharp-input as well, for the Ubuntu series listed in `PPA_SERIES` in the
+release workflow. `packaging/debian/` is the single package definition: CPack takes
+its maintainer scripts, and Launchpad builds the same package from a source upload
+that `packaging/ppa/build-source.sh` makes of the tagged tree and its submodule.
+Both builds read the client ABI capability from the public header, and both keep
+the capture worker root-only.
+
+Launchpad accepts each version once, so the workflow first builds every series and
+architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container
+of the series, offline and unprivileged, as Launchpad does. Rerunning the workflow
+uploads only what the PPA lacks. The `ppa_revision` input uploads a released version
+again as `<version>-1~<series><revision>`, reusing the upstream tarball Launchpad
+already holds. To rehearse locally, with Docker installed:
+
+```bash
+SERIES=noble bash packaging/ppa/build-source.sh
+bash packaging/ppa/rehearse.sh dist/ppa/keysharp-desktop_*~noble1.dsc noble
+```
+
+Uploads are signed with the organization secrets `PPA_GPG_PRIVATE_KEY`, the
+armored secret key of a GPG identity registered with the PPA owner's Launchpad
+account, and `PPA_GPG_PASSPHRASE` when that key has a passphrase.

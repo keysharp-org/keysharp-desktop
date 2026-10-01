@@ -11,6 +11,14 @@ On Debian or Ubuntu:
 sudo apt install ./keysharp-desktop_<version>_<arch>.deb
 ```
 
+On Ubuntu 24.04 or 26.04, Keysharp's Launchpad PPA supplies the same package and
+keeps it updated:
+
+```sh
+sudo add-apt-repository ppa:descolada/keysharp
+sudo apt install keysharp-desktop
+```
+
 On another systemd distribution:
 
 ```sh
@@ -74,7 +82,7 @@ restart their user service. Use `journalctl --user -u keysharp-desktop.service` 
 ## Upgrade and remove
 
 Install a newer release through the same channel. Downloaded `.deb` files do not
-configure an update repository. Check releases for security fixes and new operations;
+configure an update repository; the PPA does. Check releases for security fixes and new operations;
 ABI compatibility alone does not mean a release is current.
 
 Remove a package through its package manager. Remove the default source/archive

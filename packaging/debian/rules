@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+# The client ABI, not the product version, is the package's contract, and the public header states it.
+ABI_MINOR := $(shell sed -n 's/^\#define KSD_CLIENT_ABI_MINOR \([0-9]*\)u*$$/\1/p' include/keysharp_desktop/client.h)
+
+%:
+	dh $@
+
+# libexec is fixed because the capture worker's path is compiled into the service.
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBEXECDIR=libexec \
+		-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF
+
+# The tests bind sockets below XDG_RUNTIME_DIR, which a build machine does not provide.
+override_dh_auto_test:
+	runtime="$$(mktemp -d)" && XDG_RUNTIME_DIR="$$runtime" dh_auto_test; status=$$?; rm -rf "$$runtime"; exit $$status
+
+# The capture worker is root-only; dh_fixperms would make it world-executable.
+override_dh_fixperms:
+	dh_fixperms -Xkeysharp-desktop-capture-worker
+
+# The maintainer scripts set up the units and the permission store, exactly as in the CPack package.
+override_dh_installsystemd override_dh_installsystemduser override_dh_installtmpfiles:
+
+override_dh_gencontrol:
+	dh_gencontrol -- -Vclient-abi:Provides="keysharp-desktop-client-abi-0 (= 0.$(ABI_MINOR))"
+
+# The upstream LICENSE is the package's copyright notice.
+execute_after_dh_auto_install:
+	install -Dm644 LICENSE debian/keysharp-desktop/usr/share/doc/keysharp-desktop/copyright

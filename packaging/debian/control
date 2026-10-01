@@ -1,0 +1,41 @@
+Source: keysharp-desktop
+Section: utils
+Priority: optional
+Maintainer: Descolada <16986957+Descolada@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.20),
+               pkgconf | pkg-config,
+               libglib2.0-dev,
+               libxcb1-dev,
+               libxcb-shm0-dev,
+               libxcb-randr0-dev,
+               libxcb-shape0-dev,
+               libxcb-xkb-dev,
+               libxcb-composite0-dev,
+               libxkbcommon-dev,
+               libxkbcommon-x11-dev,
+               libwayland-dev,
+               libwayland-bin,
+               wayland-protocols (>= 1.39),
+               dbus <!nocheck>
+Standards-Version: 4.7.0
+Homepage: https://github.com/keysharp-org/keysharp-desktop
+Rules-Requires-Root: no
+
+Package: keysharp-desktop
+Architecture: amd64 arm64
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+         polkitd | policykit-1,
+         systemd
+Provides: ${client-abi:Provides}
+Breaks: keysharp (<< 0.0.0.17)
+Replaces: keysharp (<< 0.0.0.17)
+Description: Per-application desktop capability broker for Linux
+ A Linux desktop automation service and C library for capture, window
+ inspection and control, clipboard access and compositor pointer
+ operations. Applications use libkeysharp-desktop.so.0; the available
+ operations depend on the active compositor.
+ .
+ On GNOME or Cinnamon, run "keysharp-desktop enable-extension" as the
+ graphical user after installing.

@@ -143,8 +143,8 @@ or any new backend, and do not delete them: nothing is removed and no ABI change
   connection from one thread at a time.
 - Comments explain why, in one to three lines. Do not restate the code, describe what it
   replaced, or capitalise words for emphasis.
-- Shell lifecycle scripts are POSIX `sh`, and CI shellchecks
-  `install.sh uninstall.sh packaging/install-release.sh`.
+- Shell lifecycle scripts are POSIX `sh`, and CI shellchecks them together with the Debian
+  maintainer scripts in `packaging/debian/` and the Launchpad tooling in `packaging/ppa/`.
 - Provider JavaScript is validated in CI; keep the GNOME and Cinnamon extensions in step
   with the private provider interface.
 - Public API changes need `include/keysharp_desktop/client.h`, `docs/integrating.md`, and
