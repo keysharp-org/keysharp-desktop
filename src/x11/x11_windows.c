@@ -492,7 +492,11 @@ void ksd_x11_window_query(ksd_x11 *connection, uint32_t window,
     free(state);
     if (!ok) {
         ksd_buffer_clear(&out);
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "the window no longer exists");
+        xcb_generic_error_t *error = NULL;
+        free(xcb_get_window_attributes_reply(c,
+            xcb_get_window_attributes(c, window), &error));
+        ksd_x11_window_error(result, error, "the X server could not report the window");
+        free(error);
         return;
     }
     xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c, xcb_query_tree(c, window), NULL);

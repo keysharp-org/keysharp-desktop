@@ -13,6 +13,9 @@
 #define KSD_X11_MAX_WINDOWS 4096u
 #define KSD_X11_MAX_TEXT 4096u
 
+void ksd_x11_window_error(ksd_operation_result *result,
+                           const xcb_generic_error_t *error,
+                           const char *diagnostic);
 xcb_get_property_reply_t *ksd_x11_property(xcb_connection_t *connection,
                                            xcb_window_t window,
                                            xcb_atom_t name, xcb_atom_t type,

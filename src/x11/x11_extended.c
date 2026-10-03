@@ -30,9 +30,8 @@ static bool checked(ksd_x11 *connection, xcb_void_cookie_t cookie,
                     ksd_operation_result *result)
 {
     xcb_generic_error_t *error = xcb_request_check(connection->connection, cookie);
-    if (error != NULL) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, error->error_code,
-                         "the X server rejected the operation");
+    if (error != NULL || ksd_x11_connection_failed(connection)) {
+        ksd_x11_window_error(result, error, "the X server rejected the operation");
         free(error);
         return false;
     }
@@ -42,10 +41,12 @@ static bool checked(ksd_x11 *connection, xcb_void_cookie_t cookie,
 void ksd_x11_window_children(ksd_x11 *connection, uint32_t window,
                              ksd_operation_result *result)
 {
+    xcb_generic_error_t *error = NULL;
     xcb_query_tree_reply_t *tree = xcb_query_tree_reply(connection->connection,
-        xcb_query_tree(connection->connection, window), NULL);
+        xcb_query_tree(connection->connection, window), &error);
     if (tree == NULL) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "the window no longer exists");
+        ksd_x11_window_error(result, error, "the X server did not report the window's children");
+        free(error);
         return;
     }
     int count = xcb_query_tree_children_length(tree);
@@ -232,11 +233,13 @@ void ksd_x11_window_click(ksd_x11 *connection, uint32_t window,
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u, "invalid client click");
         return;
     }
+    xcb_generic_error_t *error = NULL;
     xcb_translate_coordinates_reply_t *place = xcb_translate_coordinates_reply(
         connection->connection, xcb_translate_coordinates(connection->connection,
-            window, connection->screen->root, (int16_t)x, (int16_t)y), NULL);
+            window, connection->screen->root, (int16_t)x, (int16_t)y), &error);
     if (place == NULL) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "the window no longer exists");
+        ksd_x11_window_error(result, error, "the X server did not report the window's position");
+        free(error);
         return;
     }
     xcb_button_press_event_t event = { 0 };
@@ -268,11 +271,13 @@ void ksd_x11_window_button(ksd_x11 *connection, uint32_t window,
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u, "invalid window button event");
         return;
     }
+    xcb_generic_error_t *error = NULL;
     xcb_translate_coordinates_reply_t *place = xcb_translate_coordinates_reply(
         connection->connection, xcb_translate_coordinates(connection->connection,
-            window, connection->screen->root, (int16_t)x, (int16_t)y), NULL);
+            window, connection->screen->root, (int16_t)x, (int16_t)y), &error);
     if (place == NULL) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "the window no longer exists");
+        ksd_x11_window_error(result, error, "the X server did not report the window's position");
+        free(error);
         return;
     }
     xcb_button_press_event_t event = { 0 };

@@ -5,6 +5,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+void ksd_x11_window_error(ksd_operation_result *result,
+                           const xcb_generic_error_t *error,
+                           const char *diagnostic)
+{
+    bool missing = error != NULL && error->error_code == XCB_WINDOW;
+    ksd_result_error(result, missing ? KSD_STATUS_NOT_FOUND : KSD_STATUS_UNAVAILABLE,
+                     error != NULL ? error->error_code : 0u,
+                     missing ? "the window no longer exists" : diagnostic);
+}
+
 /* Every name is asked for in one pass and every answer collected in a second,
  * once for the session-lifetime connection. */
 void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)

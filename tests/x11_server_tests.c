@@ -903,6 +903,13 @@ static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
 }
 
+static void assert_missing_window(const ksd_operation_result *result)
+{
+    assert(result->status == KSD_STATUS_NOT_FOUND);
+    assert(result->detail == XCB_WINDOW);
+    assert(result->tail == NULL && result->payload_fd < 0);
+}
+
 static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
                                      xcb_screen_t *screen)
 {
@@ -1054,6 +1061,11 @@ static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
     assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_UNMAPPED);
     free(attributes);
     ksd_result_init(&result);
+    ksd_x11_window_focus_child(connection, child, &result);
+    assert(result.status == KSD_STATUS_UNAVAILABLE);
+    assert(result.detail == XCB_MATCH);
+    ksd_result_clear(&result);
+    ksd_result_init(&result);
     ksd_x11_window_set_visible(connection, child, true, &result);
     assert(result.status == KSD_STATUS_OK);
     ksd_result_clear(&result);
@@ -1100,6 +1112,28 @@ static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
     ksd_result_clear(&result);
     xcb_destroy_window(owner, frame);
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+
+    /* A vanished target is distinct from a live window rejecting an operation. */
+    ksd_result_init(&result);
+    ksd_x11_window_query(connection, child, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_children(connection, child, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_set_title(connection, child, (const uint8_t *)"gone", 4u, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_set_visible(connection, child, true, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_set_visible(connection, child, false, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_redraw(connection, child, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_click(connection, child, 3, 4, 1u, 1u, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_button(connection, child, 3, 4, 1u, true, &result);
+    assert_missing_window(&result);
+    ksd_x11_window_focus_child(connection, child, &result);
+    assert_missing_window(&result);
+    ksd_result_clear(&result);
 }
 
 /* The control verbs are almost all requests to the window manager, so what
