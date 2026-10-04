@@ -8,7 +8,7 @@
  * going, that it pairs each answer with the request that asked for it, that a
  * bad request does not end it, and that it opens the display once.
  *
- * The loop reads and writes fd 3, so each case hands it one end of a
+ * The loop reads and writes fd 3, so each RPC case hands it one end of a
  * socketpair with every request already queued and the far end closed. It then
  * drains the queue and stops at end-of-file, which is also how the real worker
  * learns the authority has gone.
@@ -16,10 +16,13 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <xcb/xcb.h>
@@ -27,6 +30,7 @@
 #include "backend.h"
 #include "protocol.h"
 #include "protocol_io.h"
+#include "state_wire.h"
 #include "x11_connect.h"
 #include "x11_display.h"
 
@@ -220,8 +224,23 @@ static void check_bad_request_does_not_end_the_loop(void)
     close(far_end);
 }
 
-/* An event subscription acknowledges through the same worker connection,
- * then leaves the RPC loop and ends when the authority closes its side. */
+static ksd_frame read_watch_frame(int descriptor)
+{
+    static const uint8_t magic[4] = {
+        KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
+        KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+    };
+    struct pollfd ready = { .fd = descriptor, .events = POLLIN };
+    assert(poll(&ready, 1u, 3000) == 1);
+    assert((ready.revents & POLLIN) != 0);
+    ksd_frame frame = { 0 };
+    assert(ksd_frame_read(descriptor, magic, KSD_PROTOCOL_MAJOR,
+        KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES + 256u, false, &frame) == 1);
+    return frame;
+}
+
+/* Read snapshots concurrently: a full keyboard map can exceed the socket
+ * buffer. Closing the authority side must then end the subscription. */
 static void check_window_watch_transition(void)
 {
     int reserved = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -238,17 +257,46 @@ static void check_window_watch_transition(void)
         XCB_ATOM_WINDOW, 32u, 0u, NULL);
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
     int far_end, near_end;
-    uint64_t id;
-    uint32_t status;
     make_pair(&far_end, &near_end);
     queue_request(far_end, KSD_OP_WINDOW_WATCH, 71u, NULL, 0u);
     ksd_capture_worker_test_opens = 0u;
-    assert(serve_queued(far_end, near_end, KSD_BACKEND_X11, getpid()));
-    assert(take_answer(far_end, &id, &status));
-    assert(id == 71u && status == KSD_STATUS_OK);
-    assert(!take_answer(far_end, &id, &status));
-    assert(ksd_capture_worker_test_opens == 1u);
+    pid_t session_pid = getpid();
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        assert(prctl(PR_SET_PDEATHSIG, SIGKILL) == 0);
+        close(far_end);
+        close(xcb_get_file_descriptor(owner));
+        assert(dup2(near_end, WORKER_FD) == WORKER_FD);
+        close(near_end);
+        bool ok = ksd_capture_worker_test_serve(KSD_BACKEND_X11, session_pid);
+        assert(ksd_capture_worker_test_opens == 1u);
+        close(WORKER_FD);
+        _exit(ok ? 0 : 1);
+    }
+    close(near_end);
+    ksd_frame ready = read_watch_frame(far_end);
+    assert(ready.request_id == 71u && ready.payload_length == 8u
+        && ksd_decode_u32(ready.payload) == KSD_STATUS_OK);
+    ksd_frame_clear(&ready);
+    uint32_t domains = KSD_STATE_WINDOWS | KSD_STATE_KEYBOARD | KSD_STATE_DISPLAYS;
+    uint32_t complete = 0u;
+    for (unsigned i = 0u; complete != domains && i < 128u; i++) {
+        ksd_frame snapshot = read_watch_frame(far_end);
+        ksd_state_event event;
+        assert(snapshot.opcode == KSD_OP_STATE_EVENT
+            && snapshot.flags == KSD_FLAG_EVENT && snapshot.request_id == 0u
+            && ksd_state_event_decode(snapshot.payload, snapshot.payload_length, &event));
+        if (event.kind == KSD_STATE_SNAPSHOT_END)
+            complete |= event.domain;
+        ksd_state_event_clear(&event);
+        ksd_frame_clear(&snapshot);
+    }
+    assert(complete == domains);
     close(far_end);
+    int status;
+    assert(waitpid(child, &status, 0) == child);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     xcb_delete_property(owner, screen->root, atom->atom);
     free(atom);
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));

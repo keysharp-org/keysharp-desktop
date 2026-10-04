@@ -659,7 +659,7 @@ if(BUILD_TESTING)
     add_test(NAME persistent-worker-tests
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
             $<TARGET_FILE:persistent-worker-tests>)
-    set_tests_properties(persistent-worker-tests PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(persistent-worker-tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
     add_executable(x11-bench-tests tests/x11_bench_tests.c)
     target_link_libraries(x11-bench-tests PRIVATE
