@@ -120,7 +120,7 @@ static bool packed_frame_is_valid(ksd_frame *value)
 
 int main(void)
 {
-    assert(KSD_PROTOCOL_MAJOR == 2u);
+    assert(KSD_PROTOCOL_MAJOR == 3u);
     assert(KSD_PROTOCOL_MINOR == 0u);
     assert(strcmp(KSD_CLIENT_PROTOCOL_NAME, "keysharp-desktop/client") == 0);
     assert(KSD_FRAME_HEADER_SIZE == 24u);

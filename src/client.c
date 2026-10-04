@@ -127,8 +127,11 @@ static bool initialize_poll(ksd_connection *connection)
 static void signal_pending(ksd_connection *connection)
 {
     uint64_t value = 1u;
-    if (connection->pending_descriptor >= 0)
-        (void)write(connection->pending_descriptor, &value, sizeof(value));
+    if (connection->pending_descriptor >= 0) {
+        /* A saturated eventfd is already readable; retry only interruptions. */
+        while (write(connection->pending_descriptor, &value, sizeof(value)) < 0
+               && errno == EINTR) {}
+    }
 }
 
 static bool queue_event(ksd_connection *connection, ksd_frame *frame)
@@ -164,8 +167,10 @@ static bool take_event(ksd_connection *connection, ksd_frame *frame)
     if (connection->first_event == NULL) {
         uint64_t value;
         connection->last_event = NULL;
-        if (connection->descriptor >= 0)
-            (void)read(connection->pending_descriptor, &value, sizeof(value));
+        if (connection->descriptor >= 0) {
+            while (read(connection->pending_descriptor, &value, sizeof(value)) < 0
+                   && errno == EINTR) {}
+        }
     }
     return true;
 }
