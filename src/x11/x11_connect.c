@@ -50,7 +50,7 @@ ksd_status ksd_x11_open(const char *display, const char *authority,
     int screen_number = 0;
     ksd_status status;
 
-    if (display == NULL || connection == NULL)
+    if (display == NULL || connection == NULL || strlen(display) >= sizeof(((ksd_x11 *)0)->display_name))
         return KSD_STATUS_INVALID_REQUEST;
     *connection = NULL;
     if (authority != NULL && setenv("XAUTHORITY", authority, 1) != 0)
@@ -60,6 +60,7 @@ ksd_status ksd_x11_open(const char *display, const char *authority,
     if (opened == NULL)
         return KSD_STATUS_RESOURCE_EXHAUSTED;
     opened->connection = xcb_connect(display, &screen_number);
+    memcpy(opened->display_name, display, strlen(display) + 1u);
     status = connection_status(opened->connection);
     if (status != KSD_STATUS_OK) {
         ksd_x11_close(opened);

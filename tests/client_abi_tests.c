@@ -8,7 +8,7 @@
 
 int main(void)
 {
-    assert(KSD_CLIENT_ABI_MAJOR == 0u);
+    assert(KSD_CLIENT_ABI_MAJOR == 1u);
     assert(KSD_ROLE_AUTHORIZATION_LEASE == 3u);
     assert(KSD_BACKEND_GENERIC == 4u);
     assert(strcmp(KSD_DEFAULT_SOCKET_PATH,
@@ -20,17 +20,19 @@ int main(void)
     assert(sizeof(ksd_rectangle) == 40u);
     assert(offsetof(ksd_permission_entry, reserved64) == 4184u);
     assert(offsetof(ksd_permission_revoke, pid) == 16u);
-    assert(sizeof(ksd_bytes) == 40u);
+    assert(sizeof(ksd_connect_options) == 64u);
+    assert(offsetof(ksd_connect_options, lease_id) == 32u);
+    assert(sizeof(ksd_window_record) == (sizeof(void *) == 8u ? 272u : 240u));
+    assert(sizeof(ksd_state_event) == (sizeof(void *) == 8u ? 360u : 320u));
+    assert(sizeof(ksd_bytes) == (sizeof(void *) == 8u ? 40u : 32u));
     assert(offsetof(ksd_bytes, data) == 8u);
-    assert(offsetof(ksd_bytes, length) == 16u);
-    assert(offsetof(ksd_bytes, reserved) == 24u);
-    assert(sizeof(ksd_string) == 40u);
-    assert(sizeof(ksd_string_list) == 40u);
+    assert(offsetof(ksd_bytes, length) == (sizeof(void *) == 8u ? 16u : 12u));
+    assert(offsetof(ksd_bytes, reserved) == (sizeof(void *) == 8u ? 24u : 16u));
+    assert(sizeof(ksd_string) == sizeof(ksd_bytes));
+    assert(sizeof(ksd_string_list) == sizeof(ksd_bytes));
     assert(offsetof(ksd_capture, data) == 24u);
-    assert(offsetof(ksd_capture, reserved) == 64u);
-    assert(sizeof(ksd_capture) == 96u);
-    assert(sizeof(ksd_window_event) == 80u);
-    assert(sizeof(ksd_clipboard_event) == 120u);
+    assert(offsetof(ksd_capture, reserved) == 24u + sizeof(ksd_bytes));
+    assert(sizeof(ksd_capture) == 56u + sizeof(ksd_bytes));
 
     ksd_error error;
     ksd_connect_options options;
@@ -43,8 +45,7 @@ int main(void)
     ksd_bytes bytes;
     ksd_string string;
     ksd_string_list strings;
-    ksd_window_event window_event;
-    ksd_clipboard_event clipboard_event;
+    ksd_state_event state_event;
     ksd_error_init(&error);
     ksd_connect_options_init(&options);
     ksd_service_info_init(&info);
@@ -56,8 +57,7 @@ int main(void)
     ksd_bytes_init(&bytes);
     ksd_string_init(&string);
     ksd_string_list_init(&strings);
-    ksd_window_event_init(&window_event);
-    ksd_clipboard_event_init(&clipboard_event);
+    ksd_state_event_init(&state_event);
     assert(error.struct_size == sizeof(error));
     assert(options.struct_size == sizeof(options));
     assert(options.role == KSD_ROLE_RPC);
@@ -91,14 +91,10 @@ int main(void)
     assert(bytes.struct_size == sizeof(bytes));
     assert(string.struct_size == sizeof(string));
     assert(strings.struct_size == sizeof(strings));
-    assert(window_event.window_json.struct_size
-        == sizeof(window_event.window_json));
-    assert(clipboard_event.text.struct_size
-        == sizeof(clipboard_event.text));
-    assert(clipboard_event.mimetypes.struct_size
-        == sizeof(clipboard_event.mimetypes));
-    assert(window_event.struct_size == sizeof(window_event));
-    assert(clipboard_event.struct_size == sizeof(clipboard_event));
+    assert(state_event.struct_size == sizeof(state_event));
+    assert(state_event.window.struct_size == sizeof(state_event.window));
+    assert(state_event.window.title.struct_size == sizeof(state_event.window.title));
+    assert(state_event.data.struct_size == sizeof(state_event.data));
     assert(strcmp(ksd_backend_name(KSD_BACKEND_GNOME), "gnome") == 0);
     assert(strcmp(ksd_backend_name(KSD_BACKEND_NONE), "none") == 0);
     assert(strcmp(ksd_backend_name(KSD_BACKEND_GENERIC), "generic") == 0);

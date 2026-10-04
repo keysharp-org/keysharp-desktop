@@ -324,13 +324,13 @@ endforeach()
 
 file(READ "${SOURCE_DIR}/src/provider.c" provider_source)
 foreach(required
-        "g_timeout_source_new(KSD_PROVIDER_WATCH_POLL_MS)"
+        "g_unix_fd_source_new(cancel_fd, G_IO_IN | G_IO_HUP | G_IO_ERR)"
         "g_source_attach(timer, context)"
         "g_main_context_iteration(context, TRUE)")
     string(FIND "${provider_source}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
-            "provider watch loop is not bounded-blocking: ${required}")
+            "provider watch cancellation does not wake its event loop: ${required}")
     endif()
 endforeach()
 foreach(forbidden

@@ -5,9 +5,9 @@ source_dir=${1:?source directory is required}
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT HUP INT TERM
 
-expected_client_abi_major=$(awk '$2 == "KSD_CLIENT_ABI_MAJOR" { gsub(/u$/, "", $3); print $3 }' \
+expected_client_abi_major=$(awk '$2 == "KSD_CLIENT_ABI_MAJOR" { sub(/[uU]?[[:space:]]*$/, "", $3); print $3 }' \
     "$source_dir/include/keysharp_desktop/client.h")
-expected_client_abi_minor=$(awk '$2 == "KSD_CLIENT_ABI_MINOR" { gsub(/u$/, "", $3); print $3 }' \
+expected_client_abi_minor=$(awk '$2 == "KSD_CLIENT_ABI_MINOR" { sub(/[uU]?[[:space:]]*$/, "", $3); print $3 }' \
     "$source_dir/include/keysharp_desktop/client.h")
 for component in major minor; do
     installer_value=$(sed -n "s/^expected_client_abi_${component}=//p" \

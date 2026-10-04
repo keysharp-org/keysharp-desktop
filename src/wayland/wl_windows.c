@@ -273,6 +273,11 @@ static const ksd_wayland_window_view *window_view(ksd_wayland *connection)
     return connection->toplevel_list == NULL ? NULL : &generic_view;
 }
 
+const ksd_wayland_window_view *ksd_wayland_current_window_view(ksd_wayland *connection)
+{
+    return window_view(connection);
+}
+
 bool ksd_wayland_windows_refresh(ksd_wayland *connection,
                                  const ksd_wayland_window_view *view,
                                  ksd_operation_result *result)

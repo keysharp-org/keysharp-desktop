@@ -57,11 +57,11 @@ is_root_protected_chain() {
 }
 
 portable_library_payload() {
-    soname_link=/usr/local/lib/libkeysharp-desktop.so.0
+    soname_link=/usr/local/lib/libkeysharp-desktop.so.1
     [ -L "$soname_link" ] || return 1
     library_resolved=$(readlink -f -- "$soname_link" 2>/dev/null) || return 1
     case "$library_resolved" in
-        /usr/local/lib/libkeysharp-desktop.so.0.*) ;;
+        /usr/local/lib/libkeysharp-desktop.so.1.*) ;;
         *) return 1 ;;
     esac
     [ -f "$library_resolved" ] && [ ! -L "$library_resolved" ] || return 1
@@ -186,7 +186,7 @@ rm -f -- \
     /usr/local/bin/keysharp-desktop \
     /usr/local/libexec/keysharp-desktop-capture-worker \
     /usr/local/lib/libkeysharp-desktop.so \
-    /usr/local/lib/libkeysharp-desktop.so.0 \
+    /usr/local/lib/libkeysharp-desktop.so.1 \
     /usr/local/lib/pkgconfig/keysharp-desktop.pc \
     /usr/local/include/keysharp_desktop/client.h \
     /usr/local/lib/systemd/user/keysharp-desktop.service \

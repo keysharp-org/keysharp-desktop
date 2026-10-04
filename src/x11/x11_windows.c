@@ -172,9 +172,9 @@ static bool add_handle(xcb_window_t *windows, size_t *count, xcb_window_t window
 /* Preserve EWMH stacking order, then include root windows that the window
  * manager leaves out, such as tooltips. Without EWMH the root tree supplies
  * the list, promoting reparenting frames to their WM_STATE client. */
-static bool enumerate_windows(ksd_x11 *connection, const x11_atoms *atoms,
-                                xcb_window_t *windows, size_t *count)
+bool ksd_x11_enumerate_windows(ksd_x11 *connection, xcb_window_t *windows, size_t *count)
 {
+    const x11_atoms *atoms = &connection->atoms;
     xcb_connection_t *c = connection->connection;
     xcb_window_t root = connection->screen->root;
     *count = 0u;
@@ -329,13 +329,12 @@ static void discard_window_query(xcb_connection_t *c, window_query *query)
 /* Handles carry no title, class, pid, geometry or other window metadata. */
 void ksd_x11_window_handles(ksd_x11 *connection, ksd_operation_result *result)
 {
-    const x11_atoms *atoms = &connection->atoms;
     xcb_window_t windows[KSD_X11_MAX_WINDOWS];
     size_t count;
     ksd_buffer out;
     bool ok;
     bool first = true;
-    if (!enumerate_windows(connection, atoms, windows, &count)) {
+    if (!ksd_x11_enumerate_windows(connection, windows, &count)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "could not enumerate X11 windows");
         return;
     }
@@ -379,7 +378,7 @@ void ksd_x11_window_list(ksd_x11 *connection, bool include_hidden,
 
     xcb_window_t windows[KSD_X11_MAX_WINDOWS];
     size_t count;
-    if (!enumerate_windows(connection, atoms, windows, &count)) {
+    if (!ksd_x11_enumerate_windows(connection, windows, &count)) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u, "could not enumerate X11 windows");
         return;
     }

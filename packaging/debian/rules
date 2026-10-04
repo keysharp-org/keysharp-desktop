@@ -23,7 +23,7 @@ override_dh_fixperms:
 override_dh_installsystemd override_dh_installsystemduser override_dh_installtmpfiles:
 
 override_dh_gencontrol:
-	dh_gencontrol -- -Vclient-abi:Provides="keysharp-desktop-client-abi-0 (= 0.$(ABI_MINOR))"
+	dh_gencontrol -- -Vclient-abi:Provides="keysharp-desktop-client-abi-1 (= 1.$(ABI_MINOR))"
 
 # The upstream LICENSE is the package's copyright notice.
 execute_after_dh_auto_install:

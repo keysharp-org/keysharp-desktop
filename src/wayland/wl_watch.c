@@ -7,10 +7,12 @@
 #include "wl_hypr_windows.h"
 #include "wl_internal.h"
 #include "wl_windows.h"
+#include "wl_keyboard.h"
+#include "wl_displays.h"
+#include "state_wire.h"
 
 #include <errno.h>
 #include <poll.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -23,87 +25,68 @@
 #define KSD_WATCH_COALESCE_MS 30u
 #define KSD_WATCH_REFRESH_FAILURES 3u
 
-static const ksd_watch_window *find_window(const ksd_watch_window *windows,
+static const ksd_window_record *find_window(const ksd_window_record *windows,
                                            size_t count, uint64_t id)
 {
     for (size_t index = 0u; index < count; index++)
-        if (windows[index].id == id)
+        if (windows[index].handle == id)
             return &windows[index];
     return NULL;
 }
 
-static bool same_title(const char *a, const char *b)
-{
-    return strcmp(a == NULL ? "" : a, b == NULL ? "" : b) == 0;
-}
-
-void ksd_wayland_watch_diff(const ksd_watch_window *previous,
-                            size_t previous_count, uint64_t previous_active,
-                            const ksd_watch_window *next, size_t next_count,
-                            uint64_t next_active,
+void ksd_wayland_watch_diff(const ksd_window_record *previous,
+                            size_t previous_count,
+                            const ksd_window_record *next, size_t next_count,
                             void (*emit)(void *context, uint16_t kind,
                                          uint64_t id),
                             void *context)
 {
     for (size_t index = 0u; index < next_count; index++) {
-        const ksd_watch_window *now = &next[index];
-        const ksd_watch_window *was = find_window(previous, previous_count,
-                                                  now->id);
+        const ksd_window_record *now = &next[index];
+        const ksd_window_record *was = find_window(previous, previous_count,
+                                                  now->handle);
 
         if (was == NULL) {
-            emit(context, KSD_WINDOW_EVENT_CREATE, now->id);
+            emit(context, KSD_WINDOW_EVENT_CREATE, now->handle);
             continue;
         }
-        if (!same_title(was->title, now->title))
-            emit(context, KSD_WINDOW_EVENT_TITLE, now->id);
-        if (was->minimized != now->minimized)
-            emit(context, now->minimized ? KSD_WINDOW_EVENT_MINIMIZE
-                                         : KSD_WINDOW_EVENT_RESTORE, now->id);
-        if (was->x != now->x || was->y != now->y
-            || was->width != now->width || was->height != now->height)
-            emit(context, KSD_WINDOW_EVENT_MOVE, now->id);
+        if (!ksd_state_window_equal(was, now))
+            emit(context, KSD_WINDOW_EVENT_CHANGED, now->handle);
     }
     for (size_t index = 0u; index < previous_count; index++)
-        if (find_window(next, next_count, previous[index].id) == NULL)
-            emit(context, KSD_WINDOW_EVENT_CLOSE, previous[index].id);
-    if (previous_active == next_active)
-        return;
-    if (previous_active != 0u
-        && find_window(next, next_count, previous_active) != NULL)
-        emit(context, KSD_WINDOW_EVENT_ACTIVE_STATE, previous_active);
-    if (next_active != 0u)
-        emit(context, KSD_WINDOW_EVENT_ACTIVE, next_active);
+        if (find_window(next, next_count, previous[index].handle) == NULL)
+            emit(context, KSD_WINDOW_EVENT_CLOSE, previous[index].handle);
 }
 
 typedef struct window_watch {
     ksd_wayland *connection;
     const ksd_wayland_window_view *view;
     int stream_fd;
-    ksd_watch_window *windows;
+    ksd_window_record *windows;
     size_t count;
-    uint64_t active;
     bool failed;
     bool dirty;
+    ksd_buffer keyboard_state;
+    ksd_buffer display_state;
+    char revision[65];
 } window_watch;
 
-static void clear_windows(ksd_watch_window *windows, size_t count)
+static void clear_windows(ksd_window_record *windows, size_t count)
 {
     for (size_t index = 0u; index < count; index++)
-        free(windows[index].title);
+        ksd_window_record_clear(&windows[index]);
     free(windows);
 }
 
-/* The usable windows of the refreshed view, and the active one. */
-static bool snapshot(window_watch *watch, ksd_watch_window **windows,
-                     size_t *count, uint64_t *active)
+static bool snapshot(window_watch *watch, ksd_window_record **windows,
+                     size_t *count)
 {
-    ksd_watch_window *items;
+    ksd_window_record *items;
     size_t capacity = 0u;
     size_t used = 0u;
 
     *windows = NULL;
     *count = 0u;
-    *active = 0u;
     for (ksd_wl_toplevel *item = watch->connection->toplevels; item != NULL;
          item = item->next)
         capacity++;
@@ -112,25 +95,19 @@ static bool snapshot(window_watch *watch, ksd_watch_window **windows,
         return false;
     for (ksd_wl_toplevel *item = watch->connection->toplevels; item != NULL;
          item = item->next) {
-        uint32_t state;
-
         if (!watch->view->usable(item))
             continue;
-        state = watch->view->state(item);
-        items[used].id = item->id;
-        items[used].title = strdup(item->title == NULL ? "" : item->title);
-        if (items[used].title == NULL) {
+        ksd_buffer json;
+        ksd_buffer_init(&json, KSD_MAX_TEXT_BYTES);
+        bool ok = watch->view->append_window(&json, watch->connection, item)
+            && ksd_state_window_json(json.data, json.length, &items[used]);
+        ksd_buffer_clear(&json);
+        if (!ok) {
             clear_windows(items, used);
             return false;
         }
-        items[used].minimized =
-            (state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u;
-        items[used].x = item->hypr.x;
-        items[used].y = item->hypr.y;
-        items[used].width = item->hypr.width;
-        items[used].height = item->hypr.height;
-        if ((state & KSD_WL_TOPLEVEL_STATE_ACTIVATED) != 0u && *active == 0u)
-            *active = item->id;
+        items[used].stacking_order = used;
+        items[used].valid_fields |= KSD_FIELD_STACKING_ORDER;
         used++;
     }
     *windows = items;
@@ -151,49 +128,59 @@ static bool write_frame(int descriptor, uint16_t opcode, uint16_t flags,
     return ksd_frame_write(descriptor, &frame);
 }
 
-static const ksd_wl_toplevel *toplevel_for(window_watch *watch, uint64_t id)
+static bool emit_state(window_watch *watch, uint32_t domain, uint32_t kind,
+                       const ksd_window_record *window, const uint8_t *data, size_t length)
 {
-    for (const ksd_wl_toplevel *item = watch->connection->toplevels;
-         item != NULL; item = item->next)
-        if (item->id == id && watch->view->usable(item))
-            return item;
-    return NULL;
+    ksd_state_event event; ksd_state_event_init(&event); event.domain = domain; event.kind = kind;
+    if (window != NULL) event.window = *window;
+    event.data.data = (char *)data; event.data.length = length;
+    ksd_buffer payload; ksd_buffer_init(&payload, KSD_MAX_TEXT_BYTES + 256u);
+    bool ok = ksd_state_event_encode(&event, &payload)
+        && write_frame(watch->stream_fd, KSD_OP_STATE_EVENT, KSD_FLAG_EVENT, 0u, payload.data, payload.length);
+    ksd_buffer_clear(&payload); return ok;
+}
+
+static bool initial_windows(window_watch *watch)
+{
+    if (watch->view == NULL) return true;
+    bool ok = emit_state(watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_BEGIN, NULL, NULL, 0u);
+    for (size_t i = 0u; ok && i < watch->count; i++)
+        ok = emit_state(watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_ITEM, &watch->windows[i], NULL, 0u);
+    return ok && emit_state(watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_END, NULL, NULL, 0u);
+}
+
+static bool auxiliary_state(window_watch *watch, uint32_t domain, bool initial)
+{
+    ksd_operation_result result; ksd_result_init(&result);
+    ksd_buffer *previous = domain == KSD_STATE_KEYBOARD ? &watch->keyboard_state : &watch->display_state;
+    if (domain == KSD_STATE_KEYBOARD) {
+        ksd_wayland_keyboard_state_since(watch->connection, (const uint8_t *)watch->revision,
+            watch->revision[0] == '\0' ? 0u : 64u, &result);
+        if (watch->connection->keymap_revision != NULL) memcpy(watch->revision, watch->connection->keymap_revision, 65u);
+    } else ksd_wayland_display_list(watch->connection, &result);
+    bool ok = true;
+    if (result.status == KSD_STATUS_OK && result.tail_length >= 4u) {
+        size_t length = result.tail_length - 4u; const uint8_t *json = result.tail + 4u;
+        if (initial || previous->length != length || (length != 0u && memcmp(previous->data, json, length) != 0)) {
+            ok = (!initial || emit_state(watch, domain, KSD_STATE_SNAPSHOT_BEGIN, NULL, NULL, 0u))
+                && emit_state(watch, domain, initial ? KSD_STATE_SNAPSHOT_ITEM : KSD_STATE_CHANGED, NULL, json, length)
+                && (!initial || emit_state(watch, domain, KSD_STATE_SNAPSHOT_END, NULL, NULL, 0u));
+            previous->length = 0u; ok = ksd_buffer_bytes(previous, json, length) && ok;
+        }
+    }
+    ksd_result_clear(&result); return ok;
 }
 
 static void emit_event(void *context, uint16_t kind, uint64_t id)
 {
     window_watch *watch = context;
-    const ksd_wl_toplevel *item;
-    ksd_buffer json;
-    ksd_buffer payload;
-    char closed[48];
-    bool ok;
-
-    if (watch->failed)
-        return;
-    ksd_buffer_init(&json, KSD_MAX_TEXT_BYTES);
-    if (kind == KSD_WINDOW_EVENT_CLOSE) {
-        int written = snprintf(closed, sizeof(closed), "{\"id\":\"%llu\"}",
-                               (unsigned long long)id);
-        ok = written > 0 && (size_t)written < sizeof(closed)
-            && ksd_buffer_bytes(&json, closed, (size_t)written);
-    } else {
-        item = toplevel_for(watch, id);
-        /* Every other kind names a window of the snapshot just taken. */
-        ok = item != NULL
-            && watch->view->append_window(&json, watch->connection, item);
-    }
-    ksd_buffer_init(&payload, KSD_MAX_TEXT_BYTES + 8u);
-    ok = ok && ksd_buffer_u16(&payload, kind)
-        && ksd_buffer_u16(&payload, 0u)
-        && ksd_buffer_u32(&payload, (uint32_t)json.length)
-        && ksd_buffer_bytes(&payload, json.data, json.length)
-        && write_frame(watch->stream_fd, KSD_OP_WINDOW_EVENT, KSD_FLAG_EVENT,
-                       0u, payload.data, payload.length);
-    ksd_buffer_clear(&payload);
-    ksd_buffer_clear(&json);
-    if (!ok)
-        watch->failed = true;
+    if (watch->failed) return;
+    ksd_window_record closed; ksd_window_record_init(&closed);
+    closed.handle = id; closed.valid_fields = KSD_FIELD_ID;
+    const ksd_window_record *window = kind == KSD_WINDOW_EVENT_CLOSE
+        ? &closed : find_window(watch->windows, watch->count, id);
+    uint32_t event = kind == KSD_WINDOW_EVENT_CLOSE ? KSD_STATE_DESTROY : KSD_STATE_CHANGED;
+    watch->failed = window == NULL || !emit_state(watch, KSD_STATE_WINDOWS, event, window, NULL, 0u);
 }
 
 /* A refresh that fails is not diffed: its empty list would read as every
@@ -201,27 +188,26 @@ static void emit_event(void *context, uint16_t kind, uint64_t id)
 static bool refresh(window_watch *watch, bool emit)
 {
     ksd_operation_result result;
-    ksd_watch_window *windows;
+    ksd_window_record *windows;
     size_t count;
-    uint64_t active;
     bool refreshed;
 
     ksd_result_init(&result);
     alarm(10u);
     refreshed = ksd_wayland_windows_refresh(watch->connection, watch->view,
                                             &result)
-        && snapshot(watch, &windows, &count, &active);
-    if (refreshed && emit)
-        ksd_wayland_watch_diff(watch->windows, watch->count, watch->active,
-                               windows, count, active, emit_event, watch);
+        && snapshot(watch, &windows, &count);
     alarm(0u);
     ksd_result_clear(&result);
     if (!refreshed)
         return false;
-    clear_windows(watch->windows, watch->count);
+    ksd_window_record *previous = watch->windows;
+    size_t previous_count = watch->count;
     watch->windows = windows;
     watch->count = count;
-    watch->active = active;
+    if (emit)
+        ksd_wayland_watch_diff(previous, previous_count, windows, count, emit_event, watch);
+    clear_windows(previous, previous_count);
     return true;
 }
 
@@ -229,8 +215,8 @@ static void on_event_line(void *context, const char *name)
 {
     window_watch *watch = context;
 
-    if (ksd_wayland_hypr_event_affects_windows(name))
-        watch->dirty = true;
+    (void)name;
+    watch->dirty = true;
 }
 
 /* Reads the event socket to empty. False when Hyprland closed it. */
@@ -265,7 +251,7 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
 {
     window_watch watch = {
         .connection = connection,
-        .view = ksd_wayland_hypr_window_view(),
+        .view = connection->handle_salt_ready ? ksd_wayland_current_window_view(connection) : NULL,
         .stream_fd = stream_fd,
     };
     ksd_hypr_event_reader reader;
@@ -277,19 +263,23 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
     bool ok;
 
     ksd_wayland_hypr_event_reader_init(&reader);
+    ksd_buffer_init(&watch.keyboard_state, KSD_MAX_TEXT_BYTES);
+    ksd_buffer_init(&watch.display_state, KSD_MAX_TEXT_BYTES);
     /* This runs only in a dedicated worker process; a stalled compositor
      * must not keep it once its authority connection is gone. */
     alarm(10u);
     /* Handles must name windows the way the query worker does, which only a
      * derived handle guarantees across processes. */
-    ok = ksd_wayland_hypr_windows_available(connection)
-        && connection->handle_salt_ready;
-    if (ok)
+    bool hypr = ksd_wayland_hypr_windows_available(connection);
+    ok = true;
+    if (hypr)
         events_fd = ksd_wayland_hypr_events_open(connection->session_pid);
-    ok = ok && events_fd >= 0 && refresh(&watch, false);
+    ok = (!hypr || events_fd >= 0) && (watch.view == NULL || refresh(&watch, false));
     ksd_encode_u32(answer, ok ? KSD_STATUS_OK : KSD_STATUS_UNAVAILABLE);
     ok = write_frame(stream_fd, 0u, 0u, request_id, answer, sizeof(answer))
         && ok;
+    if (ok) ok = initial_windows(&watch) && auxiliary_state(&watch, KSD_STATE_KEYBOARD, true)
+        && auxiliary_state(&watch, KSD_STATE_DISPLAYS, true);
     alarm(0u);
     last_refresh = ksd_monotonic_milliseconds();
     next_tick = last_refresh + KSD_WATCH_TICK_MS;
@@ -304,7 +294,7 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
         uint64_t deadline = watch.dirty
             && last_refresh + KSD_WATCH_COALESCE_MS < next_tick
             ? last_refresh + KSD_WATCH_COALESCE_MS : next_tick;
-        int ready = poll(descriptors, 3u, until(deadline, now));
+        int ready = poll(descriptors, 3u, hypr ? until(deadline, now) : -1);
 
         if (ready < 0) {
             if (errno == EINTR)
@@ -329,11 +319,12 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
             break;
         }
         now = ksd_monotonic_milliseconds();
-        if (now < next_tick
+        if (hypr && now < next_tick
             && !(watch.dirty && now >= last_refresh + KSD_WATCH_COALESCE_MS))
             continue;
         watch.dirty = false;
-        if (refresh(&watch, true))
+        if ((watch.view == NULL || refresh(&watch, true))
+            && auxiliary_state(&watch, KSD_STATE_KEYBOARD, false) && auxiliary_state(&watch, KSD_STATE_DISPLAYS, false))
             failures = 0u;
         else if (++failures >= KSD_WATCH_REFRESH_FAILURES)
             ok = false;
@@ -343,5 +334,6 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
     if (events_fd >= 0)
         close(events_fd);
     clear_windows(watch.windows, watch.count);
+    ksd_buffer_clear(&watch.keyboard_state); ksd_buffer_clear(&watch.display_state);
     return ok && !watch.failed;
 }

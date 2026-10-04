@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(keysharp-desktop
-    VERSION 0.2.0
+    VERSION 1.0.0
     DESCRIPTION "Per-application desktop capability broker for Linux"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
@@ -76,6 +76,7 @@ add_subdirectory("${KEYSHARP_PERMISSIONS_SOURCE_DIR}"
     "${CMAKE_CURRENT_BINARY_DIR}/keysharp-permissions" EXCLUDE_FROM_ALL)
 
 add_library(keysharp-desktop-wire STATIC
+    src/state_wire.c
     src/protocol_io.c
     src/session_environ.c
     src/transport.c)
@@ -95,7 +96,7 @@ set_target_properties(keysharp-desktop-client PROPERTIES
     OUTPUT_NAME keysharp-desktop
     EXPORT_NAME client
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0
+    SOVERSION 1
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES)
 target_include_directories(keysharp-desktop-client
@@ -105,7 +106,7 @@ target_include_directories(keysharp-desktop-client
 target_compile_definitions(keysharp-desktop-client PRIVATE
     KEYSHARP_DESKTOP_CLIENT_BUILD _GNU_SOURCE _POSIX_C_SOURCE=200809L)
 target_link_libraries(keysharp-desktop-client PRIVATE
-    keysharp-desktop-wire KeysharpPermissions::permissions Threads::Threads)
+    keysharp-desktop-wire KeysharpPermissions::permissions)
 
 add_library(keysharp-desktop-common STATIC
     src/backend.c
@@ -565,6 +566,7 @@ if(BUILD_TESTING)
     target_link_libraries(client-stream-tests PRIVATE
         keysharp-desktop-wire KeysharpPermissions::permissions Threads::Threads)
     add_test(NAME client-stream-tests COMMAND client-stream-tests)
+    set_tests_properties(client-stream-tests PROPERTIES TIMEOUT 15)
 
     add_test(NAME client-exported-symbols-test
         COMMAND ${CMAKE_COMMAND}
@@ -627,6 +629,10 @@ if(BUILD_TESTING)
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
             $<TARGET_FILE:x11-server-tests>)
     set_tests_properties(x11-server-tests PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME x11-state-tests
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
+            $<TARGET_FILE:x11-server-tests> state)
+    set_tests_properties(x11-state-tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
     # The persistent worker's serving loop is a static function reached through
     # the same testing hook as the bootstrap parser, so this target compiles
@@ -800,7 +806,7 @@ if(BUILD_TESTING)
 
     add_test(NAME version-command COMMAND keysharp-desktop version)
     set_tests_properties(version-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "^keysharp-desktop 0.2.0")
+        PASS_REGULAR_EXPRESSION "^keysharp-desktop 1.0.0")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
         PASS_REGULAR_EXPRESSION
@@ -869,7 +875,7 @@ set(CPACK_PACKAGE_FILE_NAME "keysharp-desktop-${PROJECT_VERSION}-${CMAKE_SYSTEM_
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libglib2.0-0 (>= 2.56) | libglib2.0-0t64, polkitd | policykit-1, systemd")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-0 (= 0.${KEYSHARP_DESKTOP_ABI_MINOR})")
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-1 (= 1.${KEYSHARP_DESKTOP_ABI_MINOR})")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_BREAKS "keysharp (<< 0.0.0.17)")
 set(CPACK_DEBIAN_PACKAGE_REPLACES "keysharp (<< 0.0.0.17)")

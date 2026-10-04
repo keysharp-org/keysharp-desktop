@@ -399,47 +399,50 @@ static void record_event(void *context, uint16_t kind, uint64_t id)
 
 static void test_diffs_window_snapshots(void)
 {
-    ksd_watch_window previous[] = {
-        { .id = 1u, .title = "one", .x = 0, .y = 0, .width = 10, .height = 10 },
-        { .id = 2u, .title = "two", .x = 0, .y = 0, .width = 10, .height = 10 },
-        { .id = 3u, .title = "three", .x = 5, .y = 5, .width = 10,
-          .height = 10 },
+    ksd_window_record previous[] = {
+        { .handle = 1u, .title = { .data = "one", .length = 3u }, .flags = KSD_WINDOW_ACTIVE },
+        { .handle = 2u, .title = { .data = "two", .length = 3u } },
+        { .handle = 3u, .title = { .data = "three", .length = 5u } },
     };
-    ksd_watch_window next[] = {
-        { .id = 1u, .title = "one!", .minimized = true, .x = 1, .y = 0,
-          .width = 10, .height = 10 },
-        { .id = 3u, .title = "three", .x = 5, .y = 5, .width = 10,
-          .height = 10 },
-        { .id = 4u, .title = "four" },
+    ksd_window_record next[] = {
+        { .handle = 1u, .title = { .data = "one!", .length = 4u }, .flags = KSD_WINDOW_MINIMIZED, .frame_x = 1 },
+        { .handle = 3u, .title = { .data = "three", .length = 5u }, .flags = KSD_WINDOW_ACTIVE },
+        { .handle = 4u, .title = { .data = "four", .length = 4u } },
     };
     static const uint16_t expected[] = {
-        KSD_WINDOW_EVENT_TITLE, KSD_WINDOW_EVENT_MINIMIZE,
-        KSD_WINDOW_EVENT_MOVE, KSD_WINDOW_EVENT_CREATE,
-        KSD_WINDOW_EVENT_CLOSE, KSD_WINDOW_EVENT_ACTIVE_STATE,
-        KSD_WINDOW_EVENT_ACTIVE,
+        KSD_WINDOW_EVENT_CHANGED, KSD_WINDOW_EVENT_CHANGED,
+        KSD_WINDOW_EVENT_CREATE, KSD_WINDOW_EVENT_CLOSE,
     };
-    static const uint64_t expected_ids[] = { 1u, 1u, 1u, 4u, 2u, 1u, 3u };
+    static const uint64_t expected_ids[] = { 1u, 3u, 4u, 2u };
     diff_log log = { .count = 0u };
 
-    ksd_wayland_watch_diff(previous, 3u, 1u, next, 3u, 3u, record_event, &log);
+    ksd_wayland_watch_diff(previous, 3u, next, 3u, record_event, &log);
     assert(log.count == sizeof(expected) / sizeof(expected[0]));
     for (size_t index = 0u; index < log.count; index++)
         assert(log.kinds[index] == expected[index]
                && log.ids[index] == expected_ids[index]);
 
-    /* Focus leaving for no window deactivates only; a vanished active window
-     * is covered by its close. */
+    ksd_window_record unfocused[3]; memcpy(unfocused, next, sizeof(next));
+    unfocused[1].flags &= ~KSD_WINDOW_ACTIVE;
     log.count = 0u;
-    ksd_wayland_watch_diff(next, 3u, 3u, next, 3u, 0u, record_event, &log);
-    assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_ACTIVE_STATE
-           && log.ids[0] == 3u);
+    ksd_wayland_watch_diff(next, 3u, unfocused, 3u, record_event, &log);
+    assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CHANGED && log.ids[0] == 3u);
     log.count = 0u;
-    ksd_wayland_watch_diff(next, 3u, 4u, next, 2u, 0u, record_event, &log);
-    assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CLOSE
-           && log.ids[0] == 4u);
+    ksd_wayland_watch_diff(next, 3u, next, 2u, record_event, &log);
+    assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CLOSE && log.ids[0] == 4u);
     log.count = 0u;
-    ksd_wayland_watch_diff(next, 3u, 3u, next, 3u, 3u, record_event, &log);
+    ksd_wayland_watch_diff(next, 3u, next, 3u, record_event, &log);
     assert(log.count == 0u);
+    for (unsigned i = 0u; i < 4u; i++) {
+        ksd_window_record changed = next[1];
+        if (i == 0u) changed.flags |= KSD_WINDOW_ABOVE;
+        else if (i == 1u) changed.transparency = 128u;
+        else if (i == 2u) changed.app_id = (ksd_string) { .data = "Editor", .length = 6u };
+        else changed.flags |= KSD_WINDOW_MAXIMIZED;
+        log.count = 0u;
+        ksd_wayland_watch_diff(&next[1], 1u, &changed, 1u, record_event, &log);
+        assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CHANGED && log.ids[0] == 3u);
+    }
 }
 
 int main(void)

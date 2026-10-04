@@ -35,6 +35,7 @@ struct ksd_x11 {
     xcb_screen_t *screen;
     x11_atoms atoms;
     struct ksd_x11_keyboard_cache *keyboard;
+    char display_name[16];
 };
 
 void ksd_x11_load_atoms(xcb_connection_t *connection, x11_atoms *atoms);

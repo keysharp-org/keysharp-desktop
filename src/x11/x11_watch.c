@@ -2,6 +2,7 @@
 #include "x11_extended.h"
 #include "x11_internal.h"
 #include "protocol.h"
+#include "state_wire.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -9,11 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <xcb/randr.h>
+#include <xcb/xkb.h>
+#include <xkbcommon/xkbcommon-x11.h>
 
 typedef struct watched_window {
     xcb_window_t id;
     xcb_window_t frame;
     bool minimized;
+    xcb_window_t above_sibling;
 } watched_window;
 
 typedef struct window_watch {
@@ -23,7 +28,12 @@ typedef struct window_watch {
     watched_window *windows;
     size_t count;
     xcb_window_t active;
+    ksd_x11 *query_display;
+    uint8_t xkb_event_base, randr_event_base;
 } window_watch;
+
+static bool emit_query_state(window_watch *, uint32_t, bool);
+static bool initial_snapshot(window_watch *);
 
 static xcb_atom_t intern(xcb_connection_t *connection, const char *name)
 {
@@ -138,18 +148,12 @@ static bool minimized(window_watch *watch, xcb_window_t id)
 static bool refresh_clients(window_watch *watch, bool initial)
 {
     xcb_connection_t *c = watch->display->connection;
-    xcb_get_property_reply_t *reply = ksd_x11_property(c,
-        watch->display->screen->root, watch->atoms.client_list,
-        XCB_ATOM_WINDOW, KSD_X11_MAX_WINDOWS);
-    if (reply == NULL || reply->format != 32u || reply->bytes_after != 0u) {
-        free(reply);
-        return false;
-    }
-    size_t count = (size_t)xcb_get_property_value_length(reply) / sizeof(xcb_window_t);
-    xcb_window_t *ids = xcb_get_property_value(reply);
+    xcb_window_t ids[KSD_X11_MAX_WINDOWS];
+    size_t count = 0u;
+    if (!ksd_x11_enumerate_windows(watch->display, ids, &count)) return false;
     qsort(ids, count, sizeof(*ids), compare_ids);
-    watched_window *next = calloc(count != 0u ? count : 1u, sizeof(*next));
-    if (next == NULL) { free(reply); return false; }
+    watched_window *next = calloc(count + watch->count + 1u, sizeof(*next));
+    if (next == NULL) return false;
     size_t used = 0u;
     bool ok = true;
     for (size_t i = 0u; ok && i < count; i++) {
@@ -169,15 +173,22 @@ static bool refresh_clients(window_watch *watch, bool initial)
     for (size_t i = 0u; ok && i < watch->count; i++) {
         xcb_window_t id = watch->windows[i].id;
         if (bsearch(&id, ids, count, sizeof(*ids), compare_ids) == NULL) {
-            uint32_t mask = 0u;
-            xcb_change_window_attributes(c, id, XCB_CW_EVENT_MASK, &mask);
-            if (!initial) ok = emit_window(watch, id, KSD_WINDOW_EVENT_CLOSE);
+            xcb_generic_error_t *error = NULL;
+            xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(c,
+                xcb_get_window_attributes(c, id), &error);
+            if (attributes != NULL) {
+                next[used++] = watch->windows[i];
+                if (!initial) ok = emit_window(watch, id, KSD_WINDOW_EVENT_HIDE);
+            } else if (error != NULL && error->error_code == XCB_WINDOW) {
+                if (!initial) ok = emit_window(watch, id, KSD_WINDOW_EVENT_CLOSE);
+            } else ok = false;
+            free(attributes); free(error);
         }
     }
-    free(reply);
     free(watch->windows);
     watch->windows = next;
     watch->count = used;
+    qsort(watch->windows, watch->count, sizeof(*watch->windows), compare_ids);
     xcb_flush(c);
     return ok && !ksd_x11_connection_failed(watch->display);
 }
@@ -185,12 +196,25 @@ static bool refresh_clients(window_watch *watch, bool initial)
 static bool handle_event(window_watch *watch, xcb_generic_event_t *event)
 {
     uint8_t type = event->response_type & 0x7fu;
+    if (watch->xkb_event_base != 0u && type == watch->xkb_event_base) {
+        uint8_t kind = ((uint8_t *)event)[1];
+        if (kind != XCB_XKB_STATE_NOTIFY) ksd_x11_keyboard_clear(watch->query_display);
+        return emit_query_state(watch, KSD_STATE_KEYBOARD, false);
+    }
+    if (watch->randr_event_base != 0u && (type == watch->randr_event_base || type == watch->randr_event_base + 1u))
+        return emit_query_state(watch, KSD_STATE_DISPLAYS, false);
     xcb_window_t root = watch->display->screen->root;
+    if (type == XCB_CREATE_NOTIFY && ((xcb_create_notify_event_t *)event)->parent == root)
+        return refresh_clients(watch, false);
     if (type == XCB_PROPERTY_NOTIFY) {
         xcb_property_notify_event_t *property = (xcb_property_notify_event_t *)event;
         if (property->window == root) {
             if (property->atom == watch->atoms.client_list)
                 return refresh_clients(watch, false);
+            if (property->atom == watch->atoms.client_list_stacking)
+                return initial_snapshot(watch);
+            if (property->atom == watch->atoms.current_desktop || property->atom == watch->atoms.work_area)
+                return emit_query_state(watch, KSD_STATE_DISPLAYS, false);
             if (property->atom == watch->atoms.active_window) {
                 uint32_t active = XCB_WINDOW_NONE;
                 (void)ksd_x11_cardinal(watch->display->connection, root,
@@ -219,6 +243,13 @@ static bool handle_event(window_watch *watch, xcb_generic_event_t *event)
                     ? KSD_WINDOW_EVENT_MINIMIZE : KSD_WINDOW_EVENT_RESTORE);
             }
         }
+        return emit_window(watch, window->id, KSD_WINDOW_EVENT_CHANGED);
+    } else if (type == XCB_MAP_NOTIFY || type == XCB_UNMAP_NOTIFY) {
+        xcb_window_t id = type == XCB_MAP_NOTIFY
+            ? ((xcb_map_notify_event_t *)event)->window : ((xcb_unmap_notify_event_t *)event)->window;
+        if (find_window(watch, id) != NULL)
+            return emit_window(watch, id, type == XCB_MAP_NOTIFY ? KSD_WINDOW_EVENT_SHOW : KSD_WINDOW_EVENT_HIDE);
+        if (type == XCB_MAP_NOTIFY) return refresh_clients(watch, false);
     } else if (type == XCB_DESTROY_NOTIFY) {
         xcb_destroy_notify_event_t *destroy = (xcb_destroy_notify_event_t *)event;
         watched_window *window = find_window(watch, destroy->window);
@@ -231,17 +262,76 @@ static bool handle_event(window_watch *watch, xcb_generic_event_t *event)
         }
     } else if (type == XCB_CONFIGURE_NOTIFY) {
         xcb_configure_notify_event_t *configure = (xcb_configure_notify_event_t *)event;
-        for (size_t i = 0u; i < watch->count; i++)
-            if ((watch->windows[i].id == configure->window
-                 || watch->windows[i].frame == configure->window)
-                && !emit_window(watch, watch->windows[i].id, KSD_WINDOW_EVENT_MOVE))
-                return false;
+        bool restacked = false;
+        for (size_t i = 0u; i < watch->count; i++) {
+            if (watch->windows[i].id != configure->window && watch->windows[i].frame != configure->window) continue;
+            if (!emit_window(watch, watch->windows[i].id, KSD_WINDOW_EVENT_MOVE)) return false;
+            restacked |= watch->windows[i].above_sibling != configure->above_sibling;
+            watch->windows[i].above_sibling = configure->above_sibling;
+        }
+        if (restacked) return initial_snapshot(watch);
     } else if (type == XCB_REPARENT_NOTIFY) {
         xcb_reparent_notify_event_t *reparent = (xcb_reparent_notify_event_t *)event;
         watched_window *window = find_window(watch, reparent->window);
         if (window != NULL) window->frame = frame_for(watch, window->id);
     }
     return true;
+}
+
+static bool emit_state(window_watch *watch, uint32_t kind, uint32_t domain, ksd_window_record *window,
+                       const uint8_t *data, size_t length)
+{
+    ksd_state_event event; ksd_state_event_init(&event); event.kind = kind; event.domain = domain;
+    if (window != NULL) event.window = *window;
+    event.data.data = (char *)data; event.data.length = length;
+    ksd_buffer payload; ksd_buffer_init(&payload, KSD_MAX_TEXT_BYTES + 256u);
+    bool ok = ksd_state_event_encode(&event, &payload)
+        && write_frame(watch->stream_fd, KSD_OP_STATE_EVENT, KSD_FLAG_EVENT, 0u, payload.data, payload.length);
+    ksd_buffer_clear(&payload); return ok;
+}
+
+static bool initial_window(ksd_window_record *window, void *context)
+{
+    window_watch *watch = context;
+    if (find_window(watch, (xcb_window_t)window->handle) == NULL) {
+        watched_window *items = realloc(watch->windows, (watch->count + 1u) * sizeof(*items));
+        if (items == NULL) return false;
+        watch->windows = items;
+        watch->windows[watch->count++] = (watched_window) { .id = (xcb_window_t)window->handle,
+            .frame = frame_for(watch, (xcb_window_t)window->handle), .minimized = (window->flags & KSD_WINDOW_MINIMIZED) != 0u };
+        qsort(watch->windows, watch->count, sizeof(*items), compare_ids);
+        uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+        xcb_change_window_attributes(watch->display->connection, (xcb_window_t)window->handle, XCB_CW_EVENT_MASK, &mask);
+    }
+    return emit_state(watch, KSD_STATE_SNAPSHOT_ITEM, KSD_STATE_WINDOWS, window, NULL, 0u);
+}
+
+static bool initial_snapshot(window_watch *watch)
+{
+    ksd_operation_result result; ksd_result_init(&result);
+    ksd_x11_window_list(watch->display, true, &result);
+    bool ok = result.status == KSD_STATUS_OK && result.tail_length >= 4u
+        && emit_state(watch, KSD_STATE_SNAPSHOT_BEGIN, KSD_STATE_WINDOWS, NULL, NULL, 0u)
+        && ksd_state_windows_json(result.tail + 4u, result.tail_length - 4u, initial_window, watch)
+        && emit_state(watch, KSD_STATE_SNAPSHOT_END, KSD_STATE_WINDOWS, NULL, NULL, 0u);
+    ksd_result_clear(&result); return ok;
+}
+
+static bool emit_query_state(window_watch *watch, uint32_t domain, bool initial)
+{
+    if (watch->query_display == NULL) return true;
+    ksd_operation_result result; ksd_result_init(&result);
+    if (domain == KSD_STATE_KEYBOARD) {
+        const char *revision = initial ? NULL : ksd_x11_keyboard_revision(watch->query_display);
+        char known[33] = { 0 }; if (revision != NULL) memcpy(known, revision, 32u);
+        ksd_x11_keyboard_state_since(watch->query_display, (const uint8_t *)known, known[0] == '\0' ? 0u : 32u, &result);
+    } else ksd_x11_display_list(watch->query_display, &result);
+    bool ok = result.status != KSD_STATUS_OK || result.tail_length < 4u
+        || ((!initial || emit_state(watch, KSD_STATE_SNAPSHOT_BEGIN, domain, NULL, NULL, 0u))
+            && emit_state(watch, initial ? KSD_STATE_SNAPSHOT_ITEM : KSD_STATE_CHANGED, domain,
+                NULL, result.tail + 4u, result.tail_length - 4u)
+            && (!initial || emit_state(watch, KSD_STATE_SNAPSHOT_END, domain, NULL, NULL, 0u)));
+    ksd_result_clear(&result); return ok;
 }
 
 bool ksd_x11_watch_run(ksd_x11 *connection, int stream_fd, uint64_t request_id)
@@ -261,11 +351,29 @@ bool ksd_x11_watch_run(ksd_x11 *connection, int stream_fd, uint64_t request_id)
     uint32_t mask = XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
     xcb_change_window_attributes(c, connection->screen->root, XCB_CW_EVENT_MASK, &mask);
     bool ok = refresh_clients(&watch, true);
+    (void)ksd_x11_open(connection->display_name, NULL, &watch.query_display);
+    if (watch.query_display != NULL) {
+        if (xkb_x11_setup_xkb_extension(c, XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION,
+            XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS, NULL, NULL, &watch.xkb_event_base, NULL)) {
+            int32_t device = xkb_x11_get_core_keyboard_device_id(c);
+            uint16_t selected = XCB_XKB_EVENT_TYPE_STATE_NOTIFY | XCB_XKB_EVENT_TYPE_NEW_KEYBOARD_NOTIFY
+                | XCB_XKB_EVENT_TYPE_MAP_NOTIFY | XCB_XKB_EVENT_TYPE_NAMES_NOTIFY;
+            if (device >= 0) xcb_xkb_select_events(c, (uint16_t)device, selected, 0u, selected, 0xffu, 0xffu, NULL);
+        }
+        const xcb_query_extension_reply_t *randr = xcb_get_extension_data(c, &xcb_randr_id);
+        if (randr != NULL && randr->present) {
+            watch.randr_event_base = randr->first_event;
+            xcb_randr_select_input(c, connection->screen->root, XCB_RANDR_NOTIFY_MASK_SCREEN_CHANGE
+                | XCB_RANDR_NOTIFY_MASK_OUTPUT_CHANGE | XCB_RANDR_NOTIFY_MASK_CRTC_CHANGE);
+        }
+    }
     (void)ksd_x11_cardinal(c, connection->screen->root,
                            watch.atoms.active_window, &watch.active);
     uint8_t answer[8] = { 0u };
     ksd_encode_u32(answer, ok ? KSD_STATUS_OK : KSD_STATUS_UNAVAILABLE);
     ok = write_frame(stream_fd, 0u, 0u, request_id, answer, sizeof(answer)) && ok;
+    if (ok) ok = initial_snapshot(&watch);
+    if (ok) ok = emit_query_state(&watch, KSD_STATE_KEYBOARD, true) && emit_query_state(&watch, KSD_STATE_DISPLAYS, true);
     alarm(0u);
     while (ok) {
         struct pollfd descriptors[2] = {
@@ -289,5 +397,6 @@ bool ksd_x11_watch_run(ksd_x11 *connection, int stream_fd, uint64_t request_id)
         if ((descriptors[1].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) { ok = false; break; }
     }
     free(watch.windows);
+    ksd_x11_close(watch.query_display);
     return ok;
 }

@@ -1,9 +1,13 @@
 #include "keysharp_desktop/client.h"
 #include "protocol.h"
 #include "protocol_io.h"
+#include "state_wire.h"
+#include "transport.h"
 
 #include <assert.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,9 @@ static void write_ok_response(int descriptor, const ksd_frame *request,
     ksd_encode_u32(payload, KSD_STATUS_OK);
     if (tail_length != 0u)
         memcpy(payload + 8u, tail, tail_length);
+    if (ksd_state_mutates_windows(request->opcode)) {
+        ksd_encode_u64(payload + 8u + tail_length, 17u); tail_length += 8u;
+    }
     ksd_frame response = {
         .magic = {
             KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
@@ -398,10 +405,7 @@ SIMPLE_CALL(mouse_move_relative,
     ksd_mouse_move_relative(connection, 1, 1, error))
 SIMPLE_CALL(mouse_button, ksd_mouse_button(connection, 1u, 1u, error))
 SIMPLE_CALL(mouse_scroll, ksd_mouse_scroll(connection, 1, 1u, error))
-SIMPLE_CALL(window_watch_subscribe,
-    ksd_window_watch_subscribe(connection, error))
-SIMPLE_CALL(clipboard_watch_subscribe,
-    ksd_clipboard_watch_subscribe(connection, error))
+SIMPLE_CALL(state_subscribe, ksd_state_subscribe(connection, KSD_STATE_GRANTS, error))
 
 typedef enum response_fixture {
     RESPONSE_EMPTY,
@@ -428,12 +432,9 @@ typedef struct round_trip_case {
     { opcode, KSD_ROLE_RPC, call_##name, NULL, 0u, response }
 #define PAYLOAD_CASE(name, opcode, payload, response) \
     { opcode, KSD_ROLE_RPC, call_##name, payload, sizeof(payload), response }
-#define WATCH_CASE(name, opcode) \
-    { opcode, KSD_ROLE_EVENT_STREAM, call_##name, NULL, 0u, RESPONSE_EMPTY }
 
 static const round_trip_case round_trip_cases[] = {
-    PAYLOAD_CASE(authorize, KSD_OP_AUTHORIZE, authorize_payload,
-                 RESPONSE_AUTHORIZE),
+    { KSD_OP_AUTHORIZE, KSD_ROLE_AUTHORIZATION_LEASE, call_authorize, authorize_payload, sizeof(authorize_payload), RESPONSE_AUTHORIZE },
     EMPTY_CASE(ping, KSD_OP_PING, RESPONSE_EMPTY),
     EMPTY_CASE(permissions_list, KSD_OP_PERMISSIONS_LIST, RESPONSE_EMPTY),
     PAYLOAD_CASE(permissions_revoke, KSD_OP_PERMISSIONS_REVOKE,
@@ -518,11 +519,11 @@ static const round_trip_case round_trip_cases[] = {
                  RESPONSE_EMPTY),
     PAYLOAD_CASE(mouse_scroll, KSD_OP_MOUSE_SCROLL, pair_payload,
                  RESPONSE_EMPTY),
-    WATCH_CASE(window_watch_subscribe, KSD_OP_WINDOW_WATCH),
-    WATCH_CASE(clipboard_watch_subscribe, KSD_OP_CLIPBOARD_WATCH),
+    { KSD_OP_STATE_SUBSCRIBE, KSD_ROLE_AUTHORIZATION_LEASE, call_state_subscribe,
+        (const uint8_t[]) { LE32(KSD_STATE_GRANTS) }, 4u, RESPONSE_EMPTY },
 };
 
-_Static_assert(sizeof(round_trip_cases) / sizeof(round_trip_cases[0]) == 50u,
+_Static_assert(sizeof(round_trip_cases) / sizeof(round_trip_cases[0]) == 49u,
                "every request-producing client API needs a round-trip case");
 
 static void write_round_trip_response(int descriptor,
@@ -607,7 +608,6 @@ static void check_client_request_round_trips(void)
     }
 }
 
-#undef WATCH_CASE
 #undef PAYLOAD_CASE
 #undef EMPTY_CASE
 #undef OWNED_CALL
@@ -615,6 +615,139 @@ static void check_client_request_round_trips(void)
 #undef SIMPLE_CALL
 #undef LE64
 #undef LE32
+
+static ksd_frame state_frame(ksd_state_event *event, ksd_buffer *payload)
+{
+    ksd_buffer_init(payload, KSD_MAX_TEXT_BYTES + 256u);
+    assert(ksd_state_event_encode(event, payload));
+    return (ksd_frame) { .magic = { 'K', 'S', 'D', 'P' }, .major = KSD_PROTOCOL_MAJOR,
+        .opcode = KSD_OP_STATE_EVENT, .flags = KSD_FLAG_EVENT, .payload = payload->data, .payload_length = (uint32_t)payload->length };
+}
+
+static void check_typed_window(void)
+{
+    const char json[] = "{\"id\":\"42\",\"title\":\"caf\\u00e9 \\ud83d\\udc08\",\"appId\":\"Editor\",\"frame\":{\"x\":-12,\"y\":3,\"width\":500,\"height\":200},\"visible\":false,\"active\":true,\"validFields\":[\"title\",\"frame\",\"visible\",\"active\"]}";
+    ksd_state_event event; ksd_state_event_init(&event);
+    assert(ksd_state_window_json((const uint8_t *)json, strlen(json), &event.window));
+    assert(event.window.handle == 42u && event.window.frame_x == -12);
+    assert(event.window.frame_width == 500u && event.window.flags == KSD_WINDOW_ACTIVE);
+    assert((event.window.valid_fields & KSD_FIELD_APP_ID) == 0u);
+    assert(strcmp(event.window.title.data, "caf\xc3\xa9 \xf0\x9f\x90\x88") == 0);
+    event.kind = KSD_STATE_HIDE; event.domain = KSD_STATE_WINDOWS; event.epoch = 77u; event.sequence = 9u;
+    ksd_buffer bytes; ksd_frame frame = state_frame(&event, &bytes); ksd_state_event parsed;
+    assert(ksd_state_event_decode(frame.payload, frame.payload_length, &parsed));
+    assert(parsed.kind == KSD_STATE_HIDE && parsed.sequence == 9u && parsed.epoch == 77u);
+    assert(ksd_state_window_equal(&event.window, &parsed.window));
+    ksd_state_event_clear(&parsed); ksd_buffer_clear(&bytes); ksd_state_event_clear(&event);
+    const char child[] = "{\"ok\":true,\"window\":{\"id\":\"42\",\"topLevel\":\"7\",\"buffer\":{\"x\":-9,\"y\":11,\"width\":80,\"height\":40}}}";
+    assert(ksd_state_window_json((const uint8_t *)child, strlen(child), &event.window));
+    assert(ksd_state_window_is_child_json((const uint8_t *)child, strlen(child)));
+    assert(event.window.surface_x == -9 && event.window.surface_y == 11 && event.window.surface_width == 80u);
+    assert((event.window.valid_fields & KSD_FIELD_SURFACE) != 0u);
+    ksd_state_event_clear(&event);
+    const char unsupported[] = "{\"id\":\"42\",\"buffer\":{\"x\":9,\"width\":80},\"validFields\":[]}";
+    assert(ksd_state_window_json((const uint8_t *)unsupported, strlen(unsupported), &event.window));
+    assert((event.window.valid_fields & (KSD_FIELD_BUFFER | KSD_FIELD_SURFACE)) == 0u);
+    ksd_state_event_clear(&event);
+}
+
+static void check_buffered_readiness(void)
+{
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    ksd_connection *connection = ksd_client_test_adopt_descriptor(sockets[0]); assert(connection != NULL);
+    ksd_client_test_set_role(connection, KSD_ROLE_AUTHORIZATION_LEASE);
+    ksd_state_event event; ksd_state_event_init(&event); event.kind = KSD_STATE_GRANT_CHANGED;
+    event.domain = KSD_STATE_GRANTS; event.epoch = 88u; event.sequence = 1u; event.granted_scopes = KSD_SCOPE_WINDOW_MONITORING;
+    ksd_buffer payload; ksd_frame frame = state_frame(&event, &payload); assert(ksd_frame_write(sockets[1], &frame));
+    uint8_t granted[8] = { KSD_SCOPE_WINDOW_MONITORING };
+    ksd_frame response_request = { .opcode = KSD_OP_AUTHORIZE, .request_id = 1u };
+    write_ok_response(sockets[1], &response_request, granted, sizeof(granted), false);
+    uint32_t scopes; ksd_error error; ksd_error_init(&error);
+    assert(ksd_authorize(connection, KSD_AUTH_CHECK, KSD_SCOPE_WINDOW_MONITORING, &scopes, &error) == KSD_STATUS_OK);
+    struct pollfd ready = { .fd = ksd_connection_fd(connection), .events = POLLIN };
+    assert(poll(&ready, 1u, 0) == 1);
+    ksd_state_event output; ksd_state_event_init(&output);
+    assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_OK);
+    assert(output.sequence == 1u && output.granted_scopes == scopes); ksd_state_event_clear(&output);
+    assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_TIMEOUT);
+    assert(poll(&ready, 1u, 0) == 0);
+
+    /* Subscription masks change on the same socket, and each response remains ordered. */
+    response_request.opcode = KSD_OP_STATE_SUBSCRIBE; response_request.request_id = 2u;
+    write_ok_response(sockets[1], &response_request, NULL, 0u, false);
+    assert(ksd_state_subscribe(connection, KSD_STATE_WINDOWS | KSD_STATE_GRANTS, &error) == KSD_STATUS_OK);
+    response_request.request_id = 3u;
+    write_ok_response(sockets[1], &response_request, NULL, 0u, false);
+    assert(ksd_state_subscribe(connection, KSD_STATE_GRANTS, &error) == KSD_STATUS_OK);
+    const uint8_t magic[4] = { 'K', 'S', 'D', 'P' };
+    ksd_frame request;
+    for (unsigned i = 0u; i < 3u; i++) {
+        assert(ksd_frame_read(sockets[1], magic, KSD_PROTOCOL_MAJOR, 0u, 4096u, true, &request) == 1);
+        if (i != 0u) assert(request.opcode == KSD_OP_STATE_SUBSCRIBE && request.request_id == i + 1u);
+        ksd_frame_clear(&request);
+    }
+
+    ksd_buffer packed; ksd_buffer_init(&packed, 4096u); assert(ksd_frame_pack(&frame, &packed));
+    assert(write(sockets[1], packed.data, 7u) == 7);
+    uint64_t before = ksd_monotonic_milliseconds();
+    assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_TIMEOUT);
+    assert(ksd_monotonic_milliseconds() - before < 100u && poll(&ready, 1u, 0) == 0);
+    assert(write(sockets[1], packed.data + 7u, packed.length - 7u) == (ssize_t)(packed.length - 7u));
+    assert(poll(&ready, 1u, 1000) == 1);
+    assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_OK); ksd_state_event_clear(&output);
+    ksd_state_event clipboard; ksd_state_event_init(&clipboard);
+    clipboard.domain = KSD_STATE_CLIPBOARD; clipboard.epoch = 88u;
+    const uint32_t clipboard_kinds[] = { KSD_STATE_SNAPSHOT_BEGIN, KSD_STATE_SNAPSHOT_END, KSD_STATE_CHANGED };
+    for (unsigned i = 0u; i < 3u; i++) {
+        clipboard.kind = clipboard_kinds[i]; clipboard.sequence = i == 2u ? 1u : 0u;
+        ksd_buffer data; ksd_frame next = state_frame(&clipboard, &data);
+        assert(ksd_frame_write(sockets[1], &next));
+        assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_OK);
+        assert(output.domain == KSD_STATE_CLIPBOARD && output.kind == clipboard.kind
+            && output.epoch == clipboard.epoch && output.sequence == clipboard.sequence);
+        ksd_state_event_clear(&output); ksd_buffer_clear(&data);
+    }
+    close(sockets[1]); before = ksd_monotonic_milliseconds();
+    assert(poll(&ready, 1u, 1000) == 1);
+    assert(ksd_state_next(connection, 0u, &output, &error) != KSD_STATUS_OK);
+    assert(ksd_monotonic_milliseconds() - before < 100u);
+    ksd_buffer_clear(&packed); ksd_buffer_clear(&payload); ksd_disconnect(connection);
+}
+
+typedef struct queue_writer { int descriptor; ksd_frame *frame; } queue_writer;
+
+static void *write_queue(void *context)
+{
+    queue_writer *writer = context;
+    for (unsigned i = 0u; i < 257u; i++) assert(ksd_frame_write(writer->descriptor, writer->frame));
+    return NULL;
+}
+
+static void check_queue_limit_and_terminal_readiness(void)
+{
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    ksd_connection *connection = ksd_client_test_adopt_descriptor(sockets[0]); assert(connection != NULL);
+    ksd_client_test_set_role(connection, KSD_ROLE_AUTHORIZATION_LEASE);
+    ksd_state_event event; ksd_state_event_init(&event); event.kind = KSD_STATE_CHANGED;
+    event.domain = KSD_STATE_KEYBOARD; event.epoch = 1u;
+    ksd_buffer bytes; ksd_frame frame = state_frame(&event, &bytes);
+    queue_writer writer = { .descriptor = sockets[1], .frame = &frame }; pthread_t thread;
+    assert(pthread_create(&thread, NULL, write_queue, &writer) == 0);
+    ksd_error error; ksd_error_init(&error); uint32_t scopes;
+    assert(ksd_authorize(connection, KSD_AUTH_CHECK, KSD_SCOPE_WINDOW_MONITORING, &scopes, &error) != KSD_STATUS_OK);
+    assert(strstr(error.message, "queue") != NULL);
+    assert(pthread_join(thread, NULL) == 0);
+    for (unsigned i = 0u; i < 256u; i++) {
+        ksd_state_event output; ksd_state_event_init(&output);
+        assert(ksd_state_next(connection, 0u, &output, &error) == KSD_STATUS_OK); ksd_state_event_clear(&output);
+    }
+    struct pollfd ready = { .fd = ksd_connection_fd(connection), .events = POLLIN };
+    assert(poll(&ready, 1u, 0) == 1);
+    ksd_state_event output; ksd_state_event_init(&output);
+    assert(ksd_state_next(connection, 0u, &output, &error) != KSD_STATUS_OK);
+    assert(poll(&ready, 1u, 0) == 1);
+    ksd_buffer_clear(&bytes); close(sockets[1]); ksd_disconnect(connection);
+}
 
 int main(void)
 {
@@ -663,6 +796,9 @@ int main(void)
     write_capture_response(sockets[1], &unsealed_request,
                            capture_memfd(2u, 2u, 64u, false));
 
+    check_typed_window();
+    check_buffered_readiness();
+    check_queue_limit_and_terminal_readiness();
     check_hello_tail_compatibility();
     check_client_request_round_trips();
 
@@ -708,17 +844,9 @@ int main(void)
     assert(ksd_work_area(connection, &nonempty_rectangle, &error)
            == KSD_STATUS_INVALID_REQUEST);
 
-    ksd_window_event window_event;
-    ksd_window_event_init(&window_event);
-    window_event.window_json.data = (char *)(uintptr_t)1u;
-    assert(ksd_window_watch_next(connection, 1u, &window_event, &error)
-           == KSD_STATUS_INVALID_REQUEST);
-
-    ksd_clipboard_event clipboard_event;
-    ksd_clipboard_event_init(&clipboard_event);
-    clipboard_event.mimetypes.items = (ksd_string *)(uintptr_t)1u;
-    assert(ksd_clipboard_watch_next(connection, 1u, &clipboard_event, &error)
-           == KSD_STATUS_INVALID_REQUEST);
+    ksd_state_event state_event; ksd_state_event_init(&state_event);
+    state_event.window.app_id.data = (char *)(uintptr_t)1u;
+    assert(ksd_state_next(connection, 0u, &state_event, &error) == KSD_STATUS_INVALID_REQUEST);
 
     visitor_state state = { 0 };
     assert(ksd_permissions_list(connection, cancel_first_permission, &state,
@@ -784,16 +912,16 @@ int main(void)
         ksd_client_test_adopt_descriptor(lease_sockets[0]);
     assert(lease != NULL);
     ksd_client_test_set_role(lease, KSD_ROLE_AUTHORIZATION_LEASE);
-    uint32_t revoked = 0u;
+    ksd_state_event revoke_state; ksd_state_event_init(&revoke_state);
     ksd_error_init(&error);
-    assert(ksd_lease_next(lease, 1000u, &revoked, &error) == KSD_STATUS_OK);
-    assert(revoked == (KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE));
+    assert(ksd_state_next(lease, 1000u, &revoke_state, &error) == KSD_STATUS_OK);
+    assert(revoke_state.domain == KSD_STATE_GRANTS && revoke_state.kind == KSD_STATE_GRANT_CHANGED);
+    assert(revoke_state.revoked_scopes == (KSD_SCOPE_SCREEN_CAPTURE | TEST_FUTURE_SCOPE));
+    ksd_state_event_clear(&revoke_state);
     ksd_disconnect(lease);
     close(lease_sockets[1]);
 
-    /* A refresh applies the revocations that have already arrived and never
-     * waits for one. A fresh connection numbers its first request 1, so the
-     * grant can be answered before it is asked for. */
+    /* A nonblocking drain applies arrived revocations and preserves the last grant while idle. */
     int refresh_sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
                       refresh_sockets) == 0);
@@ -816,21 +944,21 @@ int main(void)
            == KSD_STATUS_OK);
     assert(granted == both);
 
-    granted = 0u;
-    ksd_error_init(&error);
-    assert(ksd_lease_refresh(refreshing, &granted, &error) == KSD_STATUS_OK);
+    ksd_state_event_init(&revoke_state); ksd_error_init(&error);
+    assert(ksd_state_next(refreshing, 0u, &revoke_state, &error) == KSD_STATUS_TIMEOUT);
     assert(granted == both);
 
     ksd_encode_u32(revoked_payload, KSD_SCOPE_SCREEN_CAPTURE);
     assert(ksd_frame_write(refresh_sockets[1], &revoked_event));
     ksd_error_init(&error);
-    assert(ksd_lease_refresh(refreshing, &granted, &error) == KSD_STATUS_OK);
-    assert(granted == KSD_SCOPE_WINDOW_CONTROL);
-    assert(ksd_lease_granted_scopes(refreshing) == KSD_SCOPE_WINDOW_CONTROL);
+    assert(ksd_state_next(refreshing, 0u, &revoke_state, &error) == KSD_STATUS_OK);
+    assert(revoke_state.granted_scopes == KSD_SCOPE_WINDOW_CONTROL);
+    assert(revoke_state.revoked_scopes == KSD_SCOPE_SCREEN_CAPTURE);
+    ksd_state_event_clear(&revoke_state);
 
     close(refresh_sockets[1]);
     ksd_error_init(&error);
-    assert(ksd_lease_refresh(refreshing, &granted, &error) != KSD_STATUS_OK);
+    assert(ksd_state_next(refreshing, 0u, &revoke_state, &error) != KSD_STATUS_OK);
     ksd_disconnect(refreshing);
     return 0;
 }

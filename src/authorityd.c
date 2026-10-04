@@ -20,6 +20,7 @@
 #include "provider_executable.h"
 #include "roles.h"
 #include "transport.h"
+#include "state_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -38,6 +39,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -80,6 +82,30 @@ typedef struct usage_slot {
     uint64_t key;
     size_t count;
 } usage_slot;
+
+typedef struct state_window {
+    ksd_window_record value;
+    struct state_window *next;
+} state_window;
+
+typedef struct authority_lease {
+    struct authority_lease *next;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    uint64_t id;
+    uint64_t epoch;
+    uint64_t sequences[5];
+    unsigned references;
+    bool active;
+    ksp_identity identity;
+    uint32_t requested_scopes, granted_scopes, domains;
+    uint64_t generation;
+    state_window *windows;
+    state_window *snapshot_windows;
+    bool snapshot_pending;
+    int client_fd;
+    pthread_mutex_t output_mutex;
+} authority_lease;
 
 typedef struct authority_state {
     pthread_mutex_t mutex;
@@ -125,6 +151,7 @@ typedef struct authority_state {
         ksp_identity provider_identity;
     } backends[KSD_MAX_BACKEND_REGISTRATIONS];
     ksp_store *store;
+    authority_lease *leases;
 } authority_state;
 
 typedef struct backend_snapshot {
@@ -151,6 +178,12 @@ typedef struct authority_session {
     uint64_t assembly_deadline;
     int descriptor;
     ksd_request_assembly assembly;
+    authority_lease *lease;
+    struct ucred peer;
+    int source_fd[3];
+    pthread_t source_thread[3];
+    bool source_started[3];
+    uint64_t effective_sequence;
 } authority_session;
 
 typedef struct authority_client {
@@ -1034,11 +1067,41 @@ static bool build_response(const ksd_frame *request, uint32_t status,
     return true;
 }
 
+static bool write_lease_frame(authority_lease *lease, const ksd_frame *frame)
+{
+    ksd_buffer packed;
+    ksd_buffer_init(&packed, KSD_MAX_TEXT_BYTES + 512u);
+    bool ok = ksd_frame_pack(frame, &packed);
+    pthread_mutex_lock(&lease->output_mutex);
+    size_t sent = 0u;
+    while (ok && sent < packed.length) {
+        ssize_t count = send(lease->client_fd, packed.data + sent,
+                             packed.length - sent, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (count > 0) sent += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else ok = false;
+    }
+    pthread_mutex_unlock(&lease->output_mutex);
+    ksd_buffer_clear(&packed);
+    if (!ok) (void)shutdown(lease->client_fd, SHUT_RDWR);
+    return ok;
+}
+
 static bool forward_public(authority_session *session,
                            const ksd_frame *public_frame)
 {
-    return session != NULL && public_frame != NULL
-        && ksd_frame_write(session->client_fd, public_frame);
+    if (session == NULL || public_frame == NULL) return false;
+    if (session->lease != NULL && session->role == KSD_ROLE_AUTHORIZATION_LEASE) {
+        bool ok = write_lease_frame(session->lease, public_frame);
+        if (!ok) {
+            pthread_mutex_lock(&session->lease->mutex);
+            session->lease->active = false; session->lease->granted_scopes = 0u;
+            pthread_cond_broadcast(&session->lease->changed);
+            pthread_mutex_unlock(&session->lease->mutex);
+        }
+        return ok;
+    }
+    return ksd_frame_write(session->client_fd, public_frame);
 }
 
 /* A capture answers with a sealed memfd instead of a payload, so the pixels
@@ -1065,9 +1128,21 @@ static bool forward_response(authority_session *session,
                              bool more)
 {
     ksd_frame response;
+    ksd_buffer sequenced;
+    ksd_buffer_init(&sequenced, KSD_MAX_CAPTURE_BYTES + 64u);
+    if (status == KSD_STATUS_OK && ksd_state_mutates_windows(request->opcode)) {
+        if (!ksd_buffer_bytes(&sequenced, tail, tail_length)
+            || !ksd_buffer_u64(&sequenced, session->effective_sequence)) {
+            ksd_buffer_clear(&sequenced); return false;
+        }
+        tail = sequenced.data; tail_length = (uint32_t)sequenced.length;
+    }
     if (!build_response(request, status, detail, diagnostic,
-                        tail, tail_length, more, &response))
+                        tail, tail_length, more, &response)) {
+        ksd_buffer_clear(&sequenced);
         return false;
+    }
+    ksd_buffer_clear(&sequenced);
     bool ok = forward_public(session, &response);
     ksd_frame_clear(&response);
     return ok;
@@ -1101,8 +1176,116 @@ static bool send_revoked(authority_session *session, uint32_t scopes)
                          payload, sizeof(payload));
 }
 
+static unsigned domain_index(uint32_t domain)
+{
+    unsigned index = 0u;
+    while ((domain >>= 1u) != 0u) index++;
+    return index;
+}
+
+/* Call with the lease locked; its independent socket writer preserves record order. */
+static bool lease_emit(authority_lease *lease, ksd_state_event *event)
+{
+    if (!lease->active) return false;
+    event->epoch = lease->epoch;
+    event->sequence = lease->sequences[domain_index(event->domain)];
+    ksd_buffer payload; ksd_buffer_init(&payload, KSD_MAX_TEXT_BYTES + 256u);
+    bool ok = ksd_state_event_encode(event, &payload);
+    ksd_frame frame = {
+        .magic = { KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1, KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3 },
+        .major = KSD_PROTOCOL_MAJOR, .minor = KSD_PROTOCOL_MINOR,
+        .opcode = KSD_OP_STATE_EVENT, .flags = KSD_FLAG_EVENT,
+        .payload = payload.data, .payload_length = (uint32_t)payload.length,
+    };
+    ok = ok && write_lease_frame(lease, &frame);
+    ksd_buffer_clear(&payload);
+    if (!ok) {
+        lease->active = false; lease->granted_scopes = 0u;
+        (void)shutdown(lease->client_fd, SHUT_RDWR);
+        pthread_cond_broadcast(&lease->changed);
+    }
+    return ok;
+}
+
+static bool lease_condition_init(pthread_cond_t *condition)
+{
+    pthread_condattr_t attributes;
+    if (pthread_condattr_init(&attributes) != 0) return false;
+    bool ok = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(condition, &attributes) == 0;
+    pthread_condattr_destroy(&attributes); return ok;
+}
+
+static authority_lease *lease_create(authority_session *session)
+{
+    authority_lease *lease = calloc(1u, sizeof(*lease));
+    if (lease == NULL) return NULL;
+    if (getrandom(&lease->id, sizeof(lease->id), 0) != sizeof(lease->id)
+        || lease->id == 0u || getrandom(&lease->epoch, sizeof(lease->epoch), 0) != sizeof(lease->epoch)
+        || lease->epoch == 0u) { free(lease); return NULL; }
+    pthread_mutex_init(&lease->mutex, NULL); pthread_mutex_init(&lease->output_mutex, NULL);
+    if (!lease_condition_init(&lease->changed)) {
+        pthread_mutex_destroy(&lease->mutex); pthread_mutex_destroy(&lease->output_mutex);
+        free(lease); return NULL;
+    }
+    lease->active = true; lease->references = 1u; lease->identity = session->identity;
+    lease->requested_scopes = session->requested_scopes; lease->granted_scopes = session->granted_scopes;
+    lease->generation = session->generation; lease->client_fd = session->client_fd;
+    pthread_mutex_lock(&session->state->mutex);
+    lease->next = session->state->leases; session->state->leases = lease;
+    pthread_mutex_unlock(&session->state->mutex);
+    return lease;
+}
+
+static authority_lease *lease_bind(authority_state *state, uint64_t id, const struct ucred *peer)
+{
+    authority_lease *result = NULL;
+    pthread_mutex_lock(&state->mutex);
+    for (authority_lease *lease = state->leases; lease != NULL; lease = lease->next) {
+        pthread_mutex_lock(&lease->mutex);
+        if (lease->id == id && lease->active && lease->identity.uid == peer->uid && lease->identity.pid == peer->pid) {
+            lease->references++; result = lease;
+        }
+        pthread_mutex_unlock(&lease->mutex);
+        if (result != NULL) break;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return result;
+}
+
+static void lease_release(authority_state *state, authority_lease *lease)
+{
+    if (lease == NULL) return;
+    pthread_mutex_lock(&state->mutex);
+    bool last = --lease->references == 0u;
+    if (last) {
+        authority_lease **slot = &state->leases;
+        while (*slot != lease) slot = &(*slot)->next;
+        *slot = lease->next;
+    }
+    pthread_mutex_unlock(&state->mutex);
+    if (!last) return;
+    while (lease->windows != NULL) {
+        state_window *item = lease->windows; lease->windows = item->next;
+        ksd_window_record_clear(&item->value); free(item);
+    }
+    while (lease->snapshot_windows != NULL) {
+        state_window *item = lease->snapshot_windows; lease->snapshot_windows = item->next;
+        ksd_window_record_clear(&item->value); free(item);
+    }
+    pthread_mutex_destroy(&lease->mutex); pthread_mutex_destroy(&lease->output_mutex);
+    pthread_cond_destroy(&lease->changed); free(lease);
+}
+
 static bool session_identity_refresh(authority_session *session)
 {
+    if (session->lease != NULL) {
+        pthread_mutex_lock(&session->lease->mutex);
+        bool alive = session->lease->active;
+        session->identity = session->lease->identity;
+        pthread_mutex_unlock(&session->lease->mutex);
+        return alive;
+    }
     ksp_identity verified;
     if (ksp_identity_revalidate_cached(&session->identity, &verified) != 0
         || !same_identity(&session->identity, &verified))
@@ -1115,6 +1298,40 @@ static bool session_identity_refresh(authority_session *session)
 static bool session_refresh(authority_session *session, bool force_identity,
                             bool notify, bool *generation_changed)
 {
+    if (session->lease != NULL) {
+        authority_lease *lease = session->lease;
+        pthread_mutex_lock(&lease->mutex);
+        uint64_t generation = lease->generation;
+        uint32_t granted = lease->granted_scopes;
+        bool ok = lease->active && ksp_store_generation(session->state->store, lease->identity.uid, &generation) == 0;
+        if (ok && force_identity) {
+            ksp_identity verified;
+            ok = ksp_identity_revalidate_cached(&lease->identity, &verified) == 0
+                && same_identity(&lease->identity, &verified);
+        }
+        bool changed = generation != lease->generation;
+        if (ok && changed && lease->requested_scopes != 0u)
+            ok = ksp_store_check_at_generation(session->state->store, lease->identity.uid,
+                lease->identity.hash, lease->requested_scopes, &granted, &generation) == 0;
+        if (!ok) granted = 0u;
+        uint32_t revoked = lease->granted_scopes & ~granted;
+        bool grants_changed = lease->granted_scopes != granted;
+        lease->generation = generation; lease->granted_scopes = granted;
+        session->identity = lease->identity; session->generation = generation;
+        session->requested_scopes = lease->requested_scopes; session->granted_scopes = granted;
+        if (generation_changed != NULL) *generation_changed = changed;
+        if (grants_changed && notify) {
+            ksd_state_event event; ksd_state_event_init(&event);
+            event.kind = KSD_STATE_GRANT_CHANGED; event.domain = KSD_STATE_GRANTS;
+            event.granted_scopes = granted; event.revoked_scopes = revoked;
+            lease->sequences[4]++; ok = lease_emit(lease, &event) && ok;
+            if ((revoked & KSD_SCOPE_WINDOW_MONITORING) != 0u) lease->domains &= ~KSD_STATE_WINDOWS;
+            if ((revoked & KSD_SCOPE_CLIPBOARD_MONITORING) != 0u) lease->domains &= ~KSD_STATE_CLIPBOARD;
+        }
+        pthread_cond_broadcast(&lease->changed);
+        pthread_mutex_unlock(&lease->mutex);
+        return ok;
+    }
     uint64_t generation;
     uint32_t allowed = session->granted_scopes;
     uint32_t revoked;
@@ -1502,6 +1719,39 @@ invalid:
                             NULL, 0u, false);
 }
 
+static bool complete_authorization(authority_session *session, uint32_t requested, uint32_t *status)
+{
+    authority_lease *lease = session->lease;
+    pthread_mutex_lock(&lease->mutex);
+    lease->requested_scopes |= session->requested_scopes;
+    ksp_identity verified; uint32_t granted = 0u; uint64_t generation = lease->generation;
+    bool current = lease->active
+        && ksp_identity_revalidate_cached(&lease->identity, &verified) == 0
+        && same_identity(&lease->identity, &verified);
+    if (current) current = lease->requested_scopes == 0u
+        ? ksp_store_generation(session->state->store, lease->identity.uid, &generation) == 0
+        : ksp_store_check_at_generation(session->state->store, lease->identity.uid,
+            lease->identity.hash, lease->requested_scopes, &granted, &generation) == 0;
+    uint32_t revoked = lease->granted_scopes & ~granted;
+    bool changed = lease->granted_scopes != granted;
+    lease->granted_scopes = granted; lease->generation = generation;
+    if ((revoked & KSD_SCOPE_WINDOW_MONITORING) != 0u) lease->domains &= ~KSD_STATE_WINDOWS;
+    if ((revoked & KSD_SCOPE_CLIPBOARD_MONITORING) != 0u) lease->domains &= ~KSD_STATE_CLIPBOARD;
+    session->requested_scopes = lease->requested_scopes;
+    session->granted_scopes = granted; session->generation = generation;
+    bool sent = true;
+    if (changed) {
+        ksd_state_event event; ksd_state_event_init(&event);
+        event.kind = KSD_STATE_GRANT_CHANGED; event.domain = KSD_STATE_GRANTS;
+        event.granted_scopes = granted; event.revoked_scopes = revoked;
+        lease->sequences[4]++; sent = lease_emit(lease, &event);
+    }
+    if (*status == KSD_STATUS_OK && (granted & requested) != requested) *status = KSD_STATUS_REVOKED;
+    if (!current) lease->active = false;
+    pthread_cond_broadcast(&lease->changed);
+    pthread_mutex_unlock(&lease->mutex); return current && sent;
+}
+
 static bool handle_authorize(authority_session *session,
                              const ksd_frame *request)
 {
@@ -1524,7 +1774,13 @@ static bool handle_authorize(authority_session *session,
         return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
                                 0u, "invalid AUTHORIZE payload",
                                 NULL, 0u, false);
+    if (session->role != KSD_ROLE_AUTHORIZATION_LEASE)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST, 0u,
+            "authorization belongs to the lease connection", NULL, 0u, false);
+    if (!session_refresh(session, true, true, NULL)) return false;
     uint32_t status = authorize_scopes(session, scopes, mode, &granted);
+    if (!complete_authorization(session, scopes, &status)) return false;
+    granted = session->granted_scopes;
     if (status != KSD_STATUS_OK)
         return forward_response(session, request, status, 0u,
             status == KSD_STATUS_DENIED ? "permission is not granted"
@@ -1626,13 +1882,14 @@ static bool start_display_watch(authority_session *session,
         if (ksd_frame_read(worker_fd, public_magic, KSD_PROTOCOL_MAJOR,
                              KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES + 8u,
                              true, &event) <= 0) break;
-        ok = event.flags == KSD_FLAG_EVENT && event.opcode == KSD_OP_WINDOW_EVENT
-            && event.request_id == 0u && event.payload_length >= 8u
-            && ksd_decode_u16(event.payload) >= KSD_WINDOW_EVENT_CREATE
-            && ksd_decode_u16(event.payload) <= KSD_WINDOW_EVENT_ACTIVE_STATE
-            && ksd_decode_u16(event.payload + 2u) == 0u
-            && ksd_decode_u32(event.payload + 4u) == event.payload_length - 8u
-            && ksd_utf8_valid(event.payload + 8u, event.payload_length - 8u, false)
+        ok = event.flags == KSD_FLAG_EVENT && event.request_id == 0u
+            && (event.opcode == KSD_OP_STATE_EVENT || (event.opcode == KSD_OP_WINDOW_EVENT
+                && event.payload_length >= 8u
+                && ksd_decode_u16(event.payload) >= KSD_WINDOW_EVENT_CREATE
+                && ksd_decode_u16(event.payload) <= KSD_WINDOW_EVENT_CHANGED
+                && ksd_decode_u16(event.payload + 2u) == 0u
+                && ksd_decode_u32(event.payload + 4u) == event.payload_length - 8u
+                && ksd_utf8_valid(event.payload + 8u, event.payload_length - 8u, false)))
             && watch_emit(event.opcode, event.payload, event.payload_length, context);
         ksd_frame_clear(&event);
     }
@@ -1640,33 +1897,202 @@ static bool start_display_watch(authority_session *session,
     return false;
 }
 
-static bool start_watch(authority_session *session,
-                        const ksd_frame *request, uint32_t scope,
-                        const backend_snapshot *snapshot)
+
+typedef struct state_source {
+    authority_session session;
+    backend_snapshot backend;
+    bool clipboard;
+} state_source;
+
+static void *state_source_run(void *data)
 {
-    if (session->role != KSD_ROLE_EVENT_STREAM
-        || request->payload_length != 0u)
-        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST,
-                                0u, "invalid event subscription",
-                                NULL, 0u, false);
-    watch_context context = {
-        .session = session,
-        .snapshot = snapshot,
-        .scope = scope,
-    };
-    if (watch_uses_display_worker(session->backend))
-        return start_display_watch(session, request, &context);
-    if (!forward_response(session, request, KSD_STATUS_OK, 0u,
-                          NULL, NULL, 0u, false))
-        return false;
-    char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
-    (void)ksd_provider_watch(session->identity.uid,
-        snapshot->provider_identity.pid,
-        session->backend,
-        request->opcode == KSD_OP_CLIPBOARD_WATCH,
-        watch_emit, watch_cancelled, &context,
-        diagnostic, sizeof(diagnostic));
-    return false;
+    state_source *source = data;
+    watch_context context = { .session = &source->session, .snapshot = &source->backend, .scope = 0u };
+    ksd_frame request = { .opcode = source->clipboard ? KSD_OP_CLIPBOARD_WATCH : KSD_OP_WINDOW_WATCH, .request_id = 1u };
+    if (watch_uses_display_worker(source->session.backend))
+        (void)start_display_watch(&source->session, &request, &context);
+    else {
+        char diagnostic[KSD_DIAGNOSTIC_CAPACITY];
+        (void)ksd_provider_watch(source->session.identity.uid, source->backend.provider_identity.pid,
+            source->session.backend, source->clipboard, source->session.client_fd, watch_emit, watch_cancelled, &context, diagnostic, sizeof(diagnostic));
+    }
+    close(source->session.client_fd); release_backend_snapshot(&source->backend); free(source);
+    return NULL;
+}
+
+static void state_source_stop(authority_session *session, unsigned lane)
+{
+    if (!session->source_started[lane]) return;
+    (void)shutdown(session->source_fd[lane], SHUT_RDWR); close(session->source_fd[lane]);
+    session->source_fd[lane] = -1;
+    pthread_join(session->source_thread[lane], NULL); session->source_started[lane] = false;
+}
+
+static bool state_source_start(authority_session *session, unsigned lane)
+{
+    state_source *source = calloc(1u, sizeof(*source)); int sockets[2];
+    if (source == NULL) return false;
+    if (!take_backend_snapshot(session->state, session->identity.uid, &source->backend)) { free(source); return false; }
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        release_backend_snapshot(&source->backend); free(source); return false;
+    }
+    source->session = *session; source->session.client_fd = sockets[1];
+    source->session.role = KSD_ROLE_EVENT_STREAM;
+    source->clipboard = lane == 1u;
+    if (lane == 2u) source->session.backend = KSD_BACKEND_GENERIC;
+    if (!set_socket_timeouts(sockets[1], 2u) || pthread_create(&session->source_thread[lane], NULL, state_source_run, source) != 0) {
+        close(sockets[0]); close(sockets[1]); release_backend_snapshot(&source->backend); free(source); return false;
+    }
+    session->source_started[lane] = true; session->source_fd[lane] = sockets[0];
+    return true;
+}
+
+static state_window **window_slot(authority_lease *lease, uint64_t handle)
+{
+    state_window **slot = &lease->windows;
+    while (*slot != NULL && (*slot)->value.handle != handle) slot = &(*slot)->next;
+    return slot;
+}
+
+static bool state_window_apply(authority_lease *lease, ksd_state_event *event)
+{
+    if (event->kind == KSD_STATE_SNAPSHOT_BEGIN) {
+        lease->sequences[0]++;
+        lease->snapshot_pending = true;
+        while (lease->snapshot_windows != NULL) {
+            state_window *item = lease->snapshot_windows; lease->snapshot_windows = item->next;
+            ksd_window_record_clear(&item->value); free(item);
+        }
+        return lease_emit(lease, event);
+    }
+    if (event->kind == KSD_STATE_SNAPSHOT_END) {
+        if (!lease->snapshot_pending) return false;
+        while (lease->windows != NULL) {
+            state_window *item = lease->windows; lease->windows = item->next;
+            ksd_window_record_clear(&item->value); free(item);
+        }
+        lease->windows = lease->snapshot_windows; lease->snapshot_windows = NULL;
+        lease->snapshot_pending = false;
+        pthread_cond_broadcast(&lease->changed); return lease_emit(lease, event);
+    }
+    state_window **slot;
+    if (event->kind == KSD_STATE_SNAPSHOT_ITEM) {
+        if (!lease->snapshot_pending) return false;
+        slot = &lease->snapshot_windows;
+        while (*slot != NULL && (*slot)->value.handle != event->window.handle) slot = &(*slot)->next;
+    } else slot = window_slot(lease, event->window.handle);
+    if ((event->window.valid_fields & KSD_FIELD_STACKING_ORDER) == 0u && event->kind != KSD_STATE_DESTROY) {
+        event->window.valid_fields |= KSD_FIELD_STACKING_ORDER;
+        if (*slot != NULL) event->window.stacking_order = (*slot)->value.stacking_order;
+        else {
+            for (state_window *item = lease->windows; item != NULL; item = item->next)
+                if (item->value.stacking_order >= event->window.stacking_order) event->window.stacking_order = item->value.stacking_order + 1u;
+        }
+    }
+    if (event->kind == KSD_STATE_DESTROY) {
+        if (*slot == NULL) return true;
+        state_window *item = *slot; *slot = item->next;
+        ksd_window_record_clear(&item->value); free(item);
+    } else {
+        if (*slot != NULL && event->kind != KSD_STATE_SNAPSHOT_ITEM
+            && ksd_state_window_equal(&(*slot)->value, &event->window)) return true;
+        if (*slot == NULL) {
+            *slot = calloc(1u, sizeof(**slot)); if (*slot == NULL) return false;
+            ksd_window_record_init(&(*slot)->value);
+            if (event->kind != KSD_STATE_SNAPSHOT_ITEM) event->kind = KSD_STATE_CREATE;
+        } else if (event->kind != KSD_STATE_SNAPSHOT_ITEM) {
+            ksd_window_record *old = &(*slot)->value;
+            uint32_t changed = old->flags ^ event->window.flags;
+            if ((changed & KSD_WINDOW_VISIBLE) != 0u) event->kind = (event->window.flags & KSD_WINDOW_VISIBLE) != 0u ? KSD_STATE_SHOW : KSD_STATE_HIDE;
+            else if ((changed & KSD_WINDOW_ACTIVE) != 0u) event->kind = KSD_STATE_ACTIVE;
+            else if (memcmp(&old->frame_x, &event->window.frame_x, 48u) != 0) event->kind = KSD_STATE_GEOMETRY;
+            else if (old->title.length != event->window.title.length || (old->title.length != 0u && memcmp(old->title.data, event->window.title.data, old->title.length) != 0)) event->kind = KSD_STATE_TITLE;
+            else event->kind = KSD_STATE_CHANGED;
+        }
+        ksd_window_record_clear(&(*slot)->value);
+        if (!ksd_state_window_copy(&(*slot)->value, &event->window)) return false;
+    }
+    if (event->kind != KSD_STATE_SNAPSHOT_ITEM) lease->sequences[0]++;
+    bool ok = lease_emit(lease, event); pthread_cond_broadcast(&lease->changed); return ok;
+}
+
+static bool state_source_event(authority_session *session, const ksd_frame *frame)
+{
+    if (!session_refresh(session, true, true, NULL)) return false;
+    if (frame->flags == KSD_FLAG_RESPONSE) return true;
+    if (frame->flags != KSD_FLAG_EVENT) return false;
+    ksd_state_event event; ksd_state_event_init(&event);
+    if (frame->opcode == KSD_OP_STATE_EVENT) {
+        if (!ksd_state_event_decode(frame->payload, frame->payload_length, &event)) return false;
+    } else if (frame->opcode == KSD_OP_WINDOW_EVENT) {
+        if (frame->payload_length < 8u || ksd_decode_u32(frame->payload + 4u) != frame->payload_length - 8u
+            || !ksd_state_window_json(frame->payload + 8u, frame->payload_length - 8u, &event.window)) return false;
+        event.domain = KSD_STATE_WINDOWS;
+        event.kind = ksd_decode_u16(frame->payload) == KSD_WINDOW_EVENT_CLOSE ? KSD_STATE_DESTROY : KSD_STATE_CHANGED;
+    } else if (frame->opcode == KSD_OP_CLIPBOARD_EVENT) {
+        ksd_cursor cursor; ksd_cursor_init(&cursor, frame->payload, frame->payload_length);
+        uint32_t length, count; const uint8_t *text;
+        if (!ksd_cursor_u32(&cursor, &length) || !ksd_cursor_u32(&cursor, &count) || !ksd_cursor_bytes(&cursor, length, &text)) return false;
+        ksd_buffer json; ksd_buffer_init(&json, KSD_MAX_TEXT_BYTES);
+        bool ok = ksd_buffer_bytes(&json, "{\"text\":", 8u) && ksd_buffer_json_string(&json, (const char *)text, length, false)
+            && ksd_buffer_bytes(&json, ",\"mimetypes\":[", 14u);
+        for (uint32_t i = 0u; ok && i < count; i++) {
+            ok = ksd_cursor_u32(&cursor, &length) && ksd_cursor_bytes(&cursor, length, &text)
+                && (i == 0u || ksd_buffer_bytes(&json, ",", 1u)) && ksd_buffer_json_string(&json, (const char *)text, length, false);
+        }
+        ok = ok && ksd_cursor_finished(&cursor) && ksd_buffer_bytes(&json, "]}", 2u);
+        if (!ok) { ksd_buffer_clear(&json); return false; }
+        event.domain = KSD_STATE_CLIPBOARD; event.kind = KSD_STATE_CHANGED;
+        event.data.data = (char *)json.data; event.data.length = json.length;
+    } else return false;
+    authority_lease *lease = session->lease;
+    pthread_mutex_lock(&lease->mutex);
+    bool enabled = (lease->domains & event.domain) != 0u;
+    if (event.domain == KSD_STATE_WINDOWS) enabled = enabled && (lease->granted_scopes & KSD_SCOPE_WINDOW_MONITORING) != 0u;
+    if (event.domain == KSD_STATE_CLIPBOARD) enabled = enabled && (lease->granted_scopes & KSD_SCOPE_CLIPBOARD_MONITORING) != 0u;
+    bool ok = true;
+    if (enabled) {
+        if (event.domain == KSD_STATE_WINDOWS) ok = state_window_apply(lease, &event);
+        else {
+            if (event.kind != KSD_STATE_SNAPSHOT_BEGIN && event.kind != KSD_STATE_SNAPSHOT_ITEM && event.kind != KSD_STATE_SNAPSHOT_END)
+                lease->sequences[domain_index(event.domain)]++;
+            ok = lease_emit(lease, &event);
+        }
+    }
+    pthread_mutex_unlock(&lease->mutex); ksd_state_event_clear(&event); return ok;
+}
+
+static bool handle_state_subscribe(authority_session *session, const ksd_frame *request)
+{
+    if (session->role != KSD_ROLE_AUTHORIZATION_LEASE || request->payload_length != 4u)
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST, 0u, "state subscriptions require a lease", NULL, 0u, false);
+    uint32_t domains = ksd_decode_u32(request->payload);
+    if ((domains & ~KSD_STATE_ALL) != 0u || !session_refresh(session, true, true, NULL)) return false;
+    if (((domains & KSD_STATE_WINDOWS) != 0u && (session->granted_scopes & KSD_SCOPE_WINDOW_MONITORING) == 0u)
+        || ((domains & KSD_STATE_CLIPBOARD) != 0u && (session->granted_scopes & KSD_SCOPE_CLIPBOARD_MONITORING) == 0u))
+        return forward_response(session, request, KSD_STATUS_DENIED, 0u, "state domain permission is not granted", NULL, 0u, false);
+    pthread_mutex_lock(&session->lease->mutex);
+    session->lease->domains = domains;
+    session->lease->snapshot_pending = (domains & KSD_STATE_WINDOWS) != 0u;
+    pthread_mutex_unlock(&session->lease->mutex);
+    for (unsigned lane = 0u; lane < 3u; lane++) state_source_stop(session, lane);
+    bool native = watch_uses_display_worker(session->backend);
+    bool ok = (domains & (KSD_STATE_WINDOWS | (native ? KSD_STATE_KEYBOARD | KSD_STATE_DISPLAYS : 0u))) == 0u
+        || state_source_start(session, 0u);
+    if (ok && !native && (domains & (KSD_STATE_KEYBOARD | KSD_STATE_DISPLAYS)) != 0u) ok = state_source_start(session, 2u);
+    if (ok && (domains & KSD_STATE_CLIPBOARD) != 0u) ok = state_source_start(session, 1u);
+    if (!forward_response(session, request, ok ? KSD_STATUS_OK : KSD_STATUS_UNAVAILABLE, 0u,
+        ok ? NULL : "desktop push state is unavailable", NULL, 0u, false)) return false;
+    if ((domains & KSD_STATE_GRANTS) != 0u) {
+        ksd_state_event event; ksd_state_event_init(&event); event.domain = KSD_STATE_GRANTS;
+        pthread_mutex_lock(&session->lease->mutex);
+        event.granted_scopes = session->lease->granted_scopes;
+        event.kind = KSD_STATE_SNAPSHOT_BEGIN; ok = lease_emit(session->lease, &event) && ok;
+        event.kind = KSD_STATE_SNAPSHOT_ITEM; ok = lease_emit(session->lease, &event) && ok;
+        event.kind = KSD_STATE_SNAPSHOT_END; ok = lease_emit(session->lease, &event) && ok;
+        pthread_mutex_unlock(&session->lease->mutex);
+    }
+    return ok;
 }
 
 static bool reserve_kwin_slot(authority_state *state, pid_t pid)
@@ -1760,6 +2186,127 @@ static void release_assembly_memory(authority_state *state, uid_t uid)
     pthread_mutex_unlock(&state->mutex);
 }
 
+static bool operation_observed(authority_lease *lease, const ksd_frame *request,
+                               const ksd_window_record *before)
+{
+    if (lease->snapshot_pending) return false;
+    if (request->payload_length < 8u) return true;
+    state_window *item = *window_slot(lease, ksd_decode_u64(request->payload));
+    if (request->opcode == KSD_OP_WINDOW_CLOSE || request->opcode == KSD_OP_WINDOW_KILL) return item == NULL;
+    if (item == NULL) return false;
+    ksd_window_record *window = &item->value;
+    switch (request->opcode) {
+        case KSD_OP_WINDOW_RAISE:
+        case KSD_OP_WINDOW_LOWER: {
+            uint64_t edge = window->stacking_order;
+            for (state_window *other = lease->windows; other != NULL; other = other->next) {
+                if (request->opcode == KSD_OP_WINDOW_RAISE && other->value.stacking_order > edge) edge = other->value.stacking_order;
+                if (request->opcode == KSD_OP_WINDOW_LOWER && other->value.stacking_order < edge) edge = other->value.stacking_order;
+            }
+            return window->stacking_order == edge || (before != NULL && before->stacking_order != window->stacking_order);
+        }
+        case KSD_OP_WINDOW_FOCUS:
+            return (window->valid_fields & KSD_FIELD_ACTIVE) != 0u && (window->flags & KSD_WINDOW_ACTIVE) != 0u;
+        case KSD_OP_WINDOW_MOVE_RESIZE:
+        case KSD_OP_WINDOW_MOVE_RESIZE_XID:
+            if (request->payload_length < 24u || (window->valid_fields & KSD_FIELD_FRAME) == 0u) return false;
+            return (before != NULL && (before->valid_fields & KSD_FIELD_FRAME) != 0u
+                    && memcmp(&before->frame_x, &window->frame_x, 16u) != 0)
+                || (((int32_t)ksd_decode_u32(request->payload + 8u) == INT32_MIN || window->frame_x == (int32_t)ksd_decode_u32(request->payload + 8u))
+                    && ((int32_t)ksd_decode_u32(request->payload + 12u) == INT32_MIN || window->frame_y == (int32_t)ksd_decode_u32(request->payload + 12u))
+                    && (ksd_decode_u32(request->payload + 16u) == 0u || window->frame_width == ksd_decode_u32(request->payload + 16u))
+                    && (ksd_decode_u32(request->payload + 20u) == 0u || window->frame_height == ksd_decode_u32(request->payload + 20u)));
+        case KSD_OP_WINDOW_SET_TITLE: {
+            if (request->payload_length < 12u || (window->valid_fields & KSD_FIELD_TITLE) == 0u) return false;
+            uint32_t length = ksd_decode_u32(request->payload + 8u);
+            return length == window->title.length && length == request->payload_length - 12u
+                && (length == 0u || memcmp(window->title.data, request->payload + 12u, length) == 0);
+        }
+        case KSD_OP_WINDOW_SET_VISIBLE:
+            return request->payload_length >= 12u && (window->valid_fields & KSD_FIELD_VISIBLE) != 0u
+                && ((window->flags & KSD_WINDOW_VISIBLE) != 0u) == (ksd_decode_u32(request->payload + 8u) != 0u);
+        case KSD_OP_WINDOW_SET_ABOVE:
+            return request->payload_length >= 12u && (window->valid_fields & KSD_FIELD_ABOVE) != 0u
+                && ((window->flags & KSD_WINDOW_ABOVE) != 0u) == (ksd_decode_u32(request->payload + 8u) != 0u);
+        case KSD_OP_WINDOW_SET_DECORATED:
+            return request->payload_length >= 12u && (window->valid_fields & KSD_FIELD_DECORATED) != 0u
+                && ((window->flags & KSD_WINDOW_DECORATED) != 0u) == (ksd_decode_u32(request->payload + 8u) != 0u);
+        case KSD_OP_WINDOW_SET_OPACITY:
+            return request->payload_length >= 12u && (window->valid_fields & KSD_FIELD_TRANSPARENCY) != 0u
+                && window->transparency == ksd_decode_u32(request->payload + 8u);
+        case KSD_OP_WINDOW_SET_STATE: {
+            if (request->payload_length < 12u) return false;
+            uint32_t state = ksd_decode_u32(request->payload + 8u);
+            uint64_t fields = state == KSD_WINDOW_STATE_MINIMIZED || state == KSD_WINDOW_STATE_UNMINIMIZED
+                ? KSD_FIELD_MINIMIZED : state == KSD_WINDOW_STATE_MAXIMIZED ? KSD_FIELD_MAXIMIZED
+                : KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED;
+            if ((window->valid_fields & fields) != fields) return false;
+            return state == KSD_WINDOW_STATE_MINIMIZED ? (window->flags & KSD_WINDOW_MINIMIZED) != 0u
+                : state == KSD_WINDOW_STATE_MAXIMIZED ? (window->flags & KSD_WINDOW_MAXIMIZED) != 0u
+                : state == KSD_WINDOW_STATE_UNMINIMIZED ? (window->flags & KSD_WINDOW_MINIMIZED) == 0u
+                : (window->flags & (KSD_WINDOW_MINIMIZED | KSD_WINDOW_MAXIMIZED)) == 0u;
+        }
+        default: return true;
+    }
+}
+
+static bool operation_sync(authority_session *session, const ksd_frame *request,
+                           const ksd_window_record *before)
+{
+    authority_lease *lease = session->lease;
+    if (lease == NULL) return false;
+    struct timespec deadline; clock_gettime(CLOCK_MONOTONIC, &deadline); deadline.tv_sec += 2;
+    pthread_mutex_lock(&lease->mutex);
+    /* Hyprland exposes no explicit restacking state; sequence zero claims no observation fence. */
+    bool monitoring = (lease->domains & KSD_STATE_WINDOWS) != 0u
+        && !(session->backend == KSD_BACKEND_GENERIC
+            && (request->opcode == KSD_OP_WINDOW_RAISE || request->opcode == KSD_OP_WINDOW_LOWER));
+    int result = 0;
+    while (monitoring && lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
+        && !operation_observed(lease, request, before) && result == 0)
+        result = pthread_cond_timedwait(&lease->changed, &lease->mutex, &deadline);
+    bool ok = lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
+        && (!monitoring || operation_observed(lease, request, before));
+    session->effective_sequence = monitoring && ok ? lease->sequences[0] : 0u;
+    pthread_mutex_unlock(&lease->mutex); return ok;
+}
+
+static ksd_status x11_observe_window(authority_session *session, const backend_snapshot *backend,
+                                      uint64_t handle, ksd_window_record *window, bool *child)
+{
+    ksd_kwin_relay *display = display_relay_for(session->state, &session->identity,
+        session->gid, backend->identity.pid, session->backend, false);
+    if (display == NULL) return KSD_STATUS_UNAVAILABLE;
+    uint8_t payload[8]; ksd_encode_u64(payload, handle);
+    ksd_frame query = { .opcode = KSD_OP_WINDOW_QUERY, .request_id = 1u,
+        .payload = payload, .payload_length = sizeof(payload) };
+    ksd_operation_result result; ksd_result_init(&result);
+    (void)ksd_kwin_relay_call(display, &query, ksd_monotonic_milliseconds() + KSD_DISPLAY_DEADLINE_MS, &result);
+    ksd_kwin_relay_release(display);
+    ksd_status status = result.status;
+    if (status == KSD_STATUS_OK) {
+        if (result.tail_length < 4u || !ksd_state_window_json(result.tail + 4u, result.tail_length - 4u, window))
+            status = KSD_STATUS_INTERNAL;
+        else if (child != NULL) *child = ksd_state_window_is_child_json(result.tail + 4u, result.tail_length - 4u);
+    }
+    ksd_result_clear(&result); return status;
+}
+
+static bool x11_child_sync(authority_session *session, const backend_snapshot *backend,
+                           const ksd_frame *request, const ksd_window_record *before)
+{
+    ksd_window_record observed; ksd_window_record_init(&observed);
+    ksd_status status = x11_observe_window(session, backend, before->handle, &observed, NULL);
+    bool destroy = request->opcode == KSD_OP_WINDOW_CLOSE || request->opcode == KSD_OP_WINDOW_KILL;
+    state_window item = { .value = observed };
+    authority_lease view = { .windows = status == KSD_STATUS_OK ? &item : NULL };
+    bool ok = destroy ? status == KSD_STATUS_NOT_FOUND
+        : status == KSD_STATUS_OK && operation_observed(&view, request, before);
+    ksd_window_record_clear(&observed);
+    session->effective_sequence = 0u;
+    return ok;
+}
+
 static bool execute_operation(authority_session *session,
                               const ksd_frame *request)
 {
@@ -1781,9 +2328,7 @@ static bool execute_operation(authority_session *session,
         return forward_response(session, request, KSD_STATUS_INTERNAL, 0u,
                                 "operation carries no permission scope",
                                 NULL, 0u, false);
-    if (scope == 0u ? !session_identity_refresh(session)
-                    : !session_refresh(session, true, true,
-                                       &generation_changed))
+    if (!session_refresh(session, true, true, &generation_changed))
         return false;
     if (scope != 0u && (session->granted_scopes & scope) != scope)
         return forward_response(session, request, KSD_STATUS_DENIED, 0u,
@@ -1809,21 +2354,10 @@ static bool execute_operation(authority_session *session,
                                 "operation is unavailable on this backend",
                                 NULL, 0u, false);
     }
-    if (request->opcode == KSD_OP_WINDOW_WATCH
-        || request->opcode == KSD_OP_CLIPBOARD_WATCH) {
-        bool ok;
-
-        if (!watch_uses_display_worker(session->backend)
-            && !backend_snapshot_provider_valid(&backend)) {
-            release_backend_snapshot(&backend);
-            return forward_response(session, request,
-                                    KSD_STATUS_UNAVAILABLE, 0u,
-                                    "compositor provider is unavailable",
-                                    NULL, 0u, false);
-        }
-        ok = start_watch(session, request, scope, &backend);
+    if (request->opcode == KSD_OP_WINDOW_WATCH || request->opcode == KSD_OP_CLIPBOARD_WATCH) {
         release_backend_snapshot(&backend);
-        return ok;
+        return forward_response(session, request, KSD_STATUS_INVALID_REQUEST, 0u,
+            "subscribe to state on the lease connection", NULL, 0u, false);
     }
     if (session->role != KSD_ROLE_RPC) {
         release_backend_snapshot(&backend);
@@ -1860,6 +2394,18 @@ static bool execute_operation(authority_session *session,
                                 NULL, 0u, false);
     }
     uint64_t before = session->generation;
+    ksd_window_record prior; ksd_window_record_init(&prior);
+    bool have_prior = false, child_target = false;
+    if (ksd_state_mutates_windows(request->opcode) && session->lease != NULL && request->payload_length >= 8u) {
+        pthread_mutex_lock(&session->lease->mutex);
+        state_window *item = *window_slot(session->lease, ksd_decode_u64(request->payload));
+        if (item != NULL) have_prior = ksd_state_window_copy(&prior, &item->value);
+        pthread_mutex_unlock(&session->lease->mutex);
+    }
+    if (!have_prior && session->backend == KSD_BACKEND_X11 && ksd_state_mutates_windows(request->opcode)
+        && request->payload_length >= 8u) {
+        have_prior = x11_observe_window(session, &backend, ksd_decode_u64(request->payload), &prior, &child_target) == KSD_STATUS_OK;
+    }
     ksd_operation_result result;
     ksd_result_init(&result);
     /* Three routes. KWin capture, every X11 verb, and every generic Wayland
@@ -1919,12 +2465,22 @@ static bool execute_operation(authority_session *session,
             ksd_result_error(&result, KSD_STATUS_UNAVAILABLE, 0u,
                              "compositor provider is unavailable");
     }
-    bool valid = scope == 0u
-        ? session_identity_refresh(session)
-        : session_refresh(session, true, true, &generation_changed)
-            && !generation_changed && session->generation == before
-            && (session->granted_scopes & scope) == scope;
+    bool valid = session_refresh(session, true, true, &generation_changed)
+        && (scope == 0u || (!generation_changed && session->generation == before
+            && (session->granted_scopes & scope) == scope));
     valid = valid && backend_snapshot_current(session->state, &backend);
+    if (valid && result.status == KSD_STATUS_OK && ksd_state_mutates_windows(request->opcode)) {
+        bool observed = child_target ? x11_child_sync(session, &backend, request, &prior)
+            : operation_sync(session, request, have_prior ? &prior : NULL);
+        if (!observed) {
+            pthread_mutex_lock(&session->lease->mutex);
+            valid = session->lease->active && (session->lease->granted_scopes & scope) == scope;
+            pthread_mutex_unlock(&session->lease->mutex);
+            if (valid) ksd_result_error(&result, KSD_STATUS_TIMEOUT, 0u,
+                "compositor state did not acknowledge the window operation within 2 seconds");
+        }
+    }
+    ksd_window_record_clear(&prior);
     bool ok;
     if (!valid)
         ok = forward_response(session, request,
@@ -1954,7 +2510,7 @@ static bool execute_operation(authority_session *session,
 static bool handle_public_request(authority_session *session,
                                   const ksd_frame *request)
 {
-    if (!ksd_frame_is_request(request))
+    if (!ksd_frame_is_request(request) || !session_identity_refresh(session))
         return false;
     if (request->opcode == KSD_OP_PING) {
         if (request->payload_length != 0u)
@@ -1976,6 +2532,8 @@ static bool handle_public_request(authority_session *session,
                                 NULL, 0u, false);
     if (request->opcode == KSD_OP_AUTHORIZE)
         return handle_authorize(session, request);
+    if (request->opcode == KSD_OP_STATE_SUBSCRIBE)
+        return handle_state_subscribe(session, request);
     if (request->opcode == KSD_OP_PERMISSIONS_LIST) {
         if (session->role != KSD_ROLE_RPC)
             return forward_response(session, request,
@@ -2059,10 +2617,9 @@ static bool handle_public_frame(authority_session *session,
 }
 
 static bool parse_hello(const ksd_frame *request, uint16_t *role,
-                        uint16_t *auth_mode, uint32_t *scopes)
+                        uint16_t *auth_mode, uint32_t *scopes, uint64_t *lease_id)
 {
     ksd_cursor cursor;
-    uint64_t reserved;
 
     ksd_cursor_init(&cursor, request->payload, request->payload_length);
     return request->opcode == KSD_OP_HELLO && request->flags == 0u
@@ -2070,10 +2627,9 @@ static bool parse_hello(const ksd_frame *request, uint16_t *role,
         && ksd_cursor_u16(&cursor, role)
         && ksd_cursor_u16(&cursor, auth_mode)
         && ksd_cursor_u32(&cursor, scopes)
-        && ksd_cursor_u64(&cursor, &reserved)
-        && ksd_cursor_finished(&cursor) && reserved == 0u
-        && (*role == KSD_ROLE_RPC || *role == KSD_ROLE_EVENT_STREAM
-            || *role == KSD_ROLE_AUTHORIZATION_LEASE)
+        && ksd_cursor_u64(&cursor, lease_id)
+        && ksd_cursor_finished(&cursor)
+        && (*role == KSD_ROLE_RPC || *role == KSD_ROLE_AUTHORIZATION_LEASE)
         && (*auth_mode == KSD_AUTH_CHECK || *auth_mode == KSD_AUTH_REQUEST)
         && (*scopes & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) == 0u;
 }
@@ -2097,15 +2653,16 @@ static bool start_public_session(authority_session *session)
     uint16_t auth_mode;
     uint32_t scopes;
     uint32_t granted = 0u;
+    uint64_t lease_id = 0u;
     uint32_t status = KSD_STATUS_INVALID_REQUEST;
-    uint8_t tail[24] = { 0 };
+    uint8_t tail[32] = { 0 };
 
     int received = ksd_frame_read(session->client_fd, public_magic,
         KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_MAX_REQUEST_PAYLOAD,
         true, &hello);
     if (received != 1)
         return false;
-    if (!parse_hello(&hello, &role, &auth_mode, &scopes)) {
+    if (!parse_hello(&hello, &role, &auth_mode, &scopes, &lease_id)) {
         bool replied = hello.request_id != 0u
             && forward_response(session, &hello, KSD_STATUS_INVALID_REQUEST,
                 0u, "HELLO must be first", NULL, 0u, false);
@@ -2115,8 +2672,19 @@ static bool start_public_session(authority_session *session)
     }
     session->role = role;
     status = KSD_STATUS_OK;
-    if (scopes != 0u)
-        status = authorize_scopes(session, scopes, auth_mode, &granted);
+    if (role == KSD_ROLE_AUTHORIZATION_LEASE) {
+        if (lease_id != 0u || ksp_identity_capture(session->peer.pid, session->peer.uid, &session->identity) != 0)
+            status = KSD_STATUS_DENIED;
+        if (status == KSD_STATUS_OK && scopes != 0u)
+            status = authorize_scopes(session, scopes, auth_mode, &granted);
+        if (status == KSD_STATUS_OK && (session->lease = lease_create(session)) == NULL)
+            status = KSD_STATUS_RESOURCE_EXHAUSTED;
+    } else {
+        session->lease = lease_bind(session->state, lease_id, &session->peer);
+        if (session->lease == NULL || scopes != 0u || auth_mode != KSD_AUTH_CHECK)
+            status = KSD_STATUS_DENIED;
+        else if (!session_refresh(session, true, false, NULL)) status = KSD_STATUS_REVOKED;
+    }
     bool replied;
     if (status == KSD_STATUS_OK) {
         ksd_encode_u32(tail, session->granted_scopes);
@@ -2125,6 +2693,7 @@ static bool start_public_session(authority_session *session)
                                              session->identity.uid,
                                              session->backend));
         ksd_encode_u32(tail + 16u, session->backend);
+        ksd_encode_u64(tail + 24u, session->lease->id);
         replied = forward_response(session, &hello, KSD_STATUS_OK, 0u,
                                    NULL, tail, sizeof(tail), false);
     } else {
@@ -2143,22 +2712,27 @@ static void handle_public_connection(authority_state *state, int descriptor,
         .state = state,
         .client_fd = descriptor,
         .gid = peer->gid,
+        .peer = *peer,
+        .source_fd = { -1, -1, -1 },
     };
-    if (peer->uid == 0u
-        || ksp_identity_capture(peer->pid, peer->uid, &session.identity) != 0)
+    if (peer->uid == 0u)
         return;
     session.identity_checked_at = monotonic_seconds();
     session.backend = registered_backend(state, peer->uid);
-    if (!start_public_session(&session))
+    if (!start_public_session(&session)) {
+        lease_release(state, session.lease);
         return;
+    }
     session.descriptor = descriptor;
     ksd_request_assembly_init(&session.assembly);
     for (;;) {
-        struct pollfd item = {
-            .fd = descriptor,
-            .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR,
+        struct pollfd items[4] = {
+            { .fd = descriptor, .events = POLLIN | POLLRDHUP | POLLHUP | POLLERR },
+            { .fd = session.source_fd[0], .events = POLLIN | POLLHUP | POLLERR },
+            { .fd = session.source_fd[1], .events = POLLIN | POLLHUP | POLLERR },
+            { .fd = session.source_fd[2], .events = POLLIN | POLLHUP | POLLERR },
         };
-        int ready = poll(&item, 1u, KSD_GENERATION_POLL_MS);
+        int ready = poll(items, 4u, KSD_GENERATION_POLL_MS);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0)
@@ -2173,7 +2747,28 @@ static void handle_public_connection(authority_state *state, int descriptor,
                 break;
             continue;
         }
-        if ((item.revents & POLLIN) != 0) {
+        bool source_ok = true;
+        for (unsigned lane = 0u; lane < 3u; lane++) {
+            if (items[lane + 1u].revents == 0) continue;
+            ksd_frame event;
+            int received = ksd_frame_read(session.source_fd[lane], public_magic, KSD_PROTOCOL_MAJOR,
+                KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES + 256u, true, &event);
+            if (received == 1) { source_ok = state_source_event(&session, &event) && source_ok; ksd_frame_clear(&event); }
+            else {
+                state_source_stop(&session, lane);
+                ksd_state_event reset; ksd_state_event_init(&reset); reset.kind = KSD_STATE_RESET;
+                pthread_mutex_lock(&session.lease->mutex);
+                for (uint32_t domain = 1u; domain <= KSD_STATE_CLIPBOARD; domain <<= 1u) {
+                    if ((session.lease->domains & domain) == 0u || (lane == 1u) != (domain == KSD_STATE_CLIPBOARD)
+                        || (lane == 2u && domain == KSD_STATE_WINDOWS)) continue;
+                    reset.domain = domain; session.lease->sequences[domain_index(domain)]++;
+                    source_ok = lease_emit(session.lease, &reset) && source_ok;
+                }
+                pthread_mutex_unlock(&session.lease->mutex);
+            }
+        }
+        if (!source_ok) break;
+        if ((items[0].revents & POLLIN) != 0) {
             ksd_frame request;
             int received = ksd_frame_read(descriptor, public_magic,
                 KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
@@ -2185,14 +2780,21 @@ static void handle_public_connection(authority_state *state, int descriptor,
             if (!ok)
                 break;
         }
-        if ((item.revents
+        if ((items[0].revents
              & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0)
             break;
     }
+    for (unsigned lane = 0u; lane < 3u; lane++) state_source_stop(&session, lane);
     if (ksd_request_assembly_active(&session.assembly)) {
         end_assembly(&session);
         release_assembly_memory(state, session.identity.uid);
     }
+    if (session.role == KSD_ROLE_AUTHORIZATION_LEASE && session.lease != NULL) {
+        pthread_mutex_lock(&session.lease->mutex); session.lease->active = false;
+        session.lease->granted_scopes = 0u; pthread_cond_broadcast(&session.lease->changed);
+        pthread_mutex_unlock(&session.lease->mutex);
+    }
+    lease_release(state, session.lease);
 }
 
 static void *connection_worker(void *argument)
@@ -2417,6 +3019,145 @@ bool ksd_authority_test_display_lanes(void)
     return ok;
 }
 
+static bool test_state_delivery(int descriptor, uint32_t kind, uint64_t sequence)
+{
+    const uint8_t magic[4] = { 'K', 'S', 'D', 'P' };
+    ksd_frame frame; ksd_state_event event;
+    if (ksd_frame_read(descriptor, magic, KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
+        KSD_MAX_TEXT_BYTES, true, &frame) != 1) return false;
+    bool ok = frame.opcode == KSD_OP_STATE_EVENT && ksd_state_event_decode(frame.payload, frame.payload_length, &event);
+    if (ok) {
+        ok = event.kind == kind && event.sequence == sequence && event.epoch == 99u;
+        ksd_state_event_clear(&event);
+    }
+    ksd_frame_clear(&frame); return ok;
+}
+
+bool ksd_authority_test_state_model(void)
+{
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    struct timeval timeout = { .tv_sec = 1 };
+    setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    authority_lease lease = { .active = true, .client_fd = sockets[0], .epoch = 99u,
+        .domains = KSD_STATE_WINDOWS, .granted_scopes = KSD_SCOPE_WINDOW_CONTROL };
+    pthread_mutex_init(&lease.mutex, NULL); pthread_mutex_init(&lease.output_mutex, NULL);
+    if (!lease_condition_init(&lease.changed)) { close(sockets[0]); close(sockets[1]); return false; }
+    ksd_state_event event; ksd_state_event_init(&event); event.domain = KSD_STATE_WINDOWS;
+    event.kind = KSD_STATE_SNAPSHOT_BEGIN;
+    bool ok = state_window_apply(&lease, &event) && test_state_delivery(sockets[1], event.kind, 1u);
+    event.kind = KSD_STATE_SNAPSHOT_ITEM; event.window.handle = 42u;
+    event.window.valid_fields = KSD_FIELD_ID | KSD_FIELD_FRAME | KSD_FIELD_VISIBLE | KSD_FIELD_ACTIVE | KSD_FIELD_STACKING_ORDER;
+    event.window.flags = KSD_WINDOW_VISIBLE | KSD_WINDOW_ACTIVE; event.window.frame_width = 50u;
+    ok = ok && state_window_apply(&lease, &event) && lease.windows == NULL && test_state_delivery(sockets[1], event.kind, 1u);
+    event.kind = KSD_STATE_SNAPSHOT_END;
+    ok = ok && state_window_apply(&lease, &event) && lease.windows != NULL && test_state_delivery(sockets[1], event.kind, 1u);
+    uint8_t payload[24] = { 0 }; ksd_encode_u64(payload, 42u);
+    ksd_frame close_request = { .opcode = KSD_OP_WINDOW_CLOSE, .payload = payload, .payload_length = 8u };
+    ksd_frame restore = { .opcode = KSD_OP_WINDOW_SET_STATE, .payload = payload, .payload_length = 12u };
+    if (ok) {
+        ok = !operation_observed(&lease, &restore, NULL);
+        lease.windows->value.valid_fields |= KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED;
+        ok = ok && operation_observed(&lease, &restore, NULL);
+        lease.windows->value.valid_fields &= ~(KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED);
+    }
+    event.kind = KSD_STATE_SNAPSHOT_BEGIN;
+    ok = ok && state_window_apply(&lease, &event) && lease.windows != NULL
+        && !operation_observed(&lease, &close_request, NULL) && test_state_delivery(sockets[1], event.kind, 2u);
+    event.kind = KSD_STATE_SNAPSHOT_ITEM; event.window.flags = KSD_WINDOW_VISIBLE;
+    ok = ok && state_window_apply(&lease, &event) && !operation_observed(&lease, &close_request, NULL)
+        && test_state_delivery(sockets[1], event.kind, 2u);
+    event.kind = KSD_STATE_SNAPSHOT_END;
+    ok = ok && state_window_apply(&lease, &event) && !operation_observed(&lease, &close_request, NULL)
+        && test_state_delivery(sockets[1], event.kind, 2u);
+    event.kind = KSD_STATE_CHANGED; event.window.title.data = strdup("actual title"); event.window.title.length = 12u;
+    event.window.valid_fields |= KSD_FIELD_TITLE;
+    ok = ok && event.window.title.data != NULL && state_window_apply(&lease, &event) && test_state_delivery(sockets[1], KSD_STATE_TITLE, 3u);
+    event.kind = KSD_STATE_CHANGED; event.window.frame_x = 19;
+    ok = ok && state_window_apply(&lease, &event) && test_state_delivery(sockets[1], KSD_STATE_GEOMETRY, 4u);
+    event.kind = KSD_STATE_CHANGED; event.window.flags = 0u;
+    ok = ok && state_window_apply(&lease, &event) && test_state_delivery(sockets[1], KSD_STATE_HIDE, 5u);
+    event.kind = KSD_STATE_CHANGED; event.window.flags = KSD_WINDOW_VISIBLE | KSD_WINDOW_ACTIVE;
+    ok = ok && state_window_apply(&lease, &event) && test_state_delivery(sockets[1], KSD_STATE_SHOW, 6u);
+    event.kind = KSD_STATE_CHANGED; event.window.flags = KSD_WINDOW_VISIBLE;
+    ok = ok && state_window_apply(&lease, &event) && test_state_delivery(sockets[1], KSD_STATE_ACTIVE, 7u);
+    event.kind = KSD_STATE_DESTROY;
+    ok = ok && state_window_apply(&lease, &event) && operation_observed(&lease, &close_request, NULL)
+        && test_state_delivery(sockets[1], KSD_STATE_DESTROY, 8u);
+    ksd_state_event_clear(&event);
+    authority_session waiting = { .lease = &lease };
+    ksd_frame focus_request = { .opcode = KSD_OP_WINDOW_FOCUS, .payload = payload, .payload_length = 8u };
+    uint64_t started = ksd_monotonic_milliseconds();
+    ok = ok && !operation_sync(&waiting, &focus_request, NULL);
+    uint64_t elapsed = ksd_monotonic_milliseconds() - started;
+    ok = ok && elapsed >= 1500u && elapsed < 3000u;
+    waiting.backend = KSD_BACKEND_GENERIC;
+    focus_request.opcode = KSD_OP_WINDOW_RAISE;
+    ok = ok && operation_sync(&waiting, &focus_request, NULL) && waiting.effective_sequence == 0u;
+    setsockopt(sockets[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    uint8_t padding[4096] = { 0 };
+    while (send(sockets[0], padding, sizeof(padding), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}
+    ok = ok && (errno == EAGAIN || errno == EWOULDBLOCK);
+    authority_session blocked = { .lease = &lease, .client_fd = sockets[0], .role = KSD_ROLE_AUTHORIZATION_LEASE };
+    ksd_frame ping = { .opcode = KSD_OP_PING, .request_id = 1u };
+    started = ksd_monotonic_milliseconds();
+    ok = ok && !forward_response(&blocked, &ping, KSD_STATUS_OK, 0u, NULL, NULL, 0u, false);
+    ok = ok && ksd_monotonic_milliseconds() - started < 500u
+        && !lease.active && lease.granted_scopes == 0u;
+    pthread_mutex_destroy(&lease.mutex); pthread_mutex_destroy(&lease.output_mutex); pthread_cond_destroy(&lease.changed);
+    close(sockets[0]); close(sockets[1]); return ok;
+}
+
+bool ksd_authority_test_authorization_race(ksp_store *store)
+{
+    authority_state state = { .store = store, .mutex = PTHREAD_MUTEX_INITIALIZER };
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) return false;
+    struct timeval timeout = { .tv_sec = 1 };
+    setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    authority_session pending = { .state = &state, .client_fd = sockets[0] };
+    uint32_t scopes = KSP_SCOPE_WINDOW_MONITORING | KSP_SCOPE_WINDOW_CONTROL;
+    uint32_t granted = 0u; uint64_t generation;
+    bool ok = ksp_identity_capture(getpid(), getuid(), &pending.identity) == 0
+        && ksp_store_generation(store, getuid(), &generation) == 0
+        && ksp_store_grant_if_generation(store, &pending.identity, scopes, generation) == 0
+        && authorize_scopes(&pending, scopes, KSD_AUTH_CHECK, &granted) == KSD_STATUS_OK;
+    if (!ok || (pending.lease = lease_create(&pending)) == NULL) { close(sockets[0]); close(sockets[1]); return false; }
+    pending.lease->epoch = 99u;
+    struct ucred peer = { .pid = getpid(), .uid = getuid(), .gid = getgid() };
+    authority_session rpc = { .state = &state, .role = KSD_ROLE_RPC,
+        .lease = lease_bind(&state, pending.lease->id, &peer) };
+    ok = rpc.lease != NULL;
+    const uint32_t outcomes[] = { KSD_STATUS_DENIED, KSD_STATUS_CANCELLED, KSD_STATUS_UNAVAILABLE, KSD_STATUS_OK };
+    for (unsigned i = 0u; ok && i < sizeof(outcomes) / sizeof(outcomes[0]); i++) {
+        if (i != 0u) {
+            uint32_t restored = KSD_STATUS_OK;
+            ok = ksp_store_generation(store, getuid(), &generation) == 0
+                && ksp_store_grant_if_generation(store, &pending.identity, scopes, generation) == 0
+                && complete_authorization(&pending, scopes, &restored) && restored == KSD_STATUS_OK
+                && test_state_delivery(sockets[1], KSD_STATE_GRANT_CHANGED, pending.lease->sequences[4]);
+        }
+        uint64_t stale_generation = pending.generation;
+        ok = ok && ksp_store_revoke(store, getuid(), pending.identity.hash, KSP_SCOPE_WINDOW_CONTROL) == 0
+            && session_refresh(&rpc, true, true, NULL)
+            && test_state_delivery(sockets[1], KSD_STATE_GRANT_CHANGED, pending.lease->sequences[4]);
+        pending.granted_scopes = scopes; pending.generation = stale_generation;
+        uint32_t status = outcomes[i];
+        ok = ok && complete_authorization(&pending, scopes, &status)
+            && pending.lease->granted_scopes == KSP_SCOPE_WINDOW_MONITORING
+            && pending.granted_scopes == KSP_SCOPE_WINDOW_MONITORING
+            && rpc.lease->granted_scopes == KSP_SCOPE_WINDOW_MONITORING
+            && status == (outcomes[i] == KSD_STATUS_OK ? KSD_STATUS_REVOKED : outcomes[i]);
+        struct pollfd idle = { .fd = sockets[1], .events = POLLIN };
+        ok = ok && poll(&idle, 1u, 0) == 0;
+    }
+    pending.lease->active = false;
+    ok = ok && !session_identity_refresh(&rpc);
+    lease_release(&state, rpc.lease); lease_release(&state, pending.lease);
+    ok = ksp_store_revoke(store, getuid(), pending.identity.hash, scopes) == 0 && ok;
+    close(sockets[0]); close(sockets[1]); pthread_mutex_destroy(&state.mutex); return ok;
+}
+
 bool ksd_authority_test_scope_cache(ksp_store *store)
 {
     authority_state state = { .store = store };
@@ -2465,7 +3206,16 @@ int ksd_authority_test_assembly_budget(unsigned int uid, int reserve)
 }
 
 
-int ksd_authority_test_generic_session(int descriptor,
+typedef struct test_lease_context { authority_state *state; int descriptor; const struct ucred *peer; } test_lease_context;
+
+static void *test_lease_run(void *data)
+{
+    test_lease_context *context = data;
+    handle_public_connection(context->state, context->descriptor, context->peer);
+    return NULL;
+}
+
+int ksd_authority_test_generic_session(int descriptor, int lease_descriptor,
                                        const struct ucred *peer,
                                        const char *persistent_directory,
                                        const char *runtime_directory)
@@ -2493,7 +3243,11 @@ int ksd_authority_test_generic_session(int descriptor,
     state.backends[0].descriptor = descriptor;
     state.backends[0].backend = KSD_BACKEND_GENERIC;
     state.backends[0].identity = identity;
+    test_lease_context lease = { .state = &state, .descriptor = lease_descriptor, .peer = peer };
+    pthread_t lease_thread;
+    if (pthread_create(&lease_thread, NULL, test_lease_run, &lease) != 0) return -1;
     handle_public_connection(&state, descriptor, peer);
+    pthread_join(lease_thread, NULL);
     ksp_store_destroy(state.store);
     pthread_mutex_destroy(&state.mutex);
     return 0;

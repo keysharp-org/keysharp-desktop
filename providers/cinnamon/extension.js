@@ -995,6 +995,8 @@ class KeysharpExtensionCore {
         this._providerConnections = new Map();
         this._vPointer = null;
         this._focusId      = null;
+        this._lastFocusedWindow = null;
+        this._restackedId = null;
         this._winCreatedId = null;
         this._mapId = 0;
         this._placements = [];
@@ -1072,12 +1074,18 @@ class KeysharpExtensionCore {
             }
         }
 
+        this._lastFocusedWindow = global.display.get_focus_window();
         this._focusId = global.display.connect('notify::focus-window', () => {
-            this._emitWindowEventRaw('active-state', this._getActiveWindow());
+            const previous = this._lastFocusedWindow;
             const win = global.display.get_focus_window();
-            if (win && this._isTrackedWindow(win))
+            this._lastFocusedWindow = win;
+            if (previous && previous !== win && this._isLiveWindow(previous) && this._isTrackedWindow(previous))
+                this._emitWindowEvent('active', previous);
+            if (win && this._isLiveWindow(win) && this._isTrackedWindow(win))
                 this._emitWindowEvent('active', win);
         });
+        this._restackedId = global.display.connect('restacked', () =>
+            this._emitWindowEventRaw('snapshot', this._getWindowList(true)));
 
         // The moment a reserved window can be placed WITHOUT a visible jump: 'map' fires as the actor is
         // about to be presented, before its first frame reaches the screen, so a move here is never seen.
@@ -1088,6 +1096,8 @@ class KeysharpExtensionCore {
 
                 if (win && win.__ksPlaceNow)
                     win.__ksPlaceNow();
+                if (win && this._isTrackedWindow(win))
+                    this._hookWindowVisibility(win);
             } catch (_e) {
             }
         });
@@ -1173,6 +1183,11 @@ class KeysharpExtensionCore {
                 this._unhookWindow(win);
         }
 
+        if (this._restackedId !== null) {
+            global.display.disconnect(this._restackedId);
+            this._restackedId = null;
+        }
+        this._lastFocusedWindow = null;
         if (this._focusId !== null) {
             global.display.disconnect(this._focusId);
             this._focusId = null;
@@ -1325,9 +1340,10 @@ class KeysharpExtensionCore {
                 const win = this._liveMetaWindow(actors[i]);
                 if (!win || !this._isTrackedWindow(win))
                     continue;
-                if (!includeHidden && win.minimized)
+                const snapshot = this._windowInfo(win);
+                if (!includeHidden && !snapshot.visible)
                     continue;
-                windows.push(this._windowInfo(win));
+                windows.push(snapshot);
             }
 
             return JSON.stringify({ok: true, windows});
@@ -2953,6 +2969,18 @@ class KeysharpExtensionCore {
             this._unhookWindow(win);
         }));
         win._keysharpHandlerIds = ids;
+        this._hookWindowVisibility(win);
+    }
+
+    _hookWindowVisibility(win) {
+        if (!win || win._keysharpVisibleActor)
+            return;
+        const actor = win.get_compositor_private();
+        if (!actor)
+            return;
+        win._keysharpVisibleActor = actor;
+        win._keysharpVisibleId = actor.connect('notify::visible', () =>
+            this._emitWindowEvent(actor.visible ? 'show' : 'hide', win));
     }
 
     _unhookWindow(win) {
@@ -2960,6 +2988,11 @@ class KeysharpExtensionCore {
             return;
         for (const id of (win._keysharpHandlerIds || [])) {
             try { win.disconnect(id); } catch (_e) {}
+        }
+        if (win._keysharpVisibleActor) {
+            try { win._keysharpVisibleActor.disconnect(win._keysharpVisibleId); } catch (_e) {}
+            win._keysharpVisibleActor = null;
+            win._keysharpVisibleId = 0;
         }
         win._keysharpHandlerIds = null;
         win._keysharpHooked = false;
@@ -3060,7 +3093,7 @@ class KeysharpExtensionCore {
             active: Boolean(win.appears_focused),
             minimized: Boolean(win.minimized),
             maximized: Boolean(win.maximized_horizontally && win.maximized_vertically),
-            visible: !win.minimized,
+            visible: !win.minimized && win.get_compositor_private()?.visible !== false,
             alwaysOnTop: alwaysOnTop,
             decorated: typeof win.decorated === 'boolean' ? win.decorated : true,
             transparency: this._windowOpacity(win),

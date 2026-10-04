@@ -5,6 +5,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#if defined(__cplusplus)
+#define KSD_ALIGN64 alignas(8)
+#else
+#define KSD_ALIGN64 _Alignas(8)
+#endif
+
 #if defined(_WIN32)
 #  if defined(KEYSHARP_DESKTOP_CLIENT_BUILD)
 #    define KSD_API __declspec(dllexport)
@@ -21,9 +27,9 @@
 extern "C" {
 #endif
 
-#define KSD_CLIENT_ABI_MAJOR 0u
+#define KSD_CLIENT_ABI_MAJOR 1u
 /* Unknown backend, operation and scope values are delivered verbatim. */
-#define KSD_CLIENT_ABI_MINOR 9u
+#define KSD_CLIENT_ABI_MINOR 0u
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
@@ -57,7 +63,6 @@ enum {
 typedef uint32_t ksd_connection_role;
 enum {
     KSD_ROLE_RPC = 0u,
-    KSD_ROLE_EVENT_STREAM = 1u,
     KSD_ROLE_AUTHORIZATION_LEASE = 3u,
 };
 
@@ -164,16 +169,6 @@ typedef uint16_t ksd_capture_format;
 #define KSD_CAPTURE_FORMAT_PNG 1u
 #define KSD_CAPTURE_FORMAT_BGRA8_PREMULTIPLIED 2u
 
-typedef uint16_t ksd_window_event_kind;
-#define KSD_WINDOW_EVENT_CREATE 1u
-#define KSD_WINDOW_EVENT_CLOSE 2u
-#define KSD_WINDOW_EVENT_ACTIVE 3u
-#define KSD_WINDOW_EVENT_TITLE 4u
-#define KSD_WINDOW_EVENT_MINIMIZE 5u
-#define KSD_WINDOW_EVENT_RESTORE 6u
-#define KSD_WINDOW_EVENT_MOVE 7u
-#define KSD_WINDOW_EVENT_ACTIVE_STATE 8u
-
 typedef struct ksd_connection ksd_connection;
 
 typedef struct ksd_error {
@@ -182,7 +177,7 @@ typedef struct ksd_error {
     int32_t system_error;
     uint32_t reserved0;
     char message[KSD_ERROR_MESSAGE_CAPACITY];
-    uint64_t reserved[4];
+    KSD_ALIGN64 uint64_t reserved[4];
 } ksd_error;
 
 typedef struct ksd_connect_options {
@@ -193,7 +188,8 @@ typedef struct ksd_connect_options {
     const char *socket_path;
     uint32_t timeout_ms;
     uint32_t flags;
-    uint64_t reserved[4];
+    KSD_ALIGN64 uint64_t lease_id;
+    KSD_ALIGN64 uint64_t reserved[3];
 } ksd_connect_options;
 
 typedef struct ksd_service_info {
@@ -201,10 +197,11 @@ typedef struct ksd_service_info {
     uint32_t abi_major;
     uint32_t abi_minor;
     uint32_t granted_scopes;
-    uint64_t available_operations;
+    KSD_ALIGN64 uint64_t available_operations;
     uint32_t backend;
     uint32_t reserved0;
-    uint64_t reserved[4];
+    KSD_ALIGN64 uint64_t lease_id;
+    KSD_ALIGN64 uint64_t reserved[3];
 } ksd_service_info;
 
 typedef struct ksd_bytes {
@@ -212,7 +209,7 @@ typedef struct ksd_bytes {
     uint32_t reserved0;
     uint8_t *data;
     size_t length;
-    uint64_t reserved[2];
+    KSD_ALIGN64 uint64_t reserved[2];
 } ksd_bytes;
 
 typedef struct ksd_string {
@@ -220,7 +217,7 @@ typedef struct ksd_string {
     uint32_t reserved0;
     char *data;
     size_t length;
-    uint64_t reserved[2];
+    KSD_ALIGN64 uint64_t reserved[2];
 } ksd_string;
 
 typedef struct ksd_string_list {
@@ -228,7 +225,7 @@ typedef struct ksd_string_list {
     uint32_t reserved0;
     ksd_string *items;
     size_t count;
-    uint64_t reserved[2];
+    KSD_ALIGN64 uint64_t reserved[2];
 } ksd_string_list;
 
 typedef struct ksd_capture {
@@ -247,7 +244,7 @@ typedef struct ksd_point {
     int32_t x;
     int32_t y;
     uint32_t reserved0;
-    uint64_t reserved[2];
+    KSD_ALIGN64 uint64_t reserved[2];
 } ksd_point;
 
 typedef struct ksd_rectangle {
@@ -257,17 +254,17 @@ typedef struct ksd_rectangle {
     uint32_t width;
     uint32_t height;
     uint32_t reserved0;
-    uint64_t reserved[2];
+    KSD_ALIGN64 uint64_t reserved[2];
 } ksd_rectangle;
 
 typedef struct ksd_permission_entry {
     uint32_t struct_size;
     uint32_t scopes;
-    uint64_t granted_at_utc;
+    KSD_ALIGN64 uint64_t granted_at_utc;
     char hash[KSD_PERMISSION_HASH_HEX_SIZE];
     char executable[KSD_EXECUTABLE_PATH_SIZE];
     uint8_t reserved[7];
-    uint64_t reserved64[4];
+    KSD_ALIGN64 uint64_t reserved64[4];
 } ksd_permission_entry;
 
 typedef bool (*ksd_permission_visitor)(
@@ -278,10 +275,10 @@ typedef struct ksd_permission_revoke {
     uint32_t target_kind;
     uint32_t scopes;
     uint32_t reserved0;
-    uint64_t pid;
+    KSD_ALIGN64 uint64_t pid;
     char hash[KSD_PERMISSION_HASH_HEX_SIZE];
     uint8_t reserved1[7];
-    uint64_t reserved[4];
+    KSD_ALIGN64 uint64_t reserved[4];
 } ksd_permission_revoke;
 
 typedef uint32_t ksd_permission_target_kind;
@@ -291,21 +288,104 @@ enum {
     KSD_PERMISSION_TARGET_ALL = 3u,
 };
 
-typedef struct ksd_window_event {
-    uint32_t struct_size;
-    uint16_t kind;
-    uint16_t reserved0;
-    ksd_string window_json;
-    uint32_t reserved[8];
-} ksd_window_event;
+#define KSD_STATE_WINDOWS 1u
+#define KSD_STATE_KEYBOARD 2u
+#define KSD_STATE_DISPLAYS 4u
+#define KSD_STATE_CLIPBOARD 8u
+#define KSD_STATE_GRANTS 16u
+#define KSD_STATE_ALL 31u
 
-typedef struct ksd_clipboard_event {
+#define KSD_STATE_SNAPSHOT_BEGIN 1u
+#define KSD_STATE_SNAPSHOT_ITEM 2u
+#define KSD_STATE_SNAPSHOT_END 3u
+#define KSD_STATE_CREATE 4u
+#define KSD_STATE_DESTROY 5u
+#define KSD_STATE_SHOW 6u
+#define KSD_STATE_HIDE 7u
+#define KSD_STATE_GEOMETRY 8u
+#define KSD_STATE_TITLE 9u
+#define KSD_STATE_ACTIVE 10u
+#define KSD_STATE_CHANGED 11u
+#define KSD_STATE_GRANT_CHANGED 12u
+#define KSD_STATE_RESET 13u
+
+#define KSD_WINDOW_VISIBLE 1u
+#define KSD_WINDOW_ACTIVE 2u
+#define KSD_WINDOW_MINIMIZED 4u
+#define KSD_WINDOW_MAXIMIZED 8u
+#define KSD_WINDOW_ABOVE 16u
+#define KSD_WINDOW_DECORATED 32u
+#define KSD_WINDOW_CURRENT_WORKSPACE 64u
+#define KSD_WINDOW_TOPLEVEL 128u
+
+#define KSD_FIELD_ID UINT64_C(1)
+#define KSD_FIELD_TITLE UINT64_C(2)
+#define KSD_FIELD_APP_ID UINT64_C(4)
+#define KSD_FIELD_PID UINT64_C(8)
+#define KSD_FIELD_FRAME UINT64_C(16)
+#define KSD_FIELD_CLIENT UINT64_C(32)
+#define KSD_FIELD_VISIBLE UINT64_C(64)
+#define KSD_FIELD_ACTIVE UINT64_C(128)
+#define KSD_FIELD_MINIMIZED UINT64_C(256)
+#define KSD_FIELD_MAXIMIZED UINT64_C(512)
+#define KSD_FIELD_ABOVE UINT64_C(1024)
+#define KSD_FIELD_DECORATED UINT64_C(2048)
+#define KSD_FIELD_TRANSPARENCY UINT64_C(4096)
+#define KSD_FIELD_CURRENT_WORKSPACE UINT64_C(8192)
+#define KSD_FIELD_CAPTURE_ID UINT64_C(16384)
+#define KSD_FIELD_PARENT UINT64_C(32768)
+#define KSD_FIELD_SURFACE UINT64_C(65536)
+#define KSD_FIELD_BUFFER UINT64_C(131072)
+#define KSD_FIELD_COMPOSITOR_ID UINT64_C(262144)
+#define KSD_FIELD_STACKING_ORDER UINT64_C(524288)
+
+typedef struct ksd_window_record {
     uint32_t struct_size;
+    uint32_t flags;
+    KSD_ALIGN64 uint64_t valid_fields;
+    KSD_ALIGN64 uint64_t handle;
+    KSD_ALIGN64 uint64_t parent;
+    uint32_t pid;
+    uint32_t transparency;
+    int32_t frame_x, frame_y;
+    uint32_t frame_width, frame_height;
+    int32_t client_x, client_y;
+    uint32_t client_width, client_height;
+    int32_t surface_x, surface_y;
+    uint32_t surface_width, surface_height;
+    uint32_t buffer_width, buffer_height;
+    ksd_string title, app_id, capture_id, compositor_id;
+    KSD_ALIGN64 uint64_t stacking_order;
+    KSD_ALIGN64 uint64_t reserved[1];
+} ksd_window_record;
+
+typedef struct ksd_state_event {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t domain;
     uint32_t reserved0;
-    ksd_string text;
-    ksd_string_list mimetypes;
-    uint32_t reserved[8];
-} ksd_clipboard_event;
+    KSD_ALIGN64 uint64_t epoch;
+    KSD_ALIGN64 uint64_t sequence;
+    ksd_window_record window;
+    ksd_string data;
+    uint32_t granted_scopes;
+    uint32_t revoked_scopes;
+    KSD_ALIGN64 uint64_t reserved[1];
+} ksd_state_event;
+
+/* A subscription replaces the domain mask in place and starts an atomic
+ * snapshot for each domain. Begin/items/end share one sequence. Deltas use
+ * consecutive per-domain sequences; a gap or changed epoch requires another
+ * subscription. Data is UTF-8 JSON for keyboard, displays and clipboard;
+ * window records never require a JSON parser. */
+KSD_API void ksd_window_record_init(ksd_window_record *window);
+KSD_API void ksd_window_record_clear(ksd_window_record *window);
+KSD_API void ksd_state_event_init(ksd_state_event *event);
+KSD_API void ksd_state_event_clear(ksd_state_event *event);
+KSD_API ksd_status ksd_state_subscribe(ksd_connection *connection,
+    uint32_t domains, ksd_error *error);
+KSD_API ksd_status ksd_state_next(ksd_connection *connection,
+    uint32_t timeout_ms, ksd_state_event *event, ksd_error *error);
 
 KSD_API uint32_t ksd_client_abi_major(void);
 KSD_API uint32_t ksd_client_abi_minor(void);
@@ -326,36 +406,30 @@ KSD_API void ksd_point_init(ksd_point *point);
 KSD_API void ksd_rectangle_init(ksd_rectangle *rectangle);
 KSD_API void ksd_permission_entry_init(ksd_permission_entry *entry);
 KSD_API void ksd_permission_revoke_init(ksd_permission_revoke *revoke);
-KSD_API void ksd_window_event_init(ksd_window_event *event);
-KSD_API void ksd_clipboard_event_init(ksd_clipboard_event *event);
 KSD_API void ksd_bytes_clear(ksd_bytes *bytes);
 KSD_API void ksd_string_clear(ksd_string *string);
 KSD_API void ksd_string_list_clear(ksd_string_list *list);
 KSD_API void ksd_capture_clear(ksd_capture *capture);
-KSD_API void ksd_window_event_clear(ksd_window_event *event);
-KSD_API void ksd_clipboard_event_clear(ksd_clipboard_event *event);
 
 KSD_API ksd_status ksd_connect(const ksd_connect_options *options,
                        ksd_connection **connection,
                        ksd_service_info *service_info, ksd_error *error);
 KSD_API void ksd_disconnect(ksd_connection *connection);
+/* Poll for POLLIN and error/hangup. Drain next(..., 0, ...) before polling:
+ * it consumes complete buffered records and never waits for missing bytes.
+ * The descriptor is borrowed, remains stable until disconnect, and must not
+ * be read, closed or used from a second thread. */
+KSD_API int ksd_connection_fd(const ksd_connection *connection);
+KSD_API uint64_t ksd_connection_lease_id(const ksd_connection *connection);
+KSD_API uint64_t ksd_connection_sequence(const ksd_connection *connection);
 KSD_API ksd_status ksd_authorize(ksd_connection *connection,
                          ksd_authorization_mode mode,
                          uint32_t requested_scopes, uint32_t *granted_scopes,
                          ksd_error *error);
 KSD_API ksd_status ksd_ping(ksd_connection *connection, ksd_error *error);
-KSD_API uint32_t ksd_connection_granted_scopes(
-    const ksd_connection *connection);
 KSD_API ksd_operations ksd_connection_available_operations(
     const ksd_connection *connection);
 KSD_API ksd_backend ksd_connection_backend(const ksd_connection *connection);
-KSD_API ksd_status ksd_lease_next(ksd_connection *connection,
-                          uint32_t timeout_ms,
-                          uint32_t *revoked_scopes, ksd_error *error);
-KSD_API uint32_t ksd_lease_granted_scopes(
-    const ksd_connection *connection);
-KSD_API ksd_status ksd_lease_refresh(ksd_connection *connection,
-                          uint32_t *granted_scopes, ksd_error *error);
 
 KSD_API ksd_status ksd_permissions_list(ksd_connection *connection,
                                 ksd_permission_visitor visitor,
@@ -521,18 +595,6 @@ KSD_API ksd_status ksd_mouse_scroll(ksd_connection *connection,
                             int32_t delta,
                             uint32_t vertical, ksd_error *error);
 
-KSD_API ksd_status ksd_window_watch_subscribe(ksd_connection *connection,
-                                      ksd_error *error);
-/* Polling timeouts must be from 1 through KSD_MAX_WATCH_TIMEOUT_MS. */
-KSD_API ksd_status ksd_window_watch_next(ksd_connection *connection,
-                                 uint32_t timeout_ms,
-                                 ksd_window_event *event, ksd_error *error);
-KSD_API ksd_status ksd_clipboard_watch_subscribe(ksd_connection *connection,
-                                         ksd_error *error);
-KSD_API ksd_status ksd_clipboard_watch_next(ksd_connection *connection,
-                                    uint32_t timeout_ms,
-                                    ksd_clipboard_event *event,
-                                    ksd_error *error);
 
 /* A connection is used by one thread at a time. Result and event buffers are
  * owned by the caller and released with the matching clear function. A

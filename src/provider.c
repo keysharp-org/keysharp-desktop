@@ -1,4 +1,6 @@
 #include "provider.h"
+#include "state_wire.h"
+#include <glib-unix.h>
 #include "provider_executable.h"
 
 #include "protocol.h"
@@ -19,7 +21,6 @@
 
 #define KSD_PROVIDER_TIMEOUT_MS 5000
 #define KSD_PROVIDER_CAPTURE_TIMEOUT_MS 30000
-#define KSD_PROVIDER_WATCH_POLL_MS 250u
 #define KSD_PROVIDER_OBJECT_PATH "/org/keysharp/DesktopProvider"
 #define KSD_PROVIDER_INTERFACE "org.keysharp.Desktop.Provider1"
 #define KSD_MAX_WINDOW_HANDLE_BYTES 128u
@@ -1228,6 +1229,9 @@ void ksd_provider_execute(uid_t uid, pid_t pid, pid_t provider_pid,
     invalid_request(result);
 }
 
+static bool snapshot_emit(watch_state *, uint32_t, uint32_t, ksd_window_record *);
+static bool snapshot_window(ksd_window_record *, void *);
+
 static uint16_t event_kind(const char *name)
 {
     if (strcmp(name, "create") == 0) return KSD_WINDOW_EVENT_CREATE;
@@ -1237,6 +1241,9 @@ static uint16_t event_kind(const char *name)
     if (strcmp(name, "minimize") == 0) return KSD_WINDOW_EVENT_MINIMIZE;
     if (strcmp(name, "restore") == 0) return KSD_WINDOW_EVENT_RESTORE;
     if (strcmp(name, "move") == 0) return KSD_WINDOW_EVENT_MOVE;
+    if (strcmp(name, "show") == 0) return KSD_WINDOW_EVENT_SHOW;
+    if (strcmp(name, "hide") == 0) return KSD_WINDOW_EVENT_HIDE;
+    if (strcmp(name, "changed") == 0) return KSD_WINDOW_EVENT_CHANGED;
     if (strcmp(name, "active-state") == 0)
         return KSD_WINDOW_EVENT_ACTIVE_STATE;
     return 0u;
@@ -1257,6 +1264,14 @@ static void window_event(GDBusConnection *connection, const gchar *sender,
     (void)interface;
     (void)signal;
     g_variant_get(parameters, "(&s&s)", &name, &json);
+    if (strcmp(name, "snapshot") == 0) {
+        size_t length = strlen(json);
+        bool ok = length <= KSD_MAX_TEXT_BYTES && snapshot_emit(watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_BEGIN, NULL)
+            && ksd_state_windows_json((const uint8_t *)json, length, snapshot_window, watch)
+            && snapshot_emit(watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_END, NULL);
+        if (!ok) watch->failed = true;
+        return;
+    }
     uint16_t kind = event_kind(name);
     size_t length = strlen(json);
     if (kind == 0u || length > KSD_MAX_TEXT_BYTES
@@ -1317,14 +1332,36 @@ static void clipboard_event(GDBusConnection *connection, const gchar *sender,
         watch->failed = true;
 }
 
-static gboolean watch_wakeup(gpointer user_data)
+static gboolean watch_wakeup(gint descriptor, GIOCondition condition, gpointer user_data)
 {
-    (void)user_data;
+    (void)descriptor; (void)condition; (void)user_data;
     return G_SOURCE_CONTINUE;
 }
 
+static void watch_closed(GDBusConnection *connection, gboolean vanished, GError *error, gpointer context)
+{
+    (void)connection; (void)vanished; (void)error;
+    g_main_context_wakeup(context);
+}
+
+static bool snapshot_emit(watch_state *watch, uint32_t domain, uint32_t kind, ksd_window_record *window)
+{
+    ksd_state_event event; ksd_state_event_init(&event);
+    event.kind = kind; event.domain = domain;
+    if (window != NULL) event.window = *window;
+    ksd_buffer bytes; ksd_buffer_init(&bytes, KSD_MAX_TEXT_BYTES + 256u);
+    bool ok = ksd_state_event_encode(&event, &bytes)
+        && watch->emit(KSD_OP_STATE_EVENT, bytes.data, (uint32_t)bytes.length, watch->user_data);
+    ksd_buffer_clear(&bytes); return ok;
+}
+
+static bool snapshot_window(ksd_window_record *window, void *context)
+{
+    return snapshot_emit(context, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_ITEM, window);
+}
+
 int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
-                       bool clipboard,
+                       bool clipboard, int cancel_fd,
                        ksd_provider_event_fn emit,
                        ksd_provider_cancel_fn cancelled,
                        void *user_data, char *diagnostic,
@@ -1335,6 +1372,7 @@ int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
     GDBusConnection *connection = NULL;
     GSource *timer = NULL;
     guint subscription = 0u;
+    gulong closed_id = 0u;
     watch_state watch = {
         .emit = emit,
         .user_data = user_data,
@@ -1357,11 +1395,25 @@ int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
         clipboard ? "ClipboardChanged" : "WindowEvent",
         KSD_PROVIDER_OBJECT_PATH, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
         clipboard ? clipboard_event : window_event, &watch, NULL);
-    timer = g_timeout_source_new(KSD_PROVIDER_WATCH_POLL_MS);
+    timer = g_unix_fd_source_new(cancel_fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
     if (subscription == 0u || timer == NULL)
         goto popped;
-    g_source_set_callback(timer, watch_wakeup, NULL, NULL);
+    g_source_set_callback(timer, (GSourceFunc)(void (*)(void))watch_wakeup, NULL, NULL);
     g_source_attach(timer, context);
+    closed_id = g_signal_connect(connection, "closed", G_CALLBACK(watch_closed), context);
+    if (!clipboard) {
+        uint8_t payload[8] = { 1u };
+        ksd_frame request = { .opcode = KSD_OP_WINDOW_LIST, .request_id = 1u, .payload = payload, .payload_length = sizeof(payload) };
+        ksd_operation_result snapshot; ksd_result_init(&snapshot);
+        ksd_provider_execute(uid, 0, provider_pid, backend, &request, &snapshot);
+        bool ok = snapshot.status == KSD_STATUS_OK && snapshot.tail_length >= 4u
+            && snapshot_emit(&watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_BEGIN, NULL)
+            && ksd_state_windows_json(snapshot.tail + 4u, snapshot.tail_length - 4u, snapshot_window, &watch)
+            && snapshot_emit(&watch, KSD_STATE_WINDOWS, KSD_STATE_SNAPSHOT_END, NULL);
+        ksd_result_clear(&snapshot);
+        if (!ok) goto popped;
+    } else if (!snapshot_emit(&watch, KSD_STATE_CLIPBOARD, KSD_STATE_SNAPSHOT_BEGIN, NULL)
+               || !snapshot_emit(&watch, KSD_STATE_CLIPBOARD, KSD_STATE_SNAPSHOT_END, NULL)) goto popped;
     while (!watch.failed && !cancelled(user_data)) {
         (void)g_main_context_iteration(context, TRUE);
         if (g_dbus_connection_is_closed(connection)) {
@@ -1372,6 +1424,7 @@ int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
     result = watch.failed ? -1 : 0;
 
 popped:
+    if (closed_id != 0u) g_signal_handler_disconnect(connection, closed_id);
     if (timer != NULL) {
         g_source_destroy(timer);
         g_source_unref(timer);

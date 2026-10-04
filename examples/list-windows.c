@@ -9,8 +9,8 @@ int main(int argc, char **argv)
     ksd_service_info info;
     ksd_error error;
     ksd_connection *connection = NULL;
+    ksd_connection *lease = NULL;
     ksd_string windows;
-    uint32_t granted = 0u;
     uint64_t target = 0u;
     uint32_t scopes = KSD_SCOPE_WINDOW_MONITORING;
 
@@ -33,22 +33,29 @@ int main(int argc, char **argv)
     ksd_service_info_init(&info);
     ksd_error_init(&error);
     ksd_string_init(&windows);
+    options.role = KSD_ROLE_AUTHORIZATION_LEASE;
+    options.authorization_mode = KSD_AUTH_REQUEST;
     options.requested_scopes = scopes;
 
-    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+    if (ksd_connect(&options, &lease, &info, &error) != KSD_STATUS_OK) {
         fprintf(stderr, "connect: %s\n", error.message);
         return 1;
     }
-    if (ksd_authorize(connection, KSD_AUTH_REQUEST, scopes,
-                      &granted, &error) != KSD_STATUS_OK) {
-        fprintf(stderr, "authorize: %s\n", error.message);
-        ksd_disconnect(connection);
+    options.role = KSD_ROLE_RPC;
+    options.authorization_mode = KSD_AUTH_CHECK;
+    options.requested_scopes = 0u;
+    options.lease_id = info.lease_id;
+    ksd_service_info_init(&info);
+    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "connect: %s\n", error.message);
+        ksd_disconnect(lease);
         return 1;
     }
     if (target != 0u && ksd_window_set_state(connection, target,
             KSD_WINDOW_STATE_UNMINIMIZED, &error) != KSD_STATUS_OK) {
         fprintf(stderr, "unminimize: %s\n", error.message);
         ksd_disconnect(connection);
+        ksd_disconnect(lease);
         return 1;
     }
     if (ksd_window_list_json(connection, 0, &windows, &error) == KSD_STATUS_OK) {
@@ -58,5 +65,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "window list: %s\n", error.message);
     }
     ksd_disconnect(connection);
+    ksd_disconnect(lease);
     return 0;
 }

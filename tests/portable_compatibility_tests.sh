@@ -136,31 +136,31 @@ wait "$upgrade_pid" 2>/dev/null || true
 upgrade_pid=
 
 mkdir -p "$temporary/live-lib" "$temporary/payload-lib/lib"
-printf '%s\n' old > "$temporary/live-lib/libkeysharp-desktop.so.0.2.0"
-printf '%s\n' new > "$temporary/payload-lib/lib/libkeysharp-desktop.so.0.2.0"
-ln -s libkeysharp-desktop.so.0.2.0 \
-    "$temporary/payload-lib/lib/libkeysharp-desktop.so.0"
-ln -s libkeysharp-desktop.so.0 \
+printf '%s\n' old > "$temporary/live-lib/libkeysharp-desktop.so.1.0.0"
+printf '%s\n' new > "$temporary/payload-lib/lib/libkeysharp-desktop.so.1.0.0"
+ln -s libkeysharp-desktop.so.1.0.0 \
+    "$temporary/payload-lib/lib/libkeysharp-desktop.so.1"
+ln -s libkeysharp-desktop.so.1 \
     "$temporary/payload-lib/lib/libkeysharp-desktop.so"
 old_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-desktop.so.0.2.0")
+    "$temporary/live-lib/libkeysharp-desktop.so.1.0.0")
 atomic_install_file \
-    "$temporary/payload-lib/lib/libkeysharp-desktop.so.0.2.0" \
-    "$temporary/live-lib/libkeysharp-desktop.so.0.2.0" 0755
+    "$temporary/payload-lib/lib/libkeysharp-desktop.so.1.0.0" \
+    "$temporary/live-lib/libkeysharp-desktop.so.1.0.0" 0755
 new_inode=$(stat -c '%i' \
-    "$temporary/live-lib/libkeysharp-desktop.so.0.2.0")
+    "$temporary/live-lib/libkeysharp-desktop.so.1.0.0")
 [ "$old_inode" != "$new_inode" ]
-[ "$(cat "$temporary/live-lib/libkeysharp-desktop.so.0.2.0")" = new ]
+[ "$(cat "$temporary/live-lib/libkeysharp-desktop.so.1.0.0")" = new ]
 atomic_install_symlink \
-    "$temporary/payload-lib/lib/libkeysharp-desktop.so.0" \
-    "$temporary/live-lib/libkeysharp-desktop.so.0"
+    "$temporary/payload-lib/lib/libkeysharp-desktop.so.1" \
+    "$temporary/live-lib/libkeysharp-desktop.so.1"
 atomic_install_symlink \
     "$temporary/payload-lib/lib/libkeysharp-desktop.so" \
     "$temporary/live-lib/libkeysharp-desktop.so"
-[ "$(readlink "$temporary/live-lib/libkeysharp-desktop.so.0")" \
-    = libkeysharp-desktop.so.0.2.0 ]
+[ "$(readlink "$temporary/live-lib/libkeysharp-desktop.so.1")" \
+    = libkeysharp-desktop.so.1.0.0 ]
 [ "$(readlink "$temporary/live-lib/libkeysharp-desktop.so")" \
-    = libkeysharp-desktop.so.0 ]
+    = libkeysharp-desktop.so.1 ]
 [ "$(cat "$temporary/live-lib/libkeysharp-desktop.so")" = new ]
 
 printf '%s\n' "portable compatibility checks passed"

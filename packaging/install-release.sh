@@ -5,8 +5,8 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset CDPATH ENV BASH_ENV LD_LIBRARY_PATH LD_PRELOAD 2>/dev/null || true
 
-expected_client_abi_major=0
-expected_client_abi_minor=9
+expected_client_abi_major=1
+expected_client_abi_minor=0
 
 skip_compatible=false
 
@@ -50,11 +50,11 @@ is_root_protected_file() {
 
 library_payload_under() {
     library_root=$(readlink -f -- "$1" 2>/dev/null) || return 1
-    soname_link=$library_root/lib/libkeysharp-desktop.so.0
+    soname_link=$library_root/lib/libkeysharp-desktop.so.1
     [ -L "$soname_link" ] || return 1
     library_resolved=$(readlink -f -- "$soname_link" 2>/dev/null) || return 1
     case "$library_resolved" in
-        "$library_root"/lib/libkeysharp-desktop.so.0.*) ;;
+        "$library_root"/lib/libkeysharp-desktop.so.1.*) ;;
         *) return 1 ;;
     esac
     [ -f "$library_resolved" ] && [ ! -L "$library_resolved" ] \
@@ -552,7 +552,7 @@ has_client_artifacts() {
     client_prefix=$1
     for required in \
         lib/libkeysharp-desktop.so \
-        lib/libkeysharp-desktop.so.0 \
+        lib/libkeysharp-desktop.so.1 \
         include/keysharp_desktop/client.h \
         lib/pkgconfig/keysharp-desktop.pc \
         lib/cmake/KeysharpDesktop/KeysharpDesktopConfig.cmake \
@@ -576,7 +576,7 @@ installation_complete() {
     has_client_artifacts "$install_prefix" || return 1
     for required in \
         lib/libkeysharp-desktop.so \
-        lib/libkeysharp-desktop.so.0 \
+        lib/libkeysharp-desktop.so.1 \
         include/keysharp_desktop/client.h \
         lib/pkgconfig/keysharp-desktop.pc \
         lib/cmake/KeysharpDesktop/KeysharpDesktopConfig.cmake \
@@ -699,7 +699,7 @@ rm -f -- \
     "$install_staging/bin/keysharp-desktop" \
     "$install_staging/libexec/keysharp-desktop-capture-worker" \
     "$install_staging/lib/libkeysharp-desktop.so" \
-    "$install_staging/lib/libkeysharp-desktop.so.0" \
+    "$install_staging/lib/libkeysharp-desktop.so.1" \
     "$install_staging/lib/$payload_library_name"
 cp -R "$install_staging/." /usr/local/
 rm -rf -- "$install_staging"
@@ -708,8 +708,8 @@ install -D -m 0644 "$policy" \
     /usr/share/polkit-1/actions/org.keysharp.desktop.policy
 atomic_install_file "$payload_library" \
     "/usr/local/lib/$payload_library_name" 0755
-atomic_install_symlink "$payload/lib/libkeysharp-desktop.so.0" \
-    /usr/local/lib/libkeysharp-desktop.so.0
+atomic_install_symlink "$payload/lib/libkeysharp-desktop.so.1" \
+    /usr/local/lib/libkeysharp-desktop.so.1
 atomic_install_symlink "$payload/lib/libkeysharp-desktop.so" \
     /usr/local/lib/libkeysharp-desktop.so
 atomic_install_file "$payload/bin/keysharp-desktop" \

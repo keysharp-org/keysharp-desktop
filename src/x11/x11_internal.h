@@ -40,4 +40,5 @@ bool ksd_x11_append_text_reply(ksd_buffer *out,
                                xcb_get_property_reply_t *reply);
 bool ksd_x11_has_state(xcb_connection_t *connection, const x11_atoms *atoms,
                        xcb_window_t window, xcb_atom_t wanted);
+bool ksd_x11_enumerate_windows(ksd_x11 *, xcb_window_t *, size_t *);
 #endif

@@ -17,6 +17,13 @@ typedef struct list_context {
     bool first;
 } list_context;
 
+static ksd_connection *command_lease;
+
+static void close_rpc(ksd_connection *connection)
+{
+    ksd_disconnect(connection); ksd_disconnect(command_lease); command_lease = NULL;
+}
+
 static void usage(FILE *stream, const char *program)
 {
     fprintf(stream,
@@ -61,10 +68,16 @@ static ksd_status open_rpc(const char *socket_path,
     ksd_connect_options options;
     ksd_connect_options_init(&options);
     options.socket_path = socket_path;
-    options.role = KSD_ROLE_RPC;
+    options.role = KSD_ROLE_AUTHORIZATION_LEASE;
     options.requested_scopes = 0u;
     ksd_service_info_init(info);
-    return ksd_connect(&options, connection, info, error);
+    ksd_status status = ksd_connect(&options, &command_lease, info, error);
+    if (status != KSD_STATUS_OK) return status;
+    options.role = KSD_ROLE_RPC; options.lease_id = info->lease_id;
+    ksd_service_info_init(info);
+    status = ksd_connect(&options, connection, info, error);
+    if (status != KSD_STATUS_OK) { ksd_disconnect(command_lease); command_lease = NULL; }
+    return status;
 }
 
 static void print_version(void)
@@ -102,7 +115,7 @@ static int probe_command(int argc, char **argv)
     printf("available_operations=0x%016" PRIx64 "\n",
            info.available_operations);
     printf("backend=%s\n", ksd_backend_name(info.backend));
-    ksd_disconnect(connection);
+    close_rpc(connection);
     return 0;
 }
 
@@ -181,7 +194,7 @@ static int permissions_list_command(int argc, char **argv)
     list_context context = { .first = true };
     status = ksd_permissions_list(connection, print_permission,
                                   &context, &error);
-    ksd_disconnect(connection);
+    close_rpc(connection);
     return status == KSD_STATUS_OK
         ? 0 : report_error("permissions list", status, &error);
 }
@@ -281,7 +294,7 @@ static int permissions_revoke_command(int argc, char **argv)
     if (status != KSD_STATUS_OK)
         return report_error("permissions revoke", status, &error);
     status = ksd_permissions_revoke(connection, &revoke, &error);
-    ksd_disconnect(connection);
+    close_rpc(connection);
     if (status != KSD_STATUS_OK)
         return report_error("permissions revoke", status, &error);
     char scopes[256];

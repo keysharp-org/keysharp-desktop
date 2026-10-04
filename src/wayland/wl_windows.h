@@ -18,6 +18,7 @@ typedef struct ksd_wayland_window_view {
 const ksd_wayland_window_view *ksd_wayland_wlr_window_view(void);
 const ksd_wayland_window_view *ksd_wayland_cosmic_window_view(void);
 const ksd_wayland_window_view *ksd_wayland_hypr_window_view(void);
+const ksd_wayland_window_view *ksd_wayland_current_window_view(ksd_wayland *connection);
 bool ksd_wayland_windows_refresh(ksd_wayland *connection,
                                  const ksd_wayland_window_view *view,
                                  ksd_operation_result *result);

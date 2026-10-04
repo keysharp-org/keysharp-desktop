@@ -10,6 +10,7 @@
 #include "x11_query.h"
 #include "x11_extended.h"
 #include "x11_watch.h"
+#include "state_wire.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -800,6 +801,10 @@ static void expect_watch_event(int descriptor, uint16_t kind, xcb_window_t windo
 {
     for (unsigned i = 0u; i < 12u; i++) {
         ksd_frame frame = read_watch_frame(descriptor);
+        if (frame.opcode == KSD_OP_STATE_EVENT) {
+            ksd_state_event event; assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
+            ksd_state_event_clear(&event); ksd_frame_clear(&frame); continue;
+        }
         assert(frame.opcode == KSD_OP_WINDOW_EVENT && frame.flags == KSD_FLAG_EVENT
             && frame.request_id == 0u && frame.payload_length >= 8u);
         uint16_t actual = ksd_decode_u16(frame.payload);
@@ -820,7 +825,8 @@ static void expect_watch_event(int descriptor, uint16_t kind, xcb_window_t windo
         }
         /* X may report one geometry change both through the client and the
          * root's substructure selection. */
-        assert(actual == KSD_WINDOW_EVENT_MOVE);
+        assert(actual == KSD_WINDOW_EVENT_MOVE || actual == KSD_WINDOW_EVENT_SHOW || actual == KSD_WINDOW_EVENT_HIDE
+            || actual == KSD_WINDOW_EVENT_CHANGED);
         ksd_frame_clear(&frame);
     }
     assert(false);
@@ -832,8 +838,8 @@ static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
     xcb_atom_t list = intern_in(owner, "_NET_CLIENT_LIST");
     xcb_atom_t state = intern_in(owner, "_NET_WM_STATE");
     xcb_atom_t hidden = intern_in(owner, "_NET_WM_STATE_HIDDEN");
-    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list,
-        XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    xcb_delete_property(owner, screen->root, list);
+    xcb_delete_property(owner, screen->root, intern_in(owner, "_NET_CLIENT_LIST_STACKING"));
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
     int pair[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
@@ -857,6 +863,14 @@ static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
     assert(ready.request_id == 42u && ready.payload_length == 8u
         && ksd_decode_u32(ready.payload) == KSD_STATUS_OK);
     ksd_frame_clear(&ready);
+    uint32_t complete = 0u;
+    for (unsigned i = 0u; complete != (KSD_STATE_WINDOWS | KSD_STATE_KEYBOARD | KSD_STATE_DISPLAYS) && i < 128u; i++) {
+        ksd_frame snapshot = read_watch_frame(pair[0]); ksd_state_event event;
+        assert(snapshot.opcode == KSD_OP_STATE_EVENT && ksd_state_event_decode(snapshot.payload, snapshot.payload_length, &event));
+        if (event.kind == KSD_STATE_SNAPSHOT_END) complete |= event.domain;
+        ksd_state_event_clear(&event); ksd_frame_clear(&snapshot);
+    }
+    assert(complete == (KSD_STATE_WINDOWS | KSD_STATE_KEYBOARD | KSD_STATE_DISPLAYS));
     struct pollfd idle = { .fd = pair[0], .events = POLLIN };
     assert(poll(&idle, 1u, 100) == 0);
 
@@ -889,6 +903,31 @@ static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
     xcb_configure_window(owner, window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y, geometry);
     xcb_flush(owner);
     expect_watch_event(pair[0], KSD_WINDOW_EVENT_MOVE, window, "\"x\":65,\"y\":70");
+    xcb_unmap_window(owner, window);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list, XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_HIDE, window, "\"visible\":false");
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, intern_in(owner, "_NET_CLIENT_LIST_STACKING"),
+        XCB_ATOM_WINDOW, 32u, 0u, NULL);
+    xcb_flush(owner);
+    bool found_hidden = false, ended = false;
+    for (unsigned i = 0u; !ended && i < 64u; i++) {
+        ksd_frame snapshot = read_watch_frame(pair[0]);
+        if (snapshot.opcode == KSD_OP_STATE_EVENT) {
+            ksd_state_event event; assert(ksd_state_event_decode(snapshot.payload, snapshot.payload_length, &event));
+            if (event.domain == KSD_STATE_WINDOWS && event.kind == KSD_STATE_SNAPSHOT_ITEM && event.window.handle == window) {
+                found_hidden = true; assert((event.window.flags & KSD_WINDOW_VISIBLE) == 0u);
+            }
+            ended = event.domain == KSD_STATE_WINDOWS && event.kind == KSD_STATE_SNAPSHOT_END;
+            ksd_state_event_clear(&event);
+        }
+        ksd_frame_clear(&snapshot);
+    }
+    assert(ended && found_hidden);
+    xcb_map_window(owner, window);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list, XCB_ATOM_WINDOW, 32u, 1u, &window);
+    xcb_flush(owner);
+    expect_watch_event(pair[0], KSD_WINDOW_EVENT_SHOW, window, "\"visible\":true");
     xcb_destroy_window(owner, window);
     xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, list,
         XCB_ATOM_WINDOW, 32u, 0u, NULL);
@@ -899,6 +938,7 @@ static void check_window_watch(ksd_x11 *connection, xcb_connection_t *owner,
     assert(waitpid(child, &status, 0) == child);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     xcb_delete_property(owner, screen->root, list);
+    xcb_delete_property(owner, screen->root, intern_in(owner, "_NET_CLIENT_LIST_STACKING"));
     xcb_delete_property(owner, screen->root, intern_in(owner, "_NET_ACTIVE_WINDOW"));
     free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
 }
@@ -1410,9 +1450,12 @@ int main(void)
     check_window_handles_with_manager(connection, owner, screen);
     check_extended_windows(connection, owner, screen);
     check_window_watch(connection, owner, screen, canonical);
-    check_capture(connection, owner, screen);
-    check_clipboard(connection, owner, canonical);
-    check_control(connection, owner, screen, canonical);
+    const char *state_only = getenv("KSD_TEST_STATE_ONLY");
+    if (state_only == NULL || state_only[0] == '\0') {
+        check_capture(connection, owner, screen);
+        check_clipboard(connection, owner, canonical);
+        check_control(connection, owner, screen, canonical);
+    }
     xcb_disconnect(owner);
 
     ksd_x11_close(connection);

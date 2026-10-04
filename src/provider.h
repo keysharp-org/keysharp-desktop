@@ -25,7 +25,7 @@ void ksd_provider_execute(uid_t uid, pid_t pid, pid_t provider_pid,
                           const ksd_frame *request,
                           ksd_operation_result *result);
 int ksd_provider_watch(uid_t uid, pid_t provider_pid, ksd_backend backend,
-                       bool clipboard,
+                       bool clipboard, int cancel_fd,
                        ksd_provider_event_fn emit,
                        ksd_provider_cancel_fn cancelled,
                        void *user_data, char *diagnostic,

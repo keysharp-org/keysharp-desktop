@@ -23,7 +23,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-int ksd_authority_test_generic_session(int descriptor,
+int ksd_authority_test_generic_session(int descriptor, int lease_descriptor,
                                        const struct ucred *peer,
                                        const char *persistent_directory,
                                        const char *runtime_directory);
@@ -31,7 +31,9 @@ int ksd_authority_test_assembly_budget(unsigned int uid, int reserve);
 bool ksd_authority_test_backend_matches(uint32_t backend, pid_t pid);
 bool ksd_session_is_x11_process(pid_t pid);
 bool ksd_authority_test_scope_cache(ksp_store *store);
+bool ksd_authority_test_authorization_race(ksp_store *store);
 bool ksd_authority_test_display_lanes(void);
+bool ksd_authority_test_state_model(void);
 
 /* GENERIC is exempt from the session cross-check because it means "no
  * compositor this service knows". X11 must NOT be exempt the same way, or a
@@ -193,6 +195,7 @@ static void check_assembly_budget(void)
 
 typedef struct authority_arguments {
     int descriptor;
+    int lease_descriptor;
     struct ucred peer;
     const char *persistent;
     const char *runtime;
@@ -208,7 +211,7 @@ static void *authority_thread(void *argument)
 {
     authority_arguments *arguments = argument;
     arguments->result = ksd_authority_test_generic_session(
-        arguments->descriptor, &arguments->peer, arguments->persistent,
+        arguments->descriptor, arguments->lease_descriptor, &arguments->peer, arguments->persistent,
         arguments->runtime);
     return NULL;
 }
@@ -223,8 +226,10 @@ static bool store_available(const char *persistent, const char *runtime)
     store_config.owner_uid = getuid();
     bool available = ksp_store_create(&store, &store_config) == 0
         && ksp_store_prepare(store) == 0;
-    if (available)
+    if (available) {
         assert(ksd_authority_test_scope_cache(store));
+        assert(ksd_authority_test_authorization_race(store));
+    }
     ksp_store_destroy(store);
     return available;
 }
@@ -426,6 +431,7 @@ int main(void)
     const char *home = getenv("HOME");
     char *resolved = home == NULL ? NULL : realpath(home, NULL);
     int sockets[2];
+    int lease_sockets[2];
     pthread_t thread;
     uint8_t hello[16] = { 0 };
     uint8_t authorize[16] = { 0 };
@@ -450,13 +456,16 @@ int main(void)
         return 77;
     }
     assert(ksd_authority_test_display_lanes());
+    assert(ksd_authority_test_state_model());
 
     struct timeval receive_timeout = { .tv_sec = 30, .tv_usec = 0 };
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, lease_sockets) == 0);
     assert(setsockopt(sockets[0], SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,
                       sizeof(receive_timeout)) == 0);
     authority_arguments arguments = {
         .descriptor = sockets[1],
+        .lease_descriptor = lease_sockets[1],
         .peer = {
             .pid = getpid(),
             .uid = getuid(),
@@ -474,12 +483,17 @@ int main(void)
                           &arguments) == 0);
     assert(pthread_attr_destroy(&attributes) == 0);
 
-    ksd_encode_u16(hello, (uint16_t)KSD_ROLE_RPC);
+    ksd_encode_u16(hello, (uint16_t)KSD_ROLE_AUTHORIZATION_LEASE);
     ksd_encode_u16(hello + 2u, (uint16_t)KSD_AUTH_CHECK);
+    send_request(lease_sockets[0], KSD_OP_HELLO, 1u, hello, sizeof(hello));
+    assert(read_status(lease_sockets[0], KSD_OP_HELLO, 1u, tail, sizeof(tail), &tail_length) == KSD_STATUS_OK);
+    assert(tail_length == 32u && ksd_decode_u64(tail + 24u) != 0u);
+    ksd_encode_u16(hello, (uint16_t)KSD_ROLE_RPC);
+    ksd_encode_u64(hello + 8u, ksd_decode_u64(tail + 24u));
     send_request(sockets[0], KSD_OP_HELLO, 1u, hello, sizeof(hello));
     assert(read_status(sockets[0], KSD_OP_HELLO, 1u, tail, sizeof(tail),
                        &tail_length) == KSD_STATUS_OK);
-    assert(tail_length == 24u);
+    assert(tail_length == 32u);
     assert(ksd_decode_u32(tail) == 0u);
     assert(ksd_decode_u64(tail + 8u) == 0u);
     assert(ksd_decode_u32(tail + 16u) == KSD_BACKEND_GENERIC);
@@ -494,9 +508,9 @@ int main(void)
 
     ksd_encode_u16(authorize, (uint16_t)KSD_AUTH_CHECK);
     ksd_encode_u32(authorize + 4u, KSD_SCOPE_SCREEN_CAPTURE);
-    send_request(sockets[0], KSD_OP_AUTHORIZE, 4u, authorize,
+    send_request(lease_sockets[0], KSD_OP_AUTHORIZE, 2u, authorize,
                  sizeof(authorize));
-    assert(read_status(sockets[0], KSD_OP_AUTHORIZE, 4u, NULL, 0u, NULL)
+    assert(read_status(lease_sockets[0], KSD_OP_AUTHORIZE, 2u, NULL, 0u, NULL)
            == KSD_STATUS_DENIED);
 
     send_request(sockets[0], KSD_OP_PERMISSIONS_LIST, 5u, NULL, 0u);
@@ -533,9 +547,11 @@ int main(void)
     check_kwin_admission();
 
     assert(close(sockets[0]) == 0);
+    assert(close(lease_sockets[0]) == 0);
     assert(pthread_join(thread, NULL) == 0);
     assert(arguments.result == 0);
     assert(close(sockets[1]) == 0);
+    assert(close(lease_sockets[1]) == 0);
     (void)remove_tree(root);
     return 0;
 }

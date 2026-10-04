@@ -241,7 +241,7 @@ foreach(workflow_source ci_workflow release_workflow)
     foreach(required
             "b8f31942dd2c286608d390634a9916bffce55ddf"
             "git rev-parse HEAD:third_party/keysharp-permissions"
-            "libkeysharp-desktop.so.0")
+            "libkeysharp-desktop.so.1")
         string(FIND "${${workflow_source}}" "${required}" found)
         if(found EQUAL -1)
             message(FATAL_ERROR "${workflow_source} misses ${required}")
@@ -290,7 +290,7 @@ foreach(required
         "/usr/local/bin/keysharp-desktop"
         "/usr/local/libexec/keysharp-desktop-capture-worker"
         "/usr/local/lib/libkeysharp-desktop.so"
-        "/usr/local/lib/libkeysharp-desktop.so.0"
+        "/usr/local/lib/libkeysharp-desktop.so.1"
         "library_payload=$(portable_library_payload || true)"
         "rm -f -- \"$library_payload\""
         "/usr/local/include/keysharp_desktop/client.h"
@@ -307,7 +307,7 @@ foreach(required
         "current_library=$(portable_library_payload)"
         "payload_library=$(library_payload_under \"$payload\" || true)"
         "atomic_install_file \"$payload_library\""
-        "atomic_install_symlink \"$payload/lib/libkeysharp-desktop.so.0\""
+        "atomic_install_symlink \"$payload/lib/libkeysharp-desktop.so.1\""
         "atomic_install_file \"$payload/bin/keysharp-desktop\""
         "atomic_install_file \"$payload/libexec/keysharp-desktop-capture-worker\""
         "rm -f -- \"$previous_library\"")
@@ -389,7 +389,7 @@ endif()
 foreach(required
         "CPACK_DEBIAN_PACKAGE_BREAKS \"keysharp (<< 0.0.0.17)\""
         "CPACK_DEBIAN_PACKAGE_REPLACES \"keysharp (<< 0.0.0.17)\""
-        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-client-abi-0 (= 0."
+        "CPACK_DEBIAN_PACKAGE_PROVIDES \"keysharp-desktop-client-abi-1 (= 1."
         "CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON"
         "16986957+Descolada@users.noreply.github.com")
     string(FIND "${cmake_source}" "${required}" found)

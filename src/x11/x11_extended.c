@@ -433,6 +433,11 @@ struct ksd_x11_keyboard_cache {
     uint8_t event_base;
 };
 
+const char *ksd_x11_keyboard_revision(ksd_x11 *connection)
+{
+    return connection->keyboard == NULL ? NULL : connection->keyboard->revision;
+}
+
 void ksd_x11_keyboard_clear(ksd_x11 *connection)
 {
     struct ksd_x11_keyboard_cache *cache = connection->keyboard;

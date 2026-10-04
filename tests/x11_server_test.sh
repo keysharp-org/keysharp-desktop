@@ -9,6 +9,7 @@ set -eu
 # Readiness is decided by connecting, not by waiting for a socket file.
 
 binary=$1
+export KSD_TEST_STATE_ONLY=${2:-}
 server=""
 
 if ! command -v Xvfb >/dev/null 2>&1; then
@@ -24,47 +25,32 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-display=99
-while [ "$display" -lt 110 ]; do
-    # An odd width, so the scanline pad is non-trivial and a stride computed
-    # as width * 4 rather than read from the server shows up.
-    Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>&1 &
+# Probe before starting so an existing display can never be adopted as the fixture.
+for display in 190 191 192 193 194 195 196 197 198 199; do
+    if KSD_TEST_DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
+        continue
+    fi
+    if [ -w /tmp/.X11-unix ]; then
+        Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>/dev/null &
+    else
+        if [ -z "$KSD_TEST_STATE_ONLY" ]; then
+            echo "private Unix X server unavailable; shared-memory tests require local transport: skipping"
+            exit 77
+        fi
+        Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten unix -nolisten local -listen tcp -pn >/dev/null 2>/dev/null &
+    fi
     server=$!
     attempt=0
-    while [ "$attempt" -lt 40 ]; do
-        # Our own server has to be alive BEFORE the display is probed. If it
-        # exited, this display belongs to someone else -- a leftover server, or
-        # another job on the same machine -- and the probe would succeed
-        # against theirs, running the whole suite on a display this script
-        # neither started nor controls, against whatever state it carries.
-        if ! kill -0 "$server" 2>/dev/null; then
-            break
-        fi
-        if KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}"             KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
-            if ! kill -0 "$server" 2>/dev/null; then
-                break
-            fi
-            # Deliberately not exec. Replacing the shell would drop the EXIT
-            # trap with it, orphaning the server: every successful run leaked
-            # one, and the next run then adopted it by the path above and
-            # inherited its state.
-            # DISPLAY as well as KSD_TEST_DISPLAY: a test that exercises the
-            # session-resolution path reads the display back out of
-            # /proc/<pid>/environ, which holds the environment this process was
-            # executed with and cannot be added to afterwards.
+    while [ "$attempt" -lt 40 ] && kill -0 "$server" 2>/dev/null; do
+        if KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
             KSD_TEST_DISPLAY=":${display}" DISPLAY=":${display}" "$binary"
-            status=$?
-            cleanup
-            server=""
-            exit "$status"
+            exit $?
         fi
         sleep 0.1
         attempt=$((attempt + 1))
     done
     cleanup
     server=""
-    display=$((display + 1))
 done
-
-echo "no usable X server after 11 attempts: skipping"
+echo "private X server did not become ready: skipping"
 exit 77

@@ -34,7 +34,7 @@ Replaces: keysharp (<< 0.0.0.17)
 Description: Per-application desktop capability broker for Linux
  A Linux desktop automation service and C library for capture, window
  inspection and control, clipboard access and compositor pointer
- operations. Applications use libkeysharp-desktop.so.0; the available
+ operations. Applications use libkeysharp-desktop.so.1; the available
  operations depend on the active compositor.
  .
  On GNOME or Cinnamon, run "keysharp-desktop enable-extension" as the

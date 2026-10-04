@@ -6,4 +6,6 @@
 *.conf text eol=lf
 *.cmake text eol=lf
 *.yml text eol=lf
+providers/gnome/extension.js text eol=lf
+providers/cinnamon/extension.js text eol=lf
 packaging/debian/** text eol=lf

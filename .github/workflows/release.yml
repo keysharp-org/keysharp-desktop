@@ -182,9 +182,9 @@ jobs:
           test -x "$STAGE/usr/local/bin/keysharp-desktop"
           test -x "$STAGE/usr/local/libexec/keysharp-desktop-capture-worker"
           test "$(stat -c %a "$STAGE/usr/local/libexec/keysharp-desktop-capture-worker")" = 700
-          test -e "$STAGE/usr/local/lib/libkeysharp-desktop.so.0"
-          readelf -d "$STAGE/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.0\]'
-          readelf -d "$STAGE/usr/local/lib/libkeysharp-desktop.so.0.2.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.0\]'
+          test -e "$STAGE/usr/local/lib/libkeysharp-desktop.so.1"
+          readelf -d "$STAGE/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.1\]'
+          readelf -d "$STAGE/usr/local/lib/libkeysharp-desktop.so.1.0.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.1\]'
 
           mkdir -p dist
           archive_name="keysharp-desktop-${VERSION}-linux-${ASSET_ARCH}"

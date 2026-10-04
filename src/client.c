@@ -5,18 +5,20 @@
 #include "permission_domain.h"
 #include "client_status.h"
 #include "transport.h"
+#include "state_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <keysharp_permissions/permissions.h>
 #include <limits.h>
 #include <poll.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -26,6 +28,8 @@
 
 #define KSD_CLIENT_PATH_CAPACITY 4096u
 #define KSD_CLIENT_MAX_RESPONSE (KSD_MAX_CAPTURE_BYTES + 64u)
+#define KSD_CLIENT_MAX_EVENTS 256u
+#define KSD_CLIENT_MAX_EVENT_BYTES (16u * 1024u * 1024u)
 
 _Static_assert(KSD_SCOPE_INPUT_MONITORING == KSP_SCOPE_INPUT_MONITORING,
                "input monitoring scope drifted");
@@ -55,8 +59,12 @@ _Static_assert(offsetof(ksd_permission_entry, reserved64) == 4184u,
 _Static_assert(offsetof(ksd_permission_revoke, pid) == 16u,
                "ksd_permission_revoke common layout drifted");
 
+typedef struct queued_event {
+    ksd_frame frame;
+    struct queued_event *next;
+} queued_event;
+
 struct ksd_connection {
-    pthread_mutex_t mutex;
     int descriptor;
     uint64_t next_request_id;
     uint32_t role;
@@ -65,7 +73,14 @@ struct ksd_connection {
     uint32_t backend;
     uint32_t timeout_ms;
     uint64_t request_deadline_ms;
-    uint16_t subscription_opcode;
+    int poll_descriptor;
+    int pending_descriptor;
+    uint64_t lease_id;
+    uint64_t sequence;
+    ksd_buffer input;
+    queued_event *first_event, *last_event;
+    size_t queued_bytes;
+    unsigned queued_count;
 };
 
 typedef struct ksd_client_response {
@@ -91,6 +106,111 @@ static const uint8_t client_magic[4] = {
     KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1,
     KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
 };
+
+static bool initialize_poll(ksd_connection *connection)
+{
+    connection->poll_descriptor = epoll_create1(EPOLL_CLOEXEC);
+    connection->pending_descriptor = eventfd(0u, EFD_NONBLOCK | EFD_CLOEXEC);
+    ksd_buffer_init(&connection->input, KSD_CLIENT_MAX_RESPONSE + KSD_FRAME_HEADER_SIZE);
+    struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP };
+    if (connection->poll_descriptor < 0 || connection->pending_descriptor < 0)
+        return false;
+    event.data.fd = connection->descriptor;
+    if (epoll_ctl(connection->poll_descriptor, EPOLL_CTL_ADD,
+                  connection->descriptor, &event) != 0)
+        return false;
+    event.data.fd = connection->pending_descriptor;
+    return epoll_ctl(connection->poll_descriptor, EPOLL_CTL_ADD,
+                     connection->pending_descriptor, &event) == 0;
+}
+
+static void signal_pending(ksd_connection *connection)
+{
+    uint64_t value = 1u;
+    if (connection->pending_descriptor >= 0)
+        (void)write(connection->pending_descriptor, &value, sizeof(value));
+}
+
+static bool queue_event(ksd_connection *connection, ksd_frame *frame)
+{
+    if (connection->queued_count >= KSD_CLIENT_MAX_EVENTS
+        || frame->payload_length > KSD_CLIENT_MAX_EVENT_BYTES - connection->queued_bytes) {
+        errno = ENOBUFS; return false;
+    }
+    ksd_state_event event;
+    if (!ksd_state_event_decode(frame->payload, frame->payload_length, &event)) { errno = EPROTO; return false; }
+    if (event.domain == KSD_STATE_GRANTS) connection->granted_scopes = event.granted_scopes;
+    ksd_state_event_clear(&event);
+    queued_event *item = calloc(1u, sizeof(*item));
+    if (item == NULL) return false;
+    connection->queued_count++; connection->queued_bytes += frame->payload_length;
+    item->frame = *frame;
+    memset(frame, 0, sizeof(*frame));
+    if (connection->last_event != NULL) connection->last_event->next = item;
+    else connection->first_event = item;
+    connection->last_event = item;
+    signal_pending(connection);
+    return true;
+}
+
+static bool take_event(ksd_connection *connection, ksd_frame *frame)
+{
+    queued_event *item = connection->first_event;
+    if (item == NULL) return false;
+    *frame = item->frame;
+    connection->queued_count--; connection->queued_bytes -= frame->payload_length;
+    connection->first_event = item->next;
+    free(item);
+    if (connection->first_event == NULL) {
+        uint64_t value;
+        connection->last_event = NULL;
+        if (connection->descriptor >= 0)
+            (void)read(connection->pending_descriptor, &value, sizeof(value));
+    }
+    return true;
+}
+
+/* Retain a partial frame without retaining readiness for bytes already read. */
+static int receive_event_frame(ksd_connection *connection, ksd_frame *frame)
+{
+    for (;;) {
+        size_t needed = KSD_FRAME_HEADER_SIZE;
+        if (connection->input.length >= KSD_FRAME_HEADER_SIZE) {
+            uint32_t length = ksd_decode_u32(connection->input.data + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
+            if (length > KSD_CLIENT_MAX_RESPONSE) { errno = EPROTO; return -1; }
+            needed += length;
+            if (connection->input.length == needed) {
+                bool valid = ksd_frame_unpack(connection->input.data, needed, client_magic,
+                    KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_CLIENT_MAX_RESPONSE, true, frame);
+                connection->input.length = 0u;
+                if (!valid) { errno = EPROTO; return -1; }
+                return 1;
+            }
+        }
+        uint8_t bytes[8192];
+        size_t amount = needed - connection->input.length;
+        if (amount > sizeof(bytes)) amount = sizeof(bytes);
+        ssize_t count = recv(connection->descriptor, bytes, amount, MSG_DONTWAIT);
+        if (count > 0) {
+            if (!ksd_buffer_bytes(&connection->input, bytes, (size_t)count)) { errno = ENOMEM; return -1; }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        if (count == 0) errno = ECONNRESET;
+        return -1;
+    }
+}
+
+static int receive_stream_response(ksd_connection *connection, ksd_frame *frame)
+{
+    for (;;) {
+        int result = receive_event_frame(connection, frame);
+        if (result != 0) return result;
+        if (!ksd_wait_until(connection->descriptor, POLLIN, connection->request_deadline_ms))
+            return -1;
+    }
+}
 
 static bool bytes_zero(const void *data, size_t length)
 {
@@ -161,22 +281,7 @@ static bool valid_service_info_output(const ksd_service_info *info)
         && bytes_zero(info->reserved, sizeof(info->reserved));
 }
 
-static bool valid_window_event_output(const ksd_window_event *event)
-{
-    return event != NULL && event->struct_size >= sizeof(*event)
-        && event->kind == 0u && event->reserved0 == 0u
-        && bytes_zero(event->reserved, sizeof(event->reserved))
-        && valid_string_output(&event->window_json);
-}
 
-static bool valid_clipboard_event_output(const ksd_clipboard_event *event)
-{
-    return event != NULL && event->struct_size >= sizeof(*event)
-        && event->reserved0 == 0u
-        && bytes_zero(event->reserved, sizeof(event->reserved))
-        && valid_string_output(&event->text)
-        && valid_string_list_output(&event->mimetypes);
-}
 
 static bool valid_error(const ksd_error *error)
 {
@@ -217,8 +322,11 @@ static ksd_status system_failure(ksd_connection *connection,
     if (connection != NULL && connection->descriptor >= 0) {
         close(connection->descriptor);
         connection->descriptor = -1;
+        signal_pending(connection);
     }
-    set_error(error, 0u, saved_errno, message);
+    set_error(error, 0u, saved_errno, saved_errno == EPROTO
+        ? "keysharp-desktop requires protocol 3.0 and client ABI 1.0; incompatible or invalid service data"
+        : message);
     return ksd_status_for_system_error(saved_errno);
 }
 
@@ -367,24 +475,7 @@ void ksd_permission_revoke_init(ksd_permission_revoke *revoke)
     }
 }
 
-void ksd_window_event_init(ksd_window_event *event)
-{
-    if (event != NULL) {
-        memset(event, 0, sizeof(*event));
-        event->struct_size = sizeof(*event);
-        ksd_string_init(&event->window_json);
-    }
-}
 
-void ksd_clipboard_event_init(ksd_clipboard_event *event)
-{
-    if (event != NULL) {
-        memset(event, 0, sizeof(*event));
-        event->struct_size = sizeof(*event);
-        ksd_string_init(&event->text);
-        ksd_string_list_init(&event->mimetypes);
-    }
-}
 
 void ksd_bytes_clear(ksd_bytes *bytes)
 {
@@ -429,34 +520,11 @@ void ksd_capture_clear(ksd_capture *capture)
     ksd_bytes_init(&capture->data);
 }
 
-void ksd_window_event_clear(ksd_window_event *event)
-{
-    if (event == NULL || event->struct_size < sizeof(*event))
-        return;
-    uint32_t size = event->struct_size;
-    ksd_string_clear(&event->window_json);
-    memset(event, 0, sizeof(*event));
-    event->struct_size = size;
-    ksd_string_init(&event->window_json);
-}
 
-void ksd_clipboard_event_clear(ksd_clipboard_event *event)
-{
-    if (event == NULL || event->struct_size < sizeof(*event))
-        return;
-    uint32_t size = event->struct_size;
-    ksd_string_clear(&event->text);
-    ksd_string_list_clear(&event->mimetypes);
-    memset(event, 0, sizeof(*event));
-    event->struct_size = size;
-    ksd_string_init(&event->text);
-    ksd_string_list_init(&event->mimetypes);
-}
 
 static bool valid_role(uint32_t role)
 {
-    return role == KSD_ROLE_RPC || role == KSD_ROLE_EVENT_STREAM
-        || role == KSD_ROLE_AUTHORIZATION_LEASE;
+    return role == KSD_ROLE_RPC || role == KSD_ROLE_AUTHORIZATION_LEASE;
 }
 
 static bool valid_status(uint32_t status)
@@ -563,10 +631,7 @@ static bool apply_revoked_event(ksd_connection *connection,
     uint32_t revoked = ksd_decode_u32(frame->payload);
     if (revoked == 0u)
         return false;
-    /* Atomic because ksd_lease_refresh reads the grants without the lock
-     * while a request on another thread holds it. */
-    __atomic_and_fetch(&connection->granted_scopes, ~revoked,
-                       __ATOMIC_RELAXED);
+    connection->granted_scopes &= ~revoked;
     if (revoked_scopes != NULL)
         *revoked_scopes = revoked;
     return true;
@@ -661,7 +726,7 @@ static bool map_capture_payload(ksd_client_response *response)
     return true;
 }
 
-static ksd_status read_response_locked(ksd_connection *connection,
+static ksd_status read_response(ksd_connection *connection,
                                        uint16_t opcode,
                                        uint64_t request_id,
                                        ksd_client_response *response,
@@ -674,21 +739,26 @@ static ksd_status read_response_locked(ksd_connection *connection,
             return system_failure(connection, error,
                                   "desktop service response timed out");
         int payload_fd = -1;
-        int received = ksd_frame_read_fd(connection->descriptor, client_magic,
-            KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_CLIENT_MAX_RESPONSE,
-            true, &frame, &payload_fd);
+        int received = connection->role == KSD_ROLE_RPC
+            ? ksd_frame_read_fd(connection->descriptor, client_magic,
+                KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_CLIENT_MAX_RESPONSE,
+                true, &frame, &payload_fd)
+            : receive_stream_response(connection, &frame);
         if (received != 1)
             return system_failure(connection, error,
                                   "desktop service response failed");
         if ((frame.flags & KSD_FLAG_EVENT) != 0u) {
             if (payload_fd >= 0)
                 close(payload_fd);
-            bool valid = apply_revoked_event(connection, &frame, NULL);
+            bool valid = frame.opcode == KSD_OP_STATE_EVENT
+                ? queue_event(connection, &frame)
+                : apply_revoked_event(connection, &frame, NULL);
             ksd_frame_clear(&frame);
             if (!valid) {
-                errno = EPROTO;
-                return system_failure(connection, error,
-                                      "desktop service sent an invalid event");
+                if (errno != ENOBUFS) errno = EPROTO;
+                return system_failure(connection, error, errno == ENOBUFS
+                    ? "desktop event queue exceeded 256 records or 16 MiB; reconnect and resnapshot"
+                    : "desktop service sent an invalid event");
             }
             continue;
         }
@@ -702,11 +772,19 @@ static ksd_status read_response_locked(ksd_connection *connection,
             return system_failure(connection, error,
                                   "desktop service sent an invalid response");
         }
+        if (response->status == KSD_STATUS_OK && ksd_state_mutates_windows(opcode)) {
+            if (response->tail_length < 8u) {
+                response_clear(response); errno = EPROTO;
+                return system_failure(connection, error, "desktop service omitted the operation sequence");
+            }
+            response->tail_length -= 8u;
+            connection->sequence = ksd_decode_u64(response->tail + response->tail_length);
+        }
         return response->status;
     }
 }
 
-static bool write_request_locked(ksd_connection *connection, uint16_t opcode,
+static bool write_request(ksd_connection *connection, uint16_t opcode,
                                  const void *payload, uint32_t payload_length,
                                  uint64_t request_id)
 {
@@ -743,11 +821,13 @@ static bool write_request_locked(ksd_connection *connection, uint16_t opcode,
     return true;
 }
 
-static ksd_status request_locked(ksd_connection *connection, uint16_t opcode,
+static ksd_status request(ksd_connection *connection, uint16_t opcode,
                                  const void *payload, uint32_t payload_length,
                                  ksd_client_response *response,
                                  ksd_error *error)
 {
+    if (connection == NULL || response == NULL || !valid_error(error))
+        return invalid_argument(error, "invalid desktop client argument");
     uint64_t request_id = next_request_id(connection);
     if (connection->descriptor < 0) {
         errno = ENOTCONN;
@@ -764,25 +844,12 @@ static ksd_status request_locked(ksd_connection *connection, uint16_t opcode,
     if (!set_remaining_timeout(connection, connection->request_deadline_ms))
         return system_failure(connection, error,
                               "desktop service request timed out");
-    if (!write_request_locked(connection, opcode, payload, payload_length,
+    if (!write_request(connection, opcode, payload, payload_length,
                               request_id))
         return system_failure(connection, error,
                               "desktop service request failed");
-    return read_response_locked(connection, opcode, request_id,
+    return read_response(connection, opcode, request_id,
                                 response, error);
-}
-
-static ksd_status request(ksd_connection *connection, uint16_t opcode,
-                          const void *payload, uint32_t payload_length,
-                          ksd_client_response *response, ksd_error *error)
-{
-    if (connection == NULL || response == NULL || !valid_error(error))
-        return invalid_argument(error, "invalid desktop client argument");
-    pthread_mutex_lock(&connection->mutex);
-    ksd_status status = request_locked(connection, opcode, payload,
-                                       payload_length, response, error);
-    pthread_mutex_unlock(&connection->mutex);
-    return status;
 }
 
 static bool parse_hello_tail(const uint8_t *tail, uint32_t tail_length,
@@ -798,7 +865,7 @@ static bool parse_hello_tail(const uint8_t *tail, uint32_t tail_length,
         || !ksd_cursor_u64(&cursor, operations)
         || !ksd_cursor_u32(&cursor, backend)
         || !ksd_cursor_u32(&cursor, &reserved1)
-        || !ksd_cursor_finished(&cursor)
+        || (cursor.length - cursor.offset != 0u && cursor.length - cursor.offset != 8u)
         || reserved0 != 0u || reserved1 != 0u)
         return false;
     *granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
@@ -831,31 +898,30 @@ ksd_status ksd_connect(const ksd_connect_options *options,
         return KSD_STATUS_RESOURCE_EXHAUSTED;
     }
     created->descriptor = -1;
+    created->poll_descriptor = -1;
+    created->pending_descriptor = -1;
     created->timeout_ms = options->timeout_ms;
     created->role = options->role;
-    if (pthread_mutex_init(&created->mutex, NULL) != 0) {
-        free(created);
-        set_error(error, 0u, ENOMEM,
-                  "could not initialize desktop connection");
-        return KSD_STATUS_RESOURCE_EXHAUSTED;
-    }
     created->descriptor = connect_socket(options->socket_path,
                                          options->timeout_ms);
     if (created->descriptor < 0) {
         ksd_status status = system_failure(created, error,
                                            "could not connect to desktop service");
-        pthread_mutex_destroy(&created->mutex);
         free(created);
         return status;
+    }
+    if (!initialize_poll(created)) {
+        ksd_disconnect(created);
+        set_error(error, 0u, errno, "could not create desktop poll descriptor");
+        return KSD_STATUS_UNAVAILABLE;
     }
 
     ksd_encode_u16(payload, (uint16_t)options->role);
     ksd_encode_u16(payload + 2u, (uint16_t)options->authorization_mode);
     ksd_encode_u32(payload + 4u, options->requested_scopes);
-    pthread_mutex_lock(&created->mutex);
-    ksd_status status = request_locked(created, KSD_OP_HELLO,
+    ksd_encode_u64(payload + 8u, options->lease_id);
+    ksd_status status = request(created, KSD_OP_HELLO,
         payload, sizeof(payload), &response, error);
-    pthread_mutex_unlock(&created->mutex);
     if (status != KSD_STATUS_OK)
         goto failed;
 
@@ -874,6 +940,7 @@ ksd_status ksd_connect(const ksd_connect_options *options,
     created->granted_scopes = granted;
     created->available_operations = operations;
     created->backend = backend;
+    created->lease_id = response.tail_length >= 32u ? ksd_decode_u64(response.tail + 24u) : 0u;
     uint32_t info_size = info->struct_size;
     memset(info, 0, sizeof(*info));
     info->struct_size = info_size;
@@ -882,6 +949,7 @@ ksd_status ksd_connect(const ksd_connect_options *options,
     info->granted_scopes = granted;
     info->available_operations = operations;
     info->backend = backend;
+    info->lease_id = created->lease_id;
     response_clear(&response);
     *connection = created;
     return KSD_STATUS_OK;
@@ -890,7 +958,9 @@ failed:
     response_clear(&response);
     if (created->descriptor >= 0)
         close(created->descriptor);
-    pthread_mutex_destroy(&created->mutex);
+    if (created->poll_descriptor >= 0) close(created->poll_descriptor);
+    if (created->pending_descriptor >= 0) close(created->pending_descriptor);
+    ksd_buffer_clear(&created->input);
     free(created);
     return status;
 }
@@ -903,8 +973,27 @@ void ksd_disconnect(ksd_connection *connection)
         (void)shutdown(connection->descriptor, SHUT_RDWR);
         close(connection->descriptor);
     }
-    pthread_mutex_destroy(&connection->mutex);
+    if (connection->poll_descriptor >= 0) close(connection->poll_descriptor);
+    if (connection->pending_descriptor >= 0) close(connection->pending_descriptor);
+    ksd_buffer_clear(&connection->input);
+    ksd_frame event;
+    while (take_event(connection, &event)) ksd_frame_clear(&event);
     free(connection);
+}
+
+int ksd_connection_fd(const ksd_connection *connection)
+{
+    return connection == NULL ? -1 : connection->poll_descriptor;
+}
+
+uint64_t ksd_connection_lease_id(const ksd_connection *connection)
+{
+    return connection == NULL ? 0u : connection->lease_id;
+}
+
+uint64_t ksd_connection_sequence(const ksd_connection *connection)
+{
+    return connection == NULL ? 0u : connection->sequence;
 }
 
 #ifdef KSD_CLIENT_TESTING
@@ -914,13 +1003,11 @@ ksd_connection *ksd_client_test_adopt_descriptor(int descriptor)
     if (connection == NULL)
         return NULL;
     connection->descriptor = descriptor;
+    connection->poll_descriptor = -1;
+    connection->pending_descriptor = -1;
     connection->role = KSD_ROLE_RPC;
     connection->timeout_ms = 1000u;
-    if (pthread_mutex_init(&connection->mutex, NULL) != 0) {
-        close(descriptor);
-        free(connection);
-        return NULL;
-    }
+    if (!initialize_poll(connection)) { ksd_disconnect(connection); return NULL; }
     return connection;
 }
 
@@ -947,18 +1034,15 @@ ksd_status ksd_authorize(ksd_connection *connection,
 {
     uint8_t payload[16] = { 0 };
     ksd_client_response response = empty_response;
-    if (connection == NULL || granted_scopes == NULL || !valid_error(error)
-        || requested_scopes == 0u
+    if (connection == NULL || connection->role != KSD_ROLE_AUTHORIZATION_LEASE
+        || granted_scopes == NULL || !valid_error(error) || requested_scopes == 0u
         || (requested_scopes
             & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u
         || (mode != KSD_AUTH_CHECK && mode != KSD_AUTH_REQUEST))
         return invalid_argument(error, "invalid authorization request");
     ksd_encode_u16(payload, (uint16_t)mode);
     ksd_encode_u32(payload + 4u, requested_scopes);
-    /* The grant is stored before the lock is released, so a revocation read
-     * by the next caller is applied after it rather than overwritten by it. */
-    pthread_mutex_lock(&connection->mutex);
-    ksd_status status = request_locked(connection, KSD_OP_AUTHORIZE,
+    ksd_status status = request(connection, KSD_OP_AUTHORIZE,
                                        payload, sizeof(payload), &response,
                                        error);
     if (status == KSD_STATUS_OK) {
@@ -975,12 +1059,10 @@ ksd_status ksd_authorize(ksd_connection *connection,
                 "desktop service returned invalid authorization");
         } else {
             granted &= (uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES;
-            __atomic_store_n(&connection->granted_scopes, granted,
-                             __ATOMIC_RELAXED);
+            connection->granted_scopes = granted;
             *granted_scopes = granted;
         }
     }
-    pthread_mutex_unlock(&connection->mutex);
     response_clear(&response);
     return status;
 }
@@ -1002,12 +1084,6 @@ ksd_status ksd_ping(ksd_connection *connection, ksd_error *error)
     return status;
 }
 
-uint32_t ksd_connection_granted_scopes(const ksd_connection *connection)
-{
-    return connection == NULL ? 0u
-        : __atomic_load_n(&connection->granted_scopes, __ATOMIC_RELAXED);
-}
-
 ksd_operations ksd_connection_available_operations(
     const ksd_connection *connection)
 {
@@ -1019,11 +1095,6 @@ ksd_backend ksd_connection_backend(const ksd_connection *connection)
     return connection == NULL ? KSD_BACKEND_NONE : connection->backend;
 }
 
-uint32_t ksd_lease_granted_scopes(const ksd_connection *connection)
-{
-    return connection != NULL && connection->role == KSD_ROLE_AUTHORIZATION_LEASE
-        ? __atomic_load_n(&connection->granted_scopes, __ATOMIC_RELAXED) : 0u;
-}
 
 static void raw_hash_to_text(const uint8_t raw[32], char hash[65])
 {
@@ -1091,9 +1162,8 @@ ksd_status ksd_permissions_list(ksd_connection *connection,
     if (connection == NULL || visitor == NULL || !valid_error(error)
         || connection->role != KSD_ROLE_RPC)
         return invalid_argument(error, "invalid permissions list request");
-    pthread_mutex_lock(&connection->mutex);
     ksd_client_response response = empty_response;
-    ksd_status status = request_locked(connection, KSD_OP_PERMISSIONS_LIST,
+    ksd_status status = request(connection, KSD_OP_PERMISSIONS_LIST,
                                        NULL, 0u, &response, error);
     bool cancelled = false;
     for (;;) {
@@ -1119,7 +1189,7 @@ ksd_status ksd_permissions_list(ksd_connection *connection,
             cancelled = true;
         uint64_t request_id = response.frame.request_id;
         response_clear(&response);
-        status = read_response_locked(connection, KSD_OP_PERMISSIONS_LIST,
+        status = read_response(connection, KSD_OP_PERMISSIONS_LIST,
                                       request_id, &response, error);
     }
     if (status == KSD_STATUS_OK && cancelled) {
@@ -1127,7 +1197,6 @@ ksd_status ksd_permissions_list(ksd_connection *connection,
         status = KSD_STATUS_CANCELLED;
     }
     response_clear(&response);
-    pthread_mutex_unlock(&connection->mutex);
     return status;
 }
 
@@ -1179,11 +1248,6 @@ ksd_status ksd_permissions_revoke(ksd_connection *connection,
     return status;
 }
 
-static ksd_status allocation_failure(ksd_error *error)
-{
-    set_error(error, 0u, ENOMEM, "desktop client allocation failed");
-    return KSD_STATUS_RESOURCE_EXHAUSTED;
-}
 
 static bool valid_rpc(const ksd_connection *connection)
 {
@@ -2065,99 +2129,38 @@ ksd_status ksd_mouse_scroll(ksd_connection *connection, int32_t delta,
                         (uint32_t)delta, vertical, error);
 }
 
-static ksd_status watch_subscribe(ksd_connection *connection,
-                                  uint16_t opcode, ksd_error *error)
-{
-    if (connection == NULL || connection->role != KSD_ROLE_EVENT_STREAM
-        || connection->subscription_opcode != 0u || !valid_error(error))
-        return invalid_argument(error, "invalid desktop watch subscription");
-    ksd_status status = request_empty_result(connection, opcode,
-                                             NULL, 0u, error);
-    if (status == KSD_STATUS_OK)
-        connection->subscription_opcode = opcode;
-    return status;
-}
 
-ksd_status ksd_window_watch_subscribe(ksd_connection *connection,
-                                      ksd_error *error)
-{
-    return watch_subscribe(connection, KSD_OP_WINDOW_WATCH, error);
-}
 
-ksd_status ksd_clipboard_watch_subscribe(ksd_connection *connection,
-                                         ksd_error *error)
-{
-    return watch_subscribe(connection, KSD_OP_CLIPBOARD_WATCH, error);
-}
 
-static ksd_status read_event_locked(ksd_connection *connection,
+static ksd_status read_event(ksd_connection *connection,
                                     uint32_t timeout_ms,
                                     uint16_t expected_opcode,
                                     ksd_frame *event,
                                     uint32_t *revoked_scopes,
                                     ksd_error *error)
 {
-    struct pollfd item = {
-        .fd = connection->descriptor,
-        .events = POLLIN | POLLHUP | POLLERR,
-    };
-    uint64_t deadline = UINT64_MAX;
-    if (timeout_ms != UINT32_MAX) {
-        uint64_t now = ksd_monotonic_milliseconds();
-        if (now == 0u || now > UINT64_MAX - timeout_ms)
-            return system_failure(connection, error,
-                                  "desktop event clock failed");
-        deadline = now + timeout_ms;
-    }
-    int ready;
+    uint64_t start = ksd_monotonic_milliseconds();
+    uint64_t deadline = timeout_ms == UINT32_MAX ? UINT64_MAX : start + timeout_ms;
     for (;;) {
-        int timeout = -1;
-        if (deadline != UINT64_MAX) {
-            uint64_t now = ksd_monotonic_milliseconds();
-            if (now == 0u || now >= deadline) {
-                reset_error(error);
-                return KSD_STATUS_TIMEOUT;
-            }
-            uint64_t remaining = deadline - now;
-            timeout = remaining > (uint64_t)INT_MAX
-                ? INT_MAX : (int)remaining;
+        if (take_event(connection, event)) break;
+        if (connection->descriptor < 0) {
+            errno = ENOTCONN;
+            return system_failure(connection, error, "desktop event connection ended");
         }
-        ready = poll(&item, 1u, timeout);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        break;
-    }
-    if (ready == 0) {
-        reset_error(error);
-        return KSD_STATUS_TIMEOUT;
-    }
-    if (ready < 0 || ((item.revents & POLLIN) == 0
-        && (item.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)) {
-        if (ready >= 0)
-            errno = ECONNRESET;
-        return system_failure(connection, error,
-                              "desktop event connection ended");
-    }
-    uint32_t frame_timeout = UINT32_MAX;
-    if (deadline != UINT64_MAX) {
+        int received = receive_event_frame(connection, event);
+        if (received > 0) break;
+        if (received < 0)
+            return system_failure(connection, error, "desktop event receive failed");
         uint64_t now = ksd_monotonic_milliseconds();
-        if (now == 0u || now >= deadline) {
+        if (timeout_ms == 0u || (deadline != UINT64_MAX && now >= deadline)) {
             reset_error(error);
             return KSD_STATUS_TIMEOUT;
         }
-        uint64_t remaining = deadline - now;
-        frame_timeout = remaining > UINT32_MAX
-            ? UINT32_MAX : (uint32_t)remaining;
+        if (!ksd_wait_until(connection->descriptor, POLLIN, deadline)) {
+            if (errno == ETIMEDOUT) { reset_error(error); return KSD_STATUS_TIMEOUT; }
+            return system_failure(connection, error, "desktop event wait failed");
+        }
     }
-    if (!set_timeouts(connection->descriptor, frame_timeout))
-        return system_failure(connection, error,
-                              "desktop event timeout failed");
-    int received = ksd_frame_read(connection->descriptor, client_magic,
-        KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR, KSD_CLIENT_MAX_RESPONSE,
-        true, event);
-    if (received != 1)
-        return system_failure(connection, error,
-                              "desktop event receive failed");
     if (event->opcode == KSD_OP_SESSION_REVOKED) {
         uint32_t revoked;
         if (!apply_revoked_event(connection, event, &revoked)) {
@@ -2183,219 +2186,36 @@ static ksd_status read_event_locked(ksd_connection *connection,
     return KSD_STATUS_OK;
 }
 
-static ksd_status event_next(ksd_connection *connection,
-                             uint32_t timeout_ms, uint16_t subscription,
-                             uint16_t event_opcode, ksd_frame *event,
-                             ksd_error *error)
+ksd_status ksd_state_subscribe(ksd_connection *connection, uint32_t domains, ksd_error *error)
 {
-    if (connection == NULL || event == NULL || !valid_error(error)
-        || connection->role != KSD_ROLE_EVENT_STREAM
-        || connection->subscription_opcode != subscription
-        || timeout_ms == 0u || timeout_ms > KSD_MAX_WATCH_TIMEOUT_MS)
-        return invalid_argument(error, "invalid desktop watch poll");
-    pthread_mutex_lock(&connection->mutex);
-    ksd_status status = read_event_locked(connection, timeout_ms,
-                                          event_opcode, event, NULL, error);
-    pthread_mutex_unlock(&connection->mutex);
-    return status;
+    if (connection == NULL || connection->role != KSD_ROLE_AUTHORIZATION_LEASE
+        || (domains & ~KSD_STATE_ALL) != 0u)
+        return invalid_argument(error, "state subscriptions require an authorization lease");
+    uint8_t payload[4]; ksd_encode_u32(payload, domains);
+    return request_empty_result(connection, KSD_OP_STATE_SUBSCRIBE, payload, sizeof(payload), error);
 }
 
-ksd_status ksd_window_watch_next(ksd_connection *connection,
-                                 uint32_t timeout_ms,
-                                 ksd_window_event *event, ksd_error *error)
+ksd_status ksd_state_next(ksd_connection *connection, uint32_t timeout_ms,
+                         ksd_state_event *event, ksd_error *error)
 {
-    if (!valid_window_event_output(event))
-        return invalid_argument(error, "invalid window event output");
-    ksd_frame frame = { 0 };
-    ksd_status status = event_next(connection, timeout_ms,
-        KSD_OP_WINDOW_WATCH, KSD_OP_WINDOW_EVENT, &frame, error);
-    if (status != KSD_STATUS_OK)
-        return status;
-    ksd_cursor cursor;
-    uint16_t kind;
-    uint16_t reserved;
-    uint32_t length;
-    const uint8_t *json;
-    ksd_cursor_init(&cursor, frame.payload, frame.payload_length);
-    if (!ksd_cursor_u16(&cursor, &kind)
-        || !ksd_cursor_u16(&cursor, &reserved)
-        || !ksd_cursor_u32(&cursor, &length)
-        || !ksd_cursor_bytes(&cursor, length, &json)
-        || !ksd_cursor_finished(&cursor) || reserved != 0u
-        || kind < KSD_WINDOW_EVENT_CREATE
-        || kind > KSD_WINDOW_EVENT_ACTIVE_STATE) {
-        ksd_frame_clear(&frame);
-        errno = EPROTO;
-        return system_failure(connection, error,
-                              "desktop service sent invalid window event");
-    }
-    ksd_window_event parsed;
-    ksd_window_event_init(&parsed);
-    parsed.kind = kind;
-    if (!parse_owned_string(json, length, false, &parsed.window_json)) {
-        ksd_frame_clear(&frame);
-        ksd_window_event_clear(&parsed);
-        errno = EPROTO;
-        return system_failure(connection, error,
-                              "desktop service sent invalid window data");
-    }
-    ksd_frame_clear(&frame);
-    ksd_window_event_clear(event);
-    *event = parsed;
-    return KSD_STATUS_OK;
-}
-
-ksd_status ksd_clipboard_watch_next(ksd_connection *connection,
-                                    uint32_t timeout_ms,
-                                    ksd_clipboard_event *event,
-                                    ksd_error *error)
-{
-    if (!valid_clipboard_event_output(event))
-        return invalid_argument(error, "invalid clipboard event output");
-    ksd_frame frame = { 0 };
-    ksd_status status = event_next(connection, timeout_ms,
-        KSD_OP_CLIPBOARD_WATCH, KSD_OP_CLIPBOARD_EVENT, &frame, error);
-    if (status != KSD_STATUS_OK)
-        return status;
-    ksd_cursor cursor;
-    uint32_t text_length;
-    uint32_t count;
-    const uint8_t *text;
-    ksd_cursor_init(&cursor, frame.payload, frame.payload_length);
-    if (!ksd_cursor_u32(&cursor, &text_length)
-        || !ksd_cursor_u32(&cursor, &count)
-        || text_length > KSD_MAX_TEXT_BYTES || count > KSD_MAX_MIMETYPES
-        || !ksd_cursor_bytes(&cursor, text_length, &text)) {
-        ksd_frame_clear(&frame);
-        errno = EPROTO;
-        return system_failure(connection, error,
-                              "desktop service sent invalid clipboard event");
-    }
-    ksd_clipboard_event parsed;
-    ksd_clipboard_event_init(&parsed);
-    if (!parse_owned_string(text, text_length, false, &parsed.text))
-        goto invalid_clipboard_event;
-    parsed.mimetypes.items = count == 0u
-        ? NULL : calloc(count, sizeof(*parsed.mimetypes.items));
-    if (count != 0u && parsed.mimetypes.items == NULL) {
-        ksd_frame_clear(&frame);
-        ksd_clipboard_event_clear(&parsed);
-        return allocation_failure(error);
-    }
-    parsed.mimetypes.count = count;
-    for (uint32_t index = 0u; index < count; index++)
-        ksd_string_init(&parsed.mimetypes.items[index]);
-    for (uint32_t index = 0u; index < count; index++) {
-        uint32_t length;
-        const uint8_t *value;
-        if (!ksd_cursor_u32(&cursor, &length)
-            || length == 0u || length > KSD_MAX_MIMETYPE_BYTES
-            || !ksd_cursor_bytes(&cursor, length, &value)
-            || !parse_owned_string(value, length, false,
-                                   &parsed.mimetypes.items[index]))
-            goto invalid_clipboard_event;
-    }
-    if (!ksd_cursor_finished(&cursor))
-        goto invalid_clipboard_event;
-    ksd_frame_clear(&frame);
-    ksd_clipboard_event_clear(event);
-    *event = parsed;
-    return KSD_STATUS_OK;
-
-invalid_clipboard_event:
-    ksd_frame_clear(&frame);
-    ksd_clipboard_event_clear(&parsed);
-    errno = EPROTO;
-    return system_failure(connection, error,
-                          "desktop service sent invalid clipboard data");
-}
-
-ksd_status ksd_lease_next(ksd_connection *connection, uint32_t timeout_ms,
-                          uint32_t *revoked_scopes, ksd_error *error)
-{
-    if (connection == NULL || revoked_scopes == NULL || !valid_error(error)
-        || connection->role != KSD_ROLE_AUTHORIZATION_LEASE
-        || timeout_ms == 0u
-        || (timeout_ms > INT_MAX && timeout_ms != UINT32_MAX))
-        return invalid_argument(error, "invalid authorization lease poll");
-    pthread_mutex_lock(&connection->mutex);
-    ksd_frame frame = { 0 };
-    uint32_t revoked = 0u;
-    ksd_status status = read_event_locked(connection, timeout_ms,
-        KSD_OP_SESSION_REVOKED, &frame, &revoked, error);
+    if (connection == NULL || event == NULL || event->struct_size < sizeof(*event)
+        || !valid_error(error) || timeout_ms > KSD_MAX_WATCH_TIMEOUT_MS)
+        return invalid_argument(error, "invalid desktop state poll");
+    if (event->kind != 0u || event->data.data != NULL || event->window.title.data != NULL
+        || event->window.app_id.data != NULL || event->window.capture_id.data != NULL || event->window.compositor_id.data != NULL)
+        return invalid_argument(error, "clear the desktop state output before reuse");
+    ksd_frame frame = { 0 }; uint32_t revoked = 0u;
+    ksd_status status = read_event(connection, timeout_ms, KSD_OP_STATE_EVENT, &frame, &revoked, error);
     if (status == KSD_STATUS_REVOKED) {
-        *revoked_scopes = revoked;
-        reset_error(error);
-        status = KSD_STATUS_OK;
-    } else if (status == KSD_STATUS_OK) {
-        ksd_frame_clear(&frame);
-        errno = EPROTO;
-        status = system_failure(connection, error,
-                                "authorization lease sent invalid event");
+        event->kind = KSD_STATE_GRANT_CHANGED; event->domain = KSD_STATE_GRANTS;
+        event->revoked_scopes = revoked; event->granted_scopes = connection->granted_scopes;
+        reset_error(error); return KSD_STATUS_OK;
     }
-    pthread_mutex_unlock(&connection->mutex);
-    return status;
-}
-
-/* A frame whose first bytes have arrived is already on its way, so finishing
- * it is not a wait on the service. */
-#define KSD_LEASE_FRAME_TIMEOUT_MS 1000u
-
-ksd_status ksd_lease_refresh(ksd_connection *connection,
-                             uint32_t *granted_scopes, ksd_error *error)
-{
-    if (connection == NULL || granted_scopes == NULL || !valid_error(error)
-        || connection->role != KSD_ROLE_AUTHORIZATION_LEASE)
-        return invalid_argument(error, "invalid authorization lease refresh");
-    /* A request in flight on this connection reads every frame that arrives
-     * before its answer and applies any revocation among them, so the grants
-     * as they stand are current. */
-    if (pthread_mutex_trylock(&connection->mutex) != 0) {
-        *granted_scopes = __atomic_load_n(&connection->granted_scopes,
-                                          __ATOMIC_RELAXED);
-        reset_error(error);
-        return KSD_STATUS_OK;
-    }
-    ksd_status status = KSD_STATUS_OK;
-    if (connection->descriptor < 0) {
-        errno = ENOTCONN;
-        status = system_failure(connection, error,
-                                "authorization lease has ended");
-    }
-    while (status == KSD_STATUS_OK) {
-        struct pollfd item = {
-            .fd = connection->descriptor,
-            .events = POLLIN,
-        };
-        int ready = poll(&item, 1u, 0);
-        if (ready < 0 && errno == EINTR)
-            continue;
-        if (ready == 0)
-            break;
-        if (ready < 0 || (item.revents & POLLIN) == 0) {
-            if (ready > 0)
-                errno = ECONNRESET;
-            status = system_failure(connection, error,
-                                    "authorization lease has ended");
-            break;
-        }
-        ksd_frame frame = { 0 };
-        status = read_event_locked(connection, KSD_LEASE_FRAME_TIMEOUT_MS,
-                                   KSD_OP_SESSION_REVOKED, &frame, NULL, error);
-        if (status == KSD_STATUS_REVOKED) {
-            status = KSD_STATUS_OK;
-        } else if (status == KSD_STATUS_OK) {
-            ksd_frame_clear(&frame);
-            errno = EPROTO;
-            status = system_failure(connection, error,
-                                    "authorization lease sent invalid event");
-        }
-    }
-    if (status == KSD_STATUS_OK) {
-        *granted_scopes = __atomic_load_n(&connection->granted_scopes,
-                                          __ATOMIC_RELAXED);
-        reset_error(error);
-    }
-    pthread_mutex_unlock(&connection->mutex);
-    return status;
+    if (status != KSD_STATUS_OK) return status;
+    ksd_state_event parsed;
+    bool valid = ksd_state_event_decode(frame.payload, frame.payload_length, &parsed);
+    ksd_frame_clear(&frame);
+    if (!valid) { errno = EPROTO; return system_failure(connection, error, "desktop service sent invalid state data"); }
+    if (parsed.domain == KSD_STATE_GRANTS) connection->granted_scopes = parsed.granted_scopes;
+    *event = parsed; return KSD_STATUS_OK;
 }

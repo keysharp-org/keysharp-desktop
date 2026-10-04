@@ -7,30 +7,37 @@ int main(void)
     ksd_service_info info;
     ksd_error error;
     ksd_connection *connection = NULL;
+    ksd_connection *lease = NULL;
     ksd_capture capture;
-    uint32_t granted = 0u;
     FILE *file;
 
     ksd_connect_options_init(&options);
     ksd_service_info_init(&info);
     ksd_error_init(&error);
     ksd_capture_init(&capture);
+    options.role = KSD_ROLE_AUTHORIZATION_LEASE;
+    options.authorization_mode = KSD_AUTH_REQUEST;
     options.requested_scopes = KSD_SCOPE_SCREEN_CAPTURE;
 
-    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+    if (ksd_connect(&options, &lease, &info, &error) != KSD_STATUS_OK) {
         fprintf(stderr, "connect: %s\n", error.message);
         return 1;
     }
-    if (ksd_authorize(connection, KSD_AUTH_REQUEST, KSD_SCOPE_SCREEN_CAPTURE,
-                      &granted, &error) != KSD_STATUS_OK) {
-        fprintf(stderr, "authorize: %s\n", error.message);
-        ksd_disconnect(connection);
+    options.role = KSD_ROLE_RPC;
+    options.authorization_mode = KSD_AUTH_CHECK;
+    options.requested_scopes = 0u;
+    options.lease_id = info.lease_id;
+    ksd_service_info_init(&info);
+    if (ksd_connect(&options, &connection, &info, &error) != KSD_STATUS_OK) {
+        fprintf(stderr, "connect: %s\n", error.message);
+        ksd_disconnect(lease);
         return 1;
     }
     if (ksd_capture_area(connection, 0, 0, 400, 300, &capture, &error)
             != KSD_STATUS_OK) {
         fprintf(stderr, "capture: %s\n", error.message);
         ksd_disconnect(connection);
+        ksd_disconnect(lease);
         return 1;
     }
     if (capture.format == KSD_CAPTURE_FORMAT_PNG
@@ -41,5 +48,6 @@ int main(void)
     }
     ksd_capture_clear(&capture);
     ksd_disconnect(connection);
+    ksd_disconnect(lease);
     return 0;
 }

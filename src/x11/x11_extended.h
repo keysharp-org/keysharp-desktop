@@ -18,4 +18,5 @@ void ksd_x11_window_button(ksd_x11 *, uint32_t, int32_t, int32_t, uint32_t, bool
 void ksd_x11_window_focus_child(ksd_x11 *, uint32_t, ksd_operation_result *);
 void ksd_x11_keyboard_clear(ksd_x11 *);
 void ksd_x11_keyboard_state_since(ksd_x11 *, const uint8_t *, uint32_t, ksd_operation_result *);
+const char *ksd_x11_keyboard_revision(ksd_x11 *);
 #endif
