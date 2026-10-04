@@ -80,7 +80,9 @@ Generic Wayland returns the compositor's fixed window extent; its capture
 protocol does not offer an `include_decoration` choice. It
 returns the window's own pixels, so a client-side-decorated
 window carries alpha in its corners, while `ksd_capture_area` returns the
-opaque composited stage. Compare colours within one path, never across both.
+visible composited stage. Cinnamon area capture uses a uniform scale across
+the requested area and transparent padding in monitor gaps and outside outputs.
+Compare colours within one path, never across both.
 `include_decoration` adds the margin the compositor draws outside the visible
 window -- shadow and invisible border on GNOME, where server-side decoration is
 already inside the visible frame rect. A window that no longer exists, or that

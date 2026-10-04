@@ -546,9 +546,7 @@ uint64_t ksd_backend_operations(ksd_backend backend)
         | KSD_OPERATION_MOUSE_SCROLL
         | KSD_OPERATION_CURSOR_POSITION
         | KSD_OPERATION_WORK_AREA;
-    operations |= KSD_OPERATION_CAPTURE_WINDOW;
-    if (backend == KSD_BACKEND_GNOME)
-        operations |= KSD_OPERATION_CAPTURE_AREA;
+    operations |= KSD_OPERATION_CAPTURE_WINDOW | KSD_OPERATION_CAPTURE_AREA;
     return operations;
 }
 

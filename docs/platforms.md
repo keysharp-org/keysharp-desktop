@@ -5,7 +5,7 @@ What a session supports depends on its compositor, so check
 
 | Operation | X11 | KWin (Wayland) | GNOME Shell | Cinnamon | Generic Wayland |
 | --- | --- | --- | --- | --- | --- |
-| Area capture | yes | yes | in-memory | - | protocol-dependent |
+| Area capture | yes | yes | in-memory | in-memory | protocol-dependent |
 | Whole-desktop capture | - | - | - | - | portal-dependent |
 | Window capture | yes | yes | in-memory | in-memory | protocol-dependent |
 | Window queries/control | yes | yes | yes | yes | protocol-dependent |
@@ -30,13 +30,16 @@ tooltips. Without EWMH it uses the root tree and ICCCM client windows; active-wi
 queries fall back to input focus. Push events require an EWMH client list, so
 clients can poll the same query API on window managers without one.
 
-Cinnamon *area* capture is not advertised because the shell APIs available for
-it require named temporary image files; Cinnamon window capture reads the
-window actor back through a pixbuf and needs no file. Both GNOME capture paths stream PNG bytes
-into an in-memory output stream inside the shell process; neither writes a
-file. GNOME window capture paints the window's own actor, so it returns the
-window's alpha: a client-side-decorated window has transparent rounded
-corners, where GNOME area capture returns the opaque composited stage. KWin
+GNOME and Cinnamon area and window capture return PNG bytes from memory inside
+the shell process. Cinnamon area capture requires its stage capture API. It
+composes the visible stage at the maximum scale of the outputs intersecting
+the requested area, giving one pixel-to-screen transform across mixed-scale
+monitors. Monitor gaps and portions outside the outputs are transparent padding;
+a rectangle wholly outside the outputs fails. Cinnamon window
+capture reads the window actor back through a pixbuf. GNOME window capture
+paints the window's own actor, so it returns the window's alpha: a
+client-side-decorated window has transparent rounded corners, where area
+capture returns the opaque composited stage within the outputs. KWin
 returns `KSD_CAPTURE_FORMAT_BGRA8_PREMULTIPLIED` for both capture opcodes, so
 a caller compositing the result itself needs different math per backend.
 KWin capture needs

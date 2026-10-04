@@ -968,6 +968,7 @@ const MAX_CAPTURE_PIXELS = 64 * 1024 * 1024;
 // Retries are timer-driven, so this is a real time budget: 40 x 16ms.
 const PLACEMENT_MAX_TRIES = 40;
 const PLACEMENT_RETRY_MS = 16;
+const MAP_REFRESH_MAX_TRIES = 125;
 // How long the actor watchdog stays armed after placement; the observed yank fight lasts ~150ms.
 const PLACEMENT_WATCH_MS = 600;
 
@@ -1098,6 +1099,7 @@ class KeysharpExtensionCore {
         this._placements = [];
         this._placed = {};
         this._placementSources = new Set();
+        this._mapRefreshSources = new Map();
         // Overlays are keyed by "<ownerKey>:<id>" (see _overlayKey) so ids never collide across clients.
         // Each entry carries its owner so a dead client's overlays can be reaped:
         //   highlight  entry = { edges:[St.Widget...], ownerKey, ownerPid, ownerStartTime, busName }
@@ -1192,13 +1194,15 @@ class KeysharpExtensionCore {
 
                 if (win && win.__ksPlaceNow)
                     win.__ksPlaceNow();
-                if (win && this._isTrackedWindow(win))
+                if (win && this._isTrackedWindow(win)) {
                     this._hookWindowVisibility(win);
+                    this._refreshMappedWindow(win);
+                }
             } catch (_e) {
             }
         });
 
-        // Emit WindowEvent('create') for newly mapped windows and hook their per-window
+        // Emit WindowEvent('create') for newly created windows and hook their per-window
         // signals (title/minimize/move/close).
         this._winCreatedId = global.display.connect('window-created', (_disp, win) => {
             if (!win || !this._isTrackedWindow(win))
@@ -1272,6 +1276,10 @@ class KeysharpExtensionCore {
         }
 
         this._placementSources.clear();
+        for (const id of this._mapRefreshSources.values()) {
+            try { GLib.source_remove(id); } catch (_e) {}
+        }
+        this._mapRefreshSources.clear();
 
         for (const actor of global.get_window_actors()) {
             const win = actor.get_meta_window();
@@ -3014,15 +3022,41 @@ class KeysharpExtensionCore {
         actor.set_size(width, height);
     }
     _emitWindowEvent(type, win) {
-        if (!win) return;
-        let json;
+        if (!win) return false;
         try {
-            json = JSON.stringify(this._windowInfo(win));
+            this._emitWindowEventRaw(type, JSON.stringify(this._windowInfo(win)));
+            return true;
         } catch (_e) {
-            try { json = JSON.stringify({id: String(win.get_stable_sequence())}); }
-            catch (_e2) { return; }
+            return false;
         }
-        this._emitWindowEventRaw(type, json);
+    }
+
+    _refreshMappedWindow(win) {
+        const previous = this._mapRefreshSources.get(win);
+        if (previous)
+            GLib.source_remove(previous);
+
+        let remaining = MAP_REFRESH_MAX_TRIES;
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PLACEMENT_RETRY_MS, () => {
+            if (!this._isLiveWindow(win)) {
+                this._mapRefreshSources.delete(win);
+                return GLib.SOURCE_REMOVE;
+            }
+            try {
+                const frame = win.get_frame_rect();
+                if (frame.width > 0 && frame.height > 0
+                    && this._emitWindowEvent('changed', win)) {
+                    this._mapRefreshSources.delete(win);
+                    return GLib.SOURCE_REMOVE;
+                }
+            } catch (_e) {
+            }
+            if (--remaining > 0)
+                return GLib.SOURCE_CONTINUE;
+            this._mapRefreshSources.delete(win);
+            return GLib.SOURCE_REMOVE;
+        });
+        this._mapRefreshSources.set(win, id);
     }
 
     _emitWindowEventRaw(type, json) {
@@ -3080,7 +3114,14 @@ class KeysharpExtensionCore {
     }
 
     _unhookWindow(win) {
-        if (!win || !win._keysharpHooked)
+        if (!win)
+            return;
+        const refresh = this._mapRefreshSources.get(win);
+        if (refresh) {
+            GLib.source_remove(refresh);
+            this._mapRefreshSources.delete(win);
+        }
+        if (!win._keysharpHooked)
             return;
         for (const id of (win._keysharpHandlerIds || [])) {
             try { win.disconnect(id); } catch (_e) {}
@@ -3195,8 +3236,10 @@ class KeysharpExtensionCore {
             transparency: this._windowOpacity(win),
         };
         Object.assign(snapshot, extras.values);
-        snapshot.validFields = ['id', 'title', 'appId', 'frame', 'client', 'active',
+        snapshot.validFields = ['id', 'title', 'appId', 'active',
             'minimized', 'maximized', 'visible', 'alwaysOnTop', 'transparency'];
+        if (frame.width > 0 && frame.height > 0)
+            snapshot.validFields.push('frame', 'client');
         if (snapshot.pid > 0)
             snapshot.validFields.push('pid');
         if (buffer !== null)

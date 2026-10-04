@@ -646,9 +646,9 @@ bool ksd_provider_capture_supported(ksd_backend backend, uint16_t opcode)
 {
     bool window = opcode == KSD_OP_CAPTURE_WINDOW;
     bool area = opcode == KSD_OP_CAPTURE_AREA;
-    if (backend == KSD_BACKEND_GNOME)
+    if (backend == KSD_BACKEND_GNOME || backend == KSD_BACKEND_CINNAMON)
         return area || window;
-    return backend == KSD_BACKEND_CINNAMON && window;
+    return false;
 }
 
 static void execute_capture(uid_t uid, pid_t provider_pid,

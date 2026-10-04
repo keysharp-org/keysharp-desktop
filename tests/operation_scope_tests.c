@@ -213,10 +213,8 @@ int main(void)
         | KSD_OPERATION_CAPTURE_WINDOW;
     assert((ksd_backend_operations(KSD_BACKEND_GNOME) & in_memory_capture)
            == in_memory_capture);
-    assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
-            & KSD_OPERATION_CAPTURE_WINDOW) != 0u);
-    assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)
-            & KSD_OPERATION_CAPTURE_AREA) == 0u);
+    assert((ksd_backend_operations(KSD_BACKEND_CINNAMON) & in_memory_capture)
+           == in_memory_capture);
     assert((ksd_backend_operations(KSD_BACKEND_GNOME)
             & KSD_OPERATION_WINDOW_QUERY) != 0u);
     assert((ksd_backend_operations(KSD_BACKEND_CINNAMON)

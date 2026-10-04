@@ -7,6 +7,7 @@ const CinnamonGLib = imports.gi.GLib;
 const CinnamonMeta = imports.gi.Meta;
 const CinnamonSt = imports.gi.St;
 const CinnamonCairoGI = imports.gi.cairo;
+const CinnamonCairo = imports.cairo;
 const CinnamonMain = imports.ui.main;
 const CinnamonByteArray = imports.byteArray;
 
@@ -424,13 +425,7 @@ function encodePixbuf(pixbuf) {
         ? data : (data && typeof data.length === 'number' ? new Uint8Array(data) : null);
 }
 
-function captureWindow(provider, handle, includeDecoration, reply) {
-    let pixbuf = null;
-    try {
-        pixbuf = captureWindowPixbuf(provider, handle, includeDecoration);
-    } catch (e) {
-        global.logError(e, 'Keysharp: CaptureWindow failed');
-    }
+function replyPixbuf(pixbuf, reply, label) {
     if (pixbuf === null) {
         reply(null);
         return;
@@ -459,10 +454,99 @@ function captureWindow(provider, handle, includeDecoration, reply) {
             stream.close(null);
             reply(stream.steal_as_bytes().get_data());
         } catch (e) {
-            global.logError(e, 'Keysharp: CaptureWindow encode failed');
+            global.logError(e, `Keysharp: ${label} encode failed`);
             reply(null);
         }
     });
+}
+
+function captureAreaPixbuf(provider, params) {
+    const [x, y, width, height] = params;
+    const bridge = gdkPixbufBridge();
+    if (bridge === null || typeof global.stage.capture !== 'function'
+        || !provider._validCaptureGeometry(width, height))
+        return null;
+
+    // Bound readback before Muffin allocates its per-output surfaces.
+    const resourceScale = global.stage.get_resource_scale();
+    const [scaleKnown, scaleValue] = Array.isArray(resourceScale)
+        ? resourceScale : [true, resourceScale];
+    const maximumScale = Math.ceil(scaleValue);
+    if (!scaleKnown || !Number.isFinite(maximumScale) || maximumScale < 1
+        || !provider._validCaptureGeometry(width * maximumScale,
+            height * maximumScale))
+        return null;
+
+    const rect = new CinnamonCairoGI.RectangleInt();
+    rect.x = x;
+    rect.y = y;
+    rect.width = width;
+    rect.height = height;
+    const [success, captures] = global.stage.capture(true, rect);
+    let surface = null;
+    let context = null;
+    try {
+        if (!success || captures.length === 0)
+            return null;
+
+        let scale = 0;
+        for (const capture of captures) {
+            const [scaleX, scaleY] = capture.image.getDeviceScale();
+            if (!Number.isFinite(scaleX) || scaleX <= 0 || scaleX !== scaleY)
+                return null;
+            scale = Math.max(scale, scaleX);
+        }
+        const pixelWidth = Math.round(width * scale);
+        const pixelHeight = Math.round(height * scale);
+        if (!provider._validCaptureGeometry(pixelWidth, pixelHeight))
+            return null;
+
+        // Stage captures retain each output's scale. One common scale keeps a
+        // rectangle spanning different outputs linearly mapped for callers.
+        surface = new CinnamonCairo.ImageSurface(CinnamonCairo.Format.ARGB32,
+            pixelWidth, pixelHeight);
+        context = new CinnamonCairo.Context(surface);
+        context.scale(scale, scale);
+        for (const capture of captures) {
+            context.save();
+            context.rectangle(capture.rect.x - x, capture.rect.y - y,
+                capture.rect.width, capture.rect.height);
+            context.clip();
+            context.setSourceSurface(capture.image, capture.rect.x - x,
+                capture.rect.y - y);
+            context.paint();
+            context.restore();
+        }
+        return bridge.pixbuf_get_from_surface(surface, 0, 0,
+            pixelWidth, pixelHeight);
+    } finally {
+        if (context !== null)
+            context.$dispose();
+        if (surface !== null)
+            surface.finish();
+        for (const capture of captures)
+            capture.image.finish();
+    }
+}
+
+function captureArea(provider, params, reply) {
+    let pixbuf = null;
+    try {
+        pixbuf = captureAreaPixbuf(provider, params);
+    } catch (e) {
+        global.logError(e, 'Keysharp: CaptureArea failed');
+    }
+    replyPixbuf(pixbuf, reply, 'CaptureArea');
+}
+
+function captureWindow(provider, handle, includeDecoration, reply) {
+    let pixbuf = null;
+    try {
+        pixbuf = captureWindowPixbuf(provider, handle, includeDecoration);
+    } catch (e) {
+        global.logError(e, 'Keysharp: CaptureWindow failed');
+    }
+    replyPixbuf(pixbuf, reply, 'CaptureWindow');
 }
 
 function windowExtras(win) {
@@ -521,7 +605,7 @@ const env = {
     decodeBytes: bytes => CinnamonByteArray.toString(bytes),
     addClickThroughChrome: addClickThroughChrome,
     makeImageContent: makeImageContent,
-    captureArea: null,
+    captureArea: captureArea,
     captureWindow: captureWindow,
     setDecorated: (win, decorated) => {
         win.decorated = decorated;

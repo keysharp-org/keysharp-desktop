@@ -204,11 +204,11 @@ endforeach()
 file(READ "${SOURCE_DIR}/providers/cinnamon/extension.js" cinnamon_provider)
 string(FIND "${cinnamon_provider}" "CaptureAreaAsync" cinnamon_area)
 string(FIND "${cinnamon_provider}" "CaptureWindowAsync" cinnamon_window)
-string(FIND "${cinnamon_provider}" "captureArea: null" cinnamon_area_disabled)
+string(FIND "${cinnamon_provider}" "captureArea: captureArea" cinnamon_area_enabled)
 if(cinnamon_area EQUAL -1 OR cinnamon_window EQUAL -1
-        OR cinnamon_area_disabled EQUAL -1)
+        OR cinnamon_area_enabled EQUAL -1)
     message(FATAL_ERROR
-        "Cinnamon must disable area capture and expose bounded window capture")
+        "Cinnamon must expose bounded in-memory area and window capture")
 endif()
 string(FIND "${cinnamon_provider}" "\n    CaptureWindow(" cinnamon_sync)
 if(NOT cinnamon_sync EQUAL -1)
@@ -218,6 +218,9 @@ endif()
 foreach(required
         "imports.gi.versions.Gdk = '3.0'"
         "actor.get_image"
+        "global.stage.capture(true, rect)"
+        "capture.image.getDeviceScale()"
+        "capture.image.finish()"
         "_validCaptureGeometry(width, height)"
         "typeof pixbuf.save_to_streamv_async !== 'function'"
         "pixbuf.save_to_streamv_async(stream, 'png', [], [], null,"
@@ -228,7 +231,7 @@ foreach(required
     string(FIND "${cinnamon_provider}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR
-            "Cinnamon window capture invariant missing: ${required}")
+            "Cinnamon capture invariant missing: ${required}")
     endif()
 endforeach()
 foreach(forbidden

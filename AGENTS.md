@@ -100,7 +100,8 @@ What a session supports depends on its compositor, so a client reads
 capture on a `kwin_wayland` session and falls back to `KSD_BACKEND_GENERIC` on
 KDE X11; GNOME Shell and
 Cinnamon provide window operations and events, clipboard reads and events, pointer
-control, cursor position and work area, with in-memory area and window capture on GNOME. Every
+control, cursor position and work area, with in-memory area and window capture. Cinnamon
+area capture requires the compositor's stage capture API. Every
 other compositor registers `KSD_BACKEND_GENERIC`, which serves what the shared Wayland
 protocols allow a client OUTSIDE the compositor to do -- the three clipboard reads over
 ext-data-control-v1, the window list over ext-foreign-toplevel-list-v1, and window state

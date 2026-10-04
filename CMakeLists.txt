@@ -843,6 +843,8 @@ if(BUILD_TESTING)
     if(KSD_NODE_EXECUTABLE)
         add_test(NAME window-state-tests COMMAND ${KSD_NODE_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/window_state_tests.js)
+        add_test(NAME cinnamon-capture-tests COMMAND ${KSD_NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/cinnamon_capture_tests.js)
     endif()
 
     add_test(NAME portable-compatibility-tests

@@ -120,8 +120,8 @@ only after the peer's kernel credentials identify root. At backend registration,
 the authority looks up the process owning the compositor's canonical session-bus
 name in a credential-dropped helper, then pins the captured process identity;
 it never attempts a root connection to the user bus. KWin script calls are also
-pinned to the unique owner of its canonical bus name. Both GNOME capture calls
-answer on the private peer with PNG bytes from an in-memory stream. KWin capture
+pinned to the unique owner of its canonical bus name. GNOME and Cinnamon capture
+calls answer on the private peer with PNG bytes from memory. KWin capture
 uses an isolated worker, a root-owned directional pipe, and a write-only D-Bus
 call child. The non-dumpable worker drains pixels while that child returns only
 fixed-size metadata. Generic whole-desktop capture asks the desktop screenshot
