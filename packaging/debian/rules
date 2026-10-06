@@ -3,16 +3,9 @@
 # The client ABI, not the product version, is the package's contract, and the public header states it.
 ABI_MINOR := $(shell sed -n 's/^\#define KSD_CLIENT_ABI_MINOR \([0-9]*\)u*$$/\1/p' include/keysharp_desktop/client.h)
 
-# dpkg-source and sbuild make source roots and build parents group-writable.
-# Permission tests require every ancestor of the generated HOME to be non-writable by others.
+# dpkg-source makes the source and debian roots group-writable.
 %:
 	chmod go-w . debian
-	build_parent="$$(dirname "$$(pwd -P)")"; \
-	while case "$$build_parent" in /build|/build/*) true;; *) false;; esac; do \
-		[ "$$(stat -c %u "$$build_parent")" = "$$(id -u)" ] || break; \
-		chmod go-w "$$build_parent" || exit; \
-		build_parent="$$(dirname "$$build_parent")"; \
-	done
 	umask 0022; dh $@
 
 # libexec is fixed because the capture worker's path is compiled into the service.
@@ -20,9 +13,8 @@ override_dh_auto_configure:
 	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBEXECDIR=libexec \
 		-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF
 
-# The tests bind sockets below XDG_RUNTIME_DIR, which a build machine does not provide.
 override_dh_auto_test:
-	runtime="$$(mktemp -d)" && XDG_RUNTIME_DIR="$$runtime" dh_auto_test; status=$$?; rm -rf "$$runtime"; exit $$status
+	sh debian/run-tests
 
 # The capture worker is root-only; dh_fixperms would make it world-executable.
 override_dh_fixperms:
