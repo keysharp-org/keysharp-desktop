@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the unsigned Launchpad source uploads for this project, one per Ubuntu series, into
-# OUTPUT_DIR. The upstream tarball is the committed HEAD with its submodules; debian/ is
-# packaging/debian as it stands.
+# OUTPUT_DIR. The upstream tarball is SOURCE_DIR's committed HEAD with its submodules; debian/
+# comes from the packaging tree containing this script.
 #
 # Environment:
 #   VERSION        upstream version; defaults to the CMake project version
@@ -10,11 +10,12 @@
 #   PPA            owner/name; when that PPA already holds this version's upstream tarball, it is
 #                  reused, because Launchpad accepts no other file under the same name
 #   OUTPUT_DIR     default: dist/ppa
+#   SOURCE_DIR     upstream checkout; defaults to the tree containing this script
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HERE="${ROOT}/packaging/ppa"
-NAME="$(sed -n 's/^Source: //p' "${ROOT}/packaging/debian/control")"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SOURCE_DIR:-${HERE}/../..}" && pwd)"
+NAME="$(sed -n 's/^Source: //p' "${HERE}/../debian/control")"
 VERSION="${VERSION:-$(sed -n "/^project(${NAME}/,/LANGUAGES/s/^[[:space:]]*VERSION \([0-9.]*\)$/\1/p" "${ROOT}/CMakeLists.txt")}"
 SERIES="${SERIES:-noble resolute}"
 PPA_REVISION="${PPA_REVISION:-1}"
@@ -26,7 +27,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${ROOT}/dist/ppa}"
   || { echo "Invalid SERIES or PPA_REVISION." >&2; exit 1; }
 
 epoch="$(git -C "${ROOT}" log -1 --format=%ct HEAD)"
-maintainer="$(sed -n 's/^Maintainer: //p' "${ROOT}/packaging/debian/control")"
+maintainer="$(sed -n 's/^Maintainer: //p' "${HERE}/../debian/control")"
 work="$(mktemp -d)"
 trap 'rm -rf -- "${work}"' EXIT
 orig_name="${NAME}_${VERSION}.orig.tar.xz"
@@ -60,7 +61,7 @@ for series in ${SERIES}; do
   mkdir -p "${dir}"
   ln -s "${orig}" "${dir}/${orig_name}"
   tar -xJf "${orig}" -C "${dir}"
-  cp -a "${ROOT}/packaging/debian" "${source_dir}/debian"
+  cp -a "${HERE}/../debian" "${source_dir}/debian"
   chmod 0755 "${source_dir}/debian/rules"
   cat > "${source_dir}/debian/changelog" <<EOF
 ${NAME} (${debian_version}) ${series}; urgency=medium

@@ -124,9 +124,29 @@ the capture worker root-only.
 Launchpad accepts each version once, so the workflow first builds every series and
 architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container
 of the series, offline and unprivileged, as Launchpad does. Rerunning the workflow
-uploads only what the PPA lacks. The `ppa_revision` input uploads a released version
+uploads only what the PPA lacks. Failed transfers are retried up to three times,
+waiting 10 and then 20 seconds, without changing the signed files. The PPA is checked
+after each failed transfer to avoid repeating an upload it has accepted.
+
+For an existing GitHub release, dispatch `Release` from `main` with its `tag` and
+`ppa_only` set to `true`. This builds and rehearses the source uploads without
+rebuilding or publishing GitHub assets. The upstream source remains the tagged tree;
+Debian packaging, rehearsal and upload tools come from the workflow revision, so a
+packaging fix can be applied without moving the release tag.
+
+The `ppa_revision` input uploads a released version
 again as `<version>-1~<series><revision>`, reusing the upstream tarball Launchpad
-already holds. To rehearse locally, with Docker installed:
+already holds. Keep the revision unchanged when recovering a transfer that Launchpad
+never accepted. Raise it when replacing an accepted package, including one whose
+Launchpad build failed. For example, after a packaging fix for the accepted v1.0.0
+Noble upload:
+
+```bash
+gh workflow run release.yml --repo keysharp-org/keysharp-desktop --ref main \
+  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=2
+```
+
+To rehearse locally, with Docker installed:
 
 ```bash
 SERIES=noble bash packaging/ppa/build-source.sh

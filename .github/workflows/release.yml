@@ -14,6 +14,11 @@ on:
         required: false
         type: string
         default: "1"
+      ppa_only:
+        description: Build and upload PPA packages for the tag without publishing GitHub assets
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -88,6 +93,7 @@ jobs:
           echo "ppa_series=$(jq -cn --arg series "$PPA_SERIES" '$series | split(" ")')" >> "$GITHUB_OUTPUT"
 
   nix:
+    if: ${{ !inputs.ppa_only }}
     needs: prepare
     runs-on: ubuntu-24.04
     steps:
@@ -100,6 +106,7 @@ jobs:
         run: nix flake check --no-write-lock-file
 
   build:
+    if: ${{ !inputs.ppa_only }}
     needs: prepare
     strategy:
       fail-fast: false
@@ -222,6 +229,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: ${{ !inputs.ppa_only }}
     needs:
       - prepare
       - nix
@@ -291,6 +299,13 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      # Packaging can be repaired without changing the released upstream tree.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          persist-credentials: false
+
       - name: Install Debian source tools
         run: |
           sudo apt-get update
@@ -301,7 +316,8 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           SERIES: ${{ env.PPA_SERIES }}
           PPA_REVISION: ${{ inputs.ppa_revision || '1' }}
-        run: bash packaging/ppa/build-source.sh
+          SOURCE_DIR: ${{ github.workspace }}
+        run: bash .release-tools/packaging/ppa/build-source.sh
 
       - uses: actions/upload-artifact@v7
         with:
@@ -325,7 +341,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.prepare.outputs.source_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v8
@@ -338,8 +354,7 @@ jobs:
           SERIES: ${{ matrix.series }}
         run: bash packaging/ppa/rehearse.sh dist/ppa/keysharp-desktop_*~"$SERIES"*.dsc "$SERIES" dist/rehearsal
 
-  # Independent of the GitHub publish job, which refuses a rerun once the release exists, so a rerun
-  # still uploads just the series Launchpad does not have.
+  # PPA recovery does not replace already published GitHub assets.
   publish-ppa:
     needs:
       - prepare
@@ -348,7 +363,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.prepare.outputs.source_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v8
