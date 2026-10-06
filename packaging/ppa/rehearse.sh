@@ -30,13 +30,14 @@ docker start -a "${container}"
 docker commit "${container}" "${image}" >/dev/null
 docker rm "${container}" >/dev/null
 
-# Exercise Debian's directory permissions with a group-writable default umask.
+# Exercise sbuild's group-writable build parents as well as source extraction.
+chmod 0775 "${build}"
 docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/nonexistent -e LC_ALL=C.UTF-8 \
   -e DEB_BUILD_OPTIONS="parallel=$(nproc)" -v "${source_dir}:/src:ro" -v "${build}:/build" -w /build \
-  "${image}" bash -euc 'umask 0002; dpkg-source -x "/src/$1" source && cd source && dpkg-buildpackage -b -us -uc' \
+  "${image}" bash -euc 'umask 0002; mkdir package; dpkg-source -x "/src/$1" package/source && cd package/source && dpkg-buildpackage -b -us -uc' \
   rehearse "$(basename "${dsc}")"
 
-cp "${build}"/*.deb "${out}/"
+cp "${build}"/package/*.deb "${out}/"
 for deb in "${out}"/*.deb; do
   dpkg-deb --info "${deb}"
 done

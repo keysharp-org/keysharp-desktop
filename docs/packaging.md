@@ -124,8 +124,10 @@ the capture worker root-only.
 Launchpad accepts each version once, so the workflow first builds every series and
 architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container
 of the series, offline and unprivileged, as Launchpad does. The rehearsal extracts
-with umask `0002`; Debian rules remove group and other write access from the extracted
-source and `debian` roots so the permission tests can use debhelper's generated home.
+with umask `0002` beneath group-writable build parents, matching sbuild's `/build`
+layout. Debian rules remove group and other write access from the extracted source
+and `debian` roots and builder-owned `/build` ancestors so permission tests can use
+debhelper's generated home.
 Rerunning the workflow
 uploads only what the PPA lacks. Failed transfers are retried up to three times,
 waiting 10 and then 20 seconds, without changing the signed files. The PPA is checked
@@ -142,11 +144,11 @@ again as `<version>-1~<series><revision>`, reusing the upstream tarball Launchpa
 already holds. Keep the revision unchanged when recovering a transfer that Launchpad
 never accepted. Raise it when replacing an accepted package, including one whose
 Launchpad build failed. For example, after a packaging fix for the accepted v1.0.0
-Noble upload:
+revision 2 uploads:
 
 ```bash
 gh workflow run release.yml --repo keysharp-org/keysharp-desktop --ref main \
-  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=2
+  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=3
 ```
 
 To rehearse locally, with Docker installed:
