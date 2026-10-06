@@ -3,8 +3,10 @@
 # The client ABI, not the product version, is the package's contract, and the public header states it.
 ABI_MINOR := $(shell sed -n 's/^\#define KSD_CLIENT_ABI_MINOR \([0-9]*\)u*$$/\1/p' include/keysharp_desktop/client.h)
 
-# Permission tests reject group-writable ancestors in debhelper's generated HOME.
+# dpkg-source applies the builder's umask to these roots before debhelper runs.
+# Permission tests require every ancestor of the generated HOME to be non-writable by others.
 %:
+	chmod go-w . debian
 	umask 0022; dh $@
 
 # libexec is fixed because the capture worker's path is compiled into the service.

@@ -123,7 +123,10 @@ the capture worker root-only.
 
 Launchpad accepts each version once, so the workflow first builds every series and
 architecture from that upload with `packaging/ppa/rehearse.sh`: in a clean container
-of the series, offline and unprivileged, as Launchpad does. Rerunning the workflow
+of the series, offline and unprivileged, as Launchpad does. The rehearsal extracts
+with umask `0002`; Debian rules remove group and other write access from the extracted
+source and `debian` roots so the permission tests can use debhelper's generated home.
+Rerunning the workflow
 uploads only what the PPA lacks. Failed transfers are retried up to three times,
 waiting 10 and then 20 seconds, without changing the signed files. The PPA is checked
 after each failed transfer to avoid repeating an upload it has accepted.
