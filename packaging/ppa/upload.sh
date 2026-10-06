@@ -37,5 +37,10 @@ for changes in "$@"; do
   fi
   # debsign asks before replacing a signature and after a failed one; no stdin makes it decide at once.
   debsign --no-conf --re-sign -p "${GNUPGHOME}/sign" -k "${fingerprint}" "${changes}" </dev/null
-  dput "ppa:${ppa}" "${changes}"
+  # Launchpad's FTP intake fails transiently; a new session starts a fresh upload.
+  for attempt in 1 2 3; do
+    dput "ppa:${ppa}" "${changes}" && break
+    [[ "${attempt}" -lt 3 ]] || exit 1
+    sleep 30
+  done
 done

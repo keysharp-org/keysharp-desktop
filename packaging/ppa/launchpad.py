@@ -22,10 +22,10 @@ def get(url):
         return json.load(response)
 
 
-def sources(ppa, source):
+def sources(ppa, source, **filters):
     owner, name = ppa.split("/", 1)
     query = urllib.parse.urlencode(
-        {"ws.op": "getPublishedSources", "source_name": source, "exact_match": "true"})
+        {"ws.op": "getPublishedSources", "source_name": source, "exact_match": "true", **filters})
     url = f"{API}/~{owner}/+archive/ubuntu/{name}?{query}"
     while url:
         page = get(url)
@@ -35,7 +35,8 @@ def sources(ppa, source):
 
 def main(command, ppa, source, version):
     if command == "has-version":
-        return 0 if any(s["source_package_version"] == version for s in sources(ppa, source)) else 1
+        # Only a version filter lists publications still pending.
+        return 0 if any(sources(ppa, source, version=version)) else 1
     if command == "orig-url":
         for publication in sources(ppa, source):
             if publication["source_package_version"].startswith(version + "-"):
