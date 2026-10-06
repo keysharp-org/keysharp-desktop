@@ -17,8 +17,7 @@ Build-Depends: debhelper-compat (= 13),
                libwayland-dev,
                libwayland-bin,
                wayland-protocols (>= 1.39),
-               dbus <!nocheck>,
-               proot <!nocheck>
+               dbus <!nocheck>
 Standards-Version: 4.7.0
 Homepage: https://github.com/keysharp-org/keysharp-desktop
 Rules-Requires-Root: no

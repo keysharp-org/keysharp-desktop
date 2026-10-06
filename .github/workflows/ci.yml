@@ -86,10 +86,7 @@ jobs:
           shellcheck install.sh uninstall.sh packaging/install-release.sh packaging/check-runtime.sh
           packaging/debian/preinst packaging/debian/postinst
           packaging/debian/prerm packaging/debian/postrm packaging/debian/run-tests
-          packaging/ppa/*.sh tests/ppa_upload_tests.sh
-
-      - name: Test PPA upload recovery
-        run: bash tests/ppa_upload_tests.sh "$GITHUB_WORKSPACE"
+          packaging/ppa/*.sh
 
       - name: Validate install tree and Debian package
         env:

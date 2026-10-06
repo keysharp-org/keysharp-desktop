@@ -3,7 +3,7 @@
 # The client ABI, not the product version, is the package's contract, and the public header states it.
 ABI_MINOR := $(shell sed -n 's/^\#define KSD_CLIENT_ABI_MINOR \([0-9]*\)u*$$/\1/p' include/keysharp_desktop/client.h)
 
-# dpkg-source makes the source and debian roots group-writable.
+# dpkg-source extracts these group-writable, which the permission-store tests refuse.
 %:
 	chmod go-w . debian
 	umask 0022; dh $@
