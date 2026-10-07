@@ -135,8 +135,11 @@ PPA; `debian/` and the PPA tools come from `main`:
 
 ```bash
 gh workflow run release.yml --repo keysharp-org/keysharp-desktop --ref main \
-  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=4
+  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=5
 ```
+
+The live-upgrade test fix is carried as a Debian patch for older tagged source;
+the source builder omits it when that source already contains the fix.
 
 To rehearse locally, with Docker installed:
 
