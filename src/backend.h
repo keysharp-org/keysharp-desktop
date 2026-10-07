@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-/* Synchronize the graphical-session variables inherited by this daemon with
+/* Synchronize graphical-session variables and the user state directory with
  * the current systemd user-manager environment. A user manager survives
  * logout, so a service restarted between sessions can otherwise keep the old
  * desktop identity for its whole lifetime. */

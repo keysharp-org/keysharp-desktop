@@ -6,6 +6,9 @@ project(keysharp-desktop
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
 
+option(KEYSHARP_DESKTOP_AUTO_ENABLE_EXTENSION
+    "enable the shell extension once per user and desktop at session startup" ON)
+
 include(GNUInstallDirs)
 include(CTest)
 include(CMakePackageConfigHelpers)
@@ -140,6 +143,7 @@ add_executable(keysharp-desktop
 # the running shell searches there. Taken from the same variable the install
 # rule uses rather than assumed to be /usr/local.
 target_compile_definitions(keysharp-desktop PRIVATE
+    KSD_AUTO_ENABLE_EXTENSION=$<BOOL:${KEYSHARP_DESKTOP_AUTO_ENABLE_EXTENSION}>
     KSD_EXTENSION_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}")
 
 add_library(keysharp-desktop-capture STATIC

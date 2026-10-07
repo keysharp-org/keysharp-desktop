@@ -309,11 +309,11 @@ refresh_invoking_user_manager() {
         HOME="$invoking_home" USER="$invoking_name" LOGNAME="$invoking_name" \
         LANG=C PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$invoking_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$invoking_runtime/bus" \
-        "$enable_binary" enable-extension >/dev/null 2>&1 \
+        "$enable_binary" enable-extension --automatic >/dev/null 2>&1 \
         || extension_status=$?
     case "$extension_status" in
-        0) extension_note="Shell extension enabled, or not needed on this desktop." ;;
-        3) extension_note="Shell extension enabled. Log out and back in to load it." ;;
+        0) extension_note="Shell extension setup checked; existing choices were preserved." ;;
+        3) extension_note="Shell extension setup needs attention. Run keysharp-desktop enable-extension as yourself for details." ;;
         *) extension_note="Could not enable the shell extension. Run this as yourself: keysharp-desktop enable-extension" ;;
     esac
 

@@ -37,19 +37,40 @@ Other distributions must supply them through their package manager. Archives tar
 glibc 2.35 or newer.
 
 Both routes install and enable the system authority and the graphical session service.
-On GNOME or Cinnamon, run the following as your graphical user:
+On GNOME or Cinnamon, the service configures the bundled extension once for each
+user and desktop, when the shell first becomes available during startup or later
+provider reconciliation. Installing on Cinnamon and
+later logging into GNOME configures each desktop separately. Completion markers
+under `$XDG_STATE_HOME/keysharp-desktop` (default `~/.local/state/keysharp-desktop`)
+preserve later manual disables. A marker records that the extension setting was
+accepted, including when a logout is still needed to load it; provider readiness
+is checked separately. GNOME's global user-extension switch and existing explicit
+entries in `disabled-extensions` are respected, even before a completion marker
+exists.
+
+If the provider needs repair, run the following as your graphical user:
 
 ```sh
 keysharp-desktop enable-extension
 ```
 
-Log out and back in if the command asks you to. The archive installer and Keysharp's
-combined setup attempt this step for the account running sudo. KWin and other
-compositors do not need this extension step. Available operations vary by compositor;
+Log out and back in if the command asks you to. KWin and other compositors do not
+need this extension step. Available operations vary by compositor;
 see [platform support](platforms.md).
 
-The NixOS module enables the extension once for each user at their first graphical
-login after installation. A later manual disable remains in effect.
+`enable-extension --automatic` uses the same per-desktop completion markers as
+the session service and preserves an extension explicitly listed as disabled.
+It reports `status=not_applicable` when setup is already recorded or an explicit
+disable is preserved. Installers and login helpers use this mode; the command
+without the flag can explicitly re-enable the extension.
+Automatic invocations read `XDG_STATE_HOME` from the graphical session's systemd
+user-manager environment, so installation and session startup use the same marker
+directory. If that environment is unavailable, automatic invocation reports
+`status=no_shell` without changing settings, allowing startup helpers to retry.
+
+The NixOS module uses a login helper for the same once-per-user-and-desktop setup;
+the helper briefly retries while the graphical session starts. Its
+`autoEnableExtension` option can disable automatic activation.
 
 ## Check and repair
 

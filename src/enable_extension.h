@@ -5,20 +5,9 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-/* Turns on the bundled shell extension for the user running the command.
- *
- * The install places the extension but has never enabled it, and until it is
- * enabled the daemon finds no provider, registers no backend, and clients are
- * told the selected backend is None or Generic. That is a silent failure with
- * a confusing symptom, so this command exists to make it one step -- and, when
- * it cannot finish the job, to say exactly which of the several things that
- * quietly defeat an enable is in the way.
- *
- * Deliberately per-user. Enablement lives in the user's own dconf, so there is
- * no machine-wide equivalent short of a dconf system database, which would
- * also stop the user ever turning it off. The command therefore refuses to run
- * as root: run under sudo it would write root's dconf and report success.
- */
+/* Enablement belongs to the user's dconf. Both automatic activation and the
+ * explicit command refuse elevated credentials rather than changing root's
+ * settings. Automatic activation preserves later manual disables. */
 
 /* What the command concluded. Every one of these is reported as a distinct
  * status= line, because they are the outcomes a user would otherwise have to
@@ -82,6 +71,12 @@ char **ksd_strv_without(const char *const *values, const char *removal);
  * whole entries with trailing slashes ignored so that /usr/local/share and
  * /usr/local/share/ are one answer rather than two. */
 bool ksd_data_dir_listed(const char *search_path, const char *directory);
+
+/* Records successful setup per desktop. An unavailable shell or a failed
+ * activation leaves the next session free to try again. */
+ksd_enable_status ksd_enable_extension_once(const char *state_home, const char *desktop,
+    ksd_enable_status (*activate)(const void *context), const void *context);
+void ksd_enable_extension_for_session(void);
 
 int ksd_enable_extension_main(int argc, char **argv);
 

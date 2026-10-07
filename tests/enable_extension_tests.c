@@ -10,6 +10,7 @@
 
 #include <assert.h>
 #include <glib.h>
+#include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -165,6 +166,84 @@ static void check_status_names_are_distinct(void)
     }
 }
 
+typedef struct {
+    ksd_enable_status status;
+    unsigned *calls;
+} activation_scenario;
+
+static ksd_enable_status simulate_activation(const void *context)
+{
+    const activation_scenario *scenario = context;
+    (*scenario->calls)++;
+    return scenario->status;
+}
+
+static void check_session_activation(void)
+{
+    char *state = g_dir_make_tmp("keysharp-extension-tests-XXXXXX", NULL);
+    assert(state != NULL);
+    char *directory = g_build_filename(state, "keysharp-desktop", NULL);
+    char *gnome = g_build_filename(directory, "extension-enabled-gnome", NULL);
+    char *cinnamon = g_build_filename(directory,
+                                      "extension-enabled-cinnamon", NULL);
+    unsigned calls = 0u;
+    activation_scenario scenario = { KSD_ENABLE_NO_SHELL, &calls };
+
+    assert(ksd_enable_extension_once(state, "gnome", simulate_activation,
+                                    &scenario) == KSD_ENABLE_NO_SHELL);
+    assert(calls == 1u && !g_file_test(gnome, G_FILE_TEST_EXISTS));
+    scenario.status = KSD_ENABLE_ENABLED;
+    assert(ksd_enable_extension_once(state, "gnome", simulate_activation,
+                                    &scenario) == KSD_ENABLE_ENABLED);
+    assert(calls == 2u && g_file_test(gnome, G_FILE_TEST_EXISTS));
+
+    /* A later manual disable must not call the activator again. */
+    scenario.status = KSD_ENABLE_KILL_SWITCH;
+    assert(ksd_enable_extension_once(state, "gnome", simulate_activation,
+                                    &scenario) == KSD_ENABLE_NOT_APPLICABLE);
+    assert(calls == 2u);
+
+    scenario.status = KSD_ENABLE_ALREADY_LIVE;
+    assert(ksd_enable_extension_once(state, "cinnamon", simulate_activation,
+                                    &scenario) == KSD_ENABLE_ALREADY_LIVE);
+    assert(calls == 3u && g_file_test(cinnamon, G_FILE_TEST_EXISTS));
+    assert(g_remove(gnome) == 0 && g_remove(cinnamon) == 0);
+
+    const ksd_enable_status completed[] = {
+        KSD_ENABLE_ALREADY_LIVE, KSD_ENABLE_ENABLED,
+        KSD_ENABLE_NEEDS_RELOGIN, KSD_ENABLE_ALREADY_LISTED,
+    };
+    for (size_t index = 0u; index < G_N_ELEMENTS(completed); index++) {
+        scenario.status = completed[index];
+        assert(ksd_enable_extension_once(state, "gnome", simulate_activation,
+                                        &scenario) == completed[index]);
+        assert(g_file_test(gnome, G_FILE_TEST_EXISTS));
+        assert(g_remove(gnome) == 0);
+    }
+
+    const ksd_enable_status incomplete[] = {
+        KSD_ENABLE_NOT_APPLICABLE, KSD_ENABLE_NO_SHELL, KSD_ENABLE_NO_BUS,
+        KSD_ENABLE_KILL_SWITCH, KSD_ENABLE_LOCKED, KSD_ENABLE_NO_SCHEMA,
+        KSD_ENABLE_SHELL_REJECTED, KSD_ENABLE_REFUSED,
+    };
+    for (size_t index = 0u; index < G_N_ELEMENTS(incomplete); index++) {
+        scenario.status = incomplete[index];
+        assert(ksd_enable_extension_once(state, "gnome", simulate_activation,
+                                        &scenario) == incomplete[index]);
+        assert(!g_file_test(gnome, G_FILE_TEST_EXISTS));
+    }
+    unsigned prior = calls;
+    assert(ksd_enable_extension_once(state, "other", simulate_activation,
+                                    &scenario) == KSD_ENABLE_NOT_APPLICABLE);
+    assert(calls == prior);
+
+    assert(g_rmdir(directory) == 0 && g_rmdir(state) == 0);
+    g_free(cinnamon);
+    g_free(gnome);
+    g_free(directory);
+    g_free(state);
+}
+
 int main(void)
 {
     check_list_membership();
@@ -174,5 +253,6 @@ int main(void)
     check_credentials_refused();
     check_exit_code_contract();
     check_status_names_are_distinct();
+    check_session_activation();
     return 0;
 }

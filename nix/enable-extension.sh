@@ -6,30 +6,26 @@ fi
 
 helper=$1
 tools=$2
-state_home=${XDG_STATE_HOME:-$HOME/.local/state}
-marker_dir=$state_home/keysharp-desktop
 case "${XDG_CURRENT_DESKTOP:-}" in
-    *Cinnamon*|*cinnamon*) desktop=cinnamon ;;
-    *GNOME*|*Gnome*|*gnome*) desktop=gnome ;;
-    *) desktop=other ;;
+    *Cinnamon*|*cinnamon*|*GNOME*|*Gnome*|*gnome*) ;;
+    *) exit 0 ;;
 esac
-marker=$marker_dir/extension-enabled-$desktop
-
-[ -e "$marker" ] && exit 0
 
 attempt=0
 while [ "$attempt" -lt 5 ]; do
-    result=$("$helper" enable-extension) || :
+    result=$("$helper" enable-extension --automatic) || :
     [ -z "$result" ] || printf '%s\n' "$result"
+    status=
+    while IFS= read -r line; do
+        case "$line" in
+            status=*) status=${line#status=} ;;
+        esac
+    done <<EOF
+$result
+EOF
 
-    case "$result" in
-        status=already_live*|status=enabled*|status=needs_relogin*|status=already_listed*)
-            umask 077
-            "$tools/mkdir" -p "$marker_dir" || exit 1
-            : > "$marker" || exit 1
-            exit 0
-            ;;
-        status=no_bus*|status=no_shell*)
+    case "$status" in
+        no_bus|no_shell)
             attempt=$((attempt + 1))
             [ "$attempt" -lt 5 ] || exit 0
             "$tools/sleep" 2

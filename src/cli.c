@@ -33,7 +33,7 @@ static void usage(FILE *stream, const char *program)
         "       %s daemon\n"
         "       %s permissions list [--socket PATH]\n"
         "       %s permissions revoke (--hash HASH|--pid PID|--all) [SCOPE ...] [--socket PATH]\n"
-        "       %s enable-extension\n",
+        "       %s enable-extension [--automatic]\n",
         program, program, program, program, program, program, program);
 }
 

@@ -57,6 +57,7 @@ bool ksd_backend_apply_session_environment(const char *const *environment,
         "DISPLAY",
         "XAUTHORITY",
         "HYPRLAND_INSTANCE_SIGNATURE",
+        "XDG_STATE_HOME",
     };
 
     if (environment == NULL && count != 0u)

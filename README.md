@@ -15,8 +15,11 @@ sudo apt install ./keysharp-desktop_<version>_<arch>.deb
 
 Other systemd distributions can extract the release archive and run `sudo ./install.sh`.
 It checks and installs missing runtime dependencies before installing the services.
-On GNOME or Cinnamon, run `keysharp-desktop enable-extension` as your graphical user
-and log out if requested. Keysharp's combined Linux setup performs this step for you.
+On GNOME or Cinnamon, the session service configures the bundled extension once
+for each user and desktop, during startup or provider reconciliation. Switching
+from Cinnamon to GNOME sets up GNOME separately;
+a later manual disable remains in effect. If the provider needs repair, run
+`keysharp-desktop enable-extension` as your graphical user and log out if requested.
 See [installation](docs/install.md) for source builds, updates and removal.
 
 ## Use it

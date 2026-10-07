@@ -4,6 +4,7 @@
 #include "session_environ.h"
 
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -396,7 +397,7 @@ static void report_search_path(const shell_profile *profile)
         profile->datadir_leaf, KSD_EXTENSION_UUID);
 }
 
-static ksd_enable_status enable_for(const shell_profile *profile)
+static ksd_enable_status enable_for(const shell_profile *profile, bool automatic)
 {
     GSettings *settings;
     ksd_enable_status status;
@@ -407,6 +408,18 @@ static ksd_enable_status enable_for(const shell_profile *profile)
     settings = open_schema(profile->schema_id);
     if (settings == NULL)
         return KSD_ENABLE_NO_SCHEMA;
+    if (automatic && schema_has_key(settings, "disabled-extensions")) {
+        char **disabled = g_settings_get_strv(settings, "disabled-extensions");
+        bool explicitly_disabled = ksd_strv_contains(
+            (const char *const *)disabled, KSD_EXTENSION_UUID);
+        g_strfreev(disabled);
+        if (explicitly_disabled) {
+            fprintf(stderr, "keysharp-desktop: %s extension was explicitly"
+                    " disabled; preserving that choice\n", profile->shell_label);
+            g_object_unref(settings);
+            return KSD_ENABLE_NOT_APPLICABLE;
+        }
+    }
     status = apply_lists(settings, profile, &changed);
     if (status != KSD_ENABLE_ENABLED) {
         g_object_unref(settings);
@@ -427,6 +440,46 @@ static ksd_enable_status enable_for(const shell_profile *profile)
      * user, and both are fixed by logging back in after checking the version
      * the extension declares. */
     return changed ? KSD_ENABLE_NEEDS_RELOGIN : KSD_ENABLE_ALREADY_LISTED;
+}
+
+ksd_enable_status ksd_enable_extension_once(const char *state_home, const char *desktop,
+    ksd_enable_status (*activate)(const void *context), const void *context)
+{
+    if (state_home == NULL || desktop == NULL || activate == NULL
+        || (strcmp(desktop, "gnome") != 0
+            && strcmp(desktop, "cinnamon") != 0))
+        return KSD_ENABLE_NOT_APPLICABLE;
+
+    ksd_enable_status status = KSD_ENABLE_NOT_APPLICABLE;
+    char *directory = g_build_filename(state_home, "keysharp-desktop", NULL);
+    char *name = g_strdup_printf("extension-enabled-%s", desktop);
+    char *marker = g_build_filename(directory, name, NULL);
+
+    if (g_file_test(marker, G_FILE_TEST_EXISTS))
+        goto done;
+    if (g_mkdir_with_parents(directory, 0700) != 0) {
+        fprintf(stderr, "keysharp-desktop: cannot record extension setup in"
+                " %s\n", directory);
+        goto done;
+    }
+
+    status = activate(context);
+    if (status == KSD_ENABLE_ALREADY_LIVE || status == KSD_ENABLE_ENABLED
+        || status == KSD_ENABLE_NEEDS_RELOGIN
+        || status == KSD_ENABLE_ALREADY_LISTED) {
+        GError *error = NULL;
+        if (!g_file_set_contents(marker, "", 0, &error)) {
+            fprintf(stderr, "keysharp-desktop: cannot record extension setup:"
+                    " %s\n", error->message);
+            g_error_free(error);
+        }
+    }
+
+done:
+    g_free(marker);
+    g_free(name);
+    g_free(directory);
+    return status;
 }
 
 static void explain(ksd_enable_status status)
@@ -486,26 +539,83 @@ static void explain(ksd_enable_status status)
     }
 }
 
+static ksd_enable_status activate_automatically(const void *context)
+{
+    return enable_for(context, true);
+}
+
+void ksd_enable_extension_for_session(void)
+{
+    static pid_t attempted_gnome = -1;
+    static pid_t attempted_cinnamon = -1;
+    const shell_profile *profile;
+    const char *desktop;
+    pid_t *attempted;
+    pid_t owner;
+
+    if (ksd_enable_credentials_refused(getuid(), geteuid(),
+                                       getgid(), getegid()))
+        return;
+    owner = ksd_backend_provider_pid(KSD_BACKEND_CINNAMON);
+    if (owner > 0) {
+        profile = &cinnamon_profile;
+        desktop = "cinnamon";
+        attempted = &attempted_cinnamon;
+    } else {
+        owner = ksd_backend_provider_pid(KSD_BACKEND_GNOME);
+        if (owner <= 0)
+            return;
+        profile = &gnome_profile;
+        desktop = "gnome";
+        attempted = &attempted_gnome;
+    }
+
+    /* A late shell or a new shell process can try; repeated reconciliation cannot. */
+    if (*attempted == owner)
+        return;
+    *attempted = owner;
+    ksd_enable_status status = ksd_enable_extension_once(g_get_user_state_dir(),
+        desktop, activate_automatically, profile);
+    if (status != KSD_ENABLE_NOT_APPLICABLE) {
+        fprintf(stderr, "keysharp-desktop daemon: %s extension setup: %s\n",
+                profile->shell_label, ksd_enable_status_name(status));
+        explain(status);
+    }
+}
+
 int ksd_enable_extension_main(int argc, char **argv)
 {
     ksd_enable_status status;
+    bool explanation_given = false;
+    bool automatic = argc == 2 && argv != NULL && argv[1] != NULL
+        && strcmp(argv[1], "--automatic") == 0;
 
-    (void)argv;
     /* Before anything else, so the command is usable in a container without a
      * bus or a shell to answer the arity question. */
-    if (argc != 1)
+    if (argc != 1 && !automatic)
         return 2;
     if (ksd_enable_credentials_refused(getuid(), geteuid(), getgid(),
                                        getegid())) {
         status = KSD_ENABLE_REFUSED;
     } else if (!session_bus_reachable()) {
         status = KSD_ENABLE_NO_BUS;
+    } else if (automatic && !ksd_backend_refresh_session_environment()) {
+        fputs("keysharp-desktop: graphical user-manager environment is"
+              " not ready; automatic extension setup deferred\n", stderr);
+        status = KSD_ENABLE_NO_SHELL;
+        explanation_given = true;
     } else if (ksd_backend_provider_pid(KSD_BACKEND_CINNAMON) > 0) {
         /* Cinnamon first: org.Cinnamon is unambiguous, where a session can
          * carry GNOME names for other reasons. */
-        status = enable_for(&cinnamon_profile);
+        status = automatic
+            ? ksd_enable_extension_once(g_get_user_state_dir(), "cinnamon",
+                activate_automatically, &cinnamon_profile)
+            : enable_for(&cinnamon_profile, false);
     } else if (ksd_backend_provider_pid(KSD_BACKEND_GNOME) > 0) {
-        status = enable_for(&gnome_profile);
+        status = automatic
+            ? ksd_enable_extension_once(g_get_user_state_dir(), "gnome",
+                activate_automatically, &gnome_profile)
+            : enable_for(&gnome_profile, false);
     } else if (ksd_backend_resolve() != KSD_BACKEND_NONE) {
         /* KWin, X11 or generic Wayland: served without an extension. */
         status = KSD_ENABLE_NOT_APPLICABLE;
@@ -513,6 +623,7 @@ int ksd_enable_extension_main(int argc, char **argv)
         status = KSD_ENABLE_NO_SHELL;
     }
     printf("status=%s\n", ksd_enable_status_name(status));
-    explain(status);
+    if (!explanation_given && (!automatic || status != KSD_ENABLE_NOT_APPLICABLE))
+        explain(status);
     return ksd_enable_exit_code(status);
 }

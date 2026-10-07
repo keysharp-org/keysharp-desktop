@@ -31,6 +31,7 @@ static const char *const manager_environment[] = {
     "XDG_SESSION_TYPE=wayland",
     "WAYLAND_DISPLAY=wayland-0",
     "DISPLAY=:1",
+    "XDG_STATE_HOME=/session/state",
     "PATH=/not-imported",
 };
 
@@ -118,12 +119,14 @@ static void check_manager_environment_refresh(void)
     assert(setenv("WAYLAND_DISPLAY", "wayland-gnome", 1) == 0);
     assert(setenv("DISPLAY", ":99", 1) == 0);
     assert(setenv("XAUTHORITY", "/old-session", 1) == 0);
+    assert(setenv("XDG_STATE_HOME", "/old-state", 1) == 0);
     assert(ksd_backend_refresh_session_environment());
     assert(strcmp(getenv("XDG_CURRENT_DESKTOP"), "KDE") == 0);
     assert(strcmp(getenv("XDG_SESSION_TYPE"), "wayland") == 0);
     assert(strcmp(getenv("WAYLAND_DISPLAY"), "wayland-0") == 0);
     assert(strcmp(getenv("DISPLAY"), ":1") == 0);
     assert(getenv("XAUTHORITY") == NULL);
+    assert(strcmp(getenv("XDG_STATE_HOME"), "/session/state") == 0);
     if (saved_path != NULL)
         assert(strcmp(getenv("PATH"), saved_path) == 0);
     else
@@ -236,10 +239,20 @@ static void check_environment_guard(void)
     assert(setenv("XDG_CURRENT_DESKTOP", "X-Cinnamon", 1) == 0);
     assert(setenv("XDG_SESSION_TYPE", "x11", 1) == 0);
     assert(setenv("DISPLAY", ":0", 1) == 0);
+    assert(setenv("XDG_STATE_HOME", "/current-state", 1) == 0);
     assert(!ksd_backend_apply_session_environment(displayless, 2u));
     assert(strcmp(getenv("XDG_CURRENT_DESKTOP"), "X-Cinnamon") == 0);
     assert(strcmp(getenv("XDG_SESSION_TYPE"), "x11") == 0);
     assert(strcmp(getenv("DISPLAY"), ":0") == 0);
+    assert(strcmp(getenv("XDG_STATE_HOME"), "/current-state") == 0);
+
+    static const char *const default_state[] = {
+        "XDG_CURRENT_DESKTOP=X-Cinnamon",
+        "XDG_SESSION_TYPE=x11",
+        "DISPLAY=:0",
+    };
+    assert(ksd_backend_apply_session_environment(default_state, 3u));
+    assert(getenv("XDG_STATE_HOME") == NULL);
 }
 
 static void check_session_type_table(void)

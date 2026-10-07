@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "enable_extension.h"
 #include <fcntl.h>
 
 #include "transport.h"
@@ -261,6 +262,9 @@ static const char *const session_identity[] = {
     "DISPLAY",
     "XAUTHORITY",
     "HYPRLAND_INSTANCE_SIGNATURE",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "XDG_STATE_HOME",
 };
 #define KSD_SESSION_IDENTITY_COUNT \
     (sizeof(session_identity) / sizeof(session_identity[0]))
@@ -300,6 +304,11 @@ static bool exec_environment_current(void)
 static bool backend_is_current(ksd_backend backend)
 {
     (void)ksd_backend_refresh_session_environment();
+    if (!exec_environment_current())
+        return false;
+#if KSD_AUTO_ENABLE_EXTENSION
+    ksd_enable_extension_for_session();
+#endif
     ksd_backend current = ksd_backend_resolve();
     return backend == KSD_BACKEND_GENERIC
         ? current == KSD_BACKEND_NONE : current == backend;
@@ -390,6 +399,11 @@ int ksd_daemon_main(int argc, char **argv)
               " import its environment into the user manager\n", stderr);
         while (!(imported = ksd_backend_refresh_session_environment())
                && ksd_backend_resolve() == KSD_BACKEND_NONE) {
+#if KSD_AUTO_ENABLE_EXTENSION
+            ksd_enable_extension_for_session();
+            if (ksd_backend_resolve() != KSD_BACKEND_NONE)
+                break;
+#endif
             struct timespec remaining = retry;
 
             while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
@@ -401,7 +415,18 @@ int ksd_daemon_main(int argc, char **argv)
             return 1;
         }
     }
-    while ((backend = ksd_backend_resolve()) == KSD_BACKEND_NONE) {
+    for (;;) {
+        if (!exec_environment_current()) {
+            fputs("keysharp-desktop daemon: graphical session changed;"
+                  " restarting to adopt its environment\n", stderr);
+            return 1;
+        }
+#if KSD_AUTO_ENABLE_EXTENSION
+        ksd_enable_extension_for_session();
+#endif
+        backend = ksd_backend_resolve();
+        if (backend != KSD_BACKEND_NONE)
+            break;
         struct timespec retry = {
             .tv_sec = KSD_BACKEND_STARTUP_RETRY_SECONDS,
         };
@@ -526,7 +551,7 @@ int ksd_daemon_main(int argc, char **argv)
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready == 0) {
-            if (backend_is_current(backend) && exec_environment_current())
+            if (backend_is_current(backend))
                 continue;
             fputs("keysharp-desktop daemon: compositor or session changed;"
                   " restarting the session backend\n", stderr);
