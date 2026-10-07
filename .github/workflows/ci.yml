@@ -49,10 +49,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
             libwayland-dev libwayland-bin wayland-protocols
 
-      # ubuntu-24.04 ships wayland-protocols 1.34, and ext-data-control-v1 --
-      # the clipboard protocol -- arrived in 1.39. The package is data only, so
-      # a pinned checkout is both cheaper and more reproducible than a PPA, and
-      # it keeps the definitions read at build time rather than vendored here.
+      # Pinned build-time protocol definitions provide ext-data-control-v1 for clipboard operations.
       - name: Fetch wayland-protocols carrying ext-data-control
         run: >-
           git clone --depth 1 --branch 1.39
@@ -100,7 +97,7 @@ jobs:
           test "$(stat -c %a "$DESTDIR/usr/local/libexec/keysharp-desktop-capture-worker")" = 700
           test -e "$DESTDIR/usr/local/lib/libkeysharp-desktop.so.1"
           readelf -d "$DESTDIR/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.1\]'
-          readelf -d "$DESTDIR/usr/local/lib/libkeysharp-desktop.so.1.0.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.1\]'
+          readelf -d "$DESTDIR/usr/local/lib/libkeysharp-desktop.so.1" | grep -q 'Library soname: \[libkeysharp-desktop.so.1\]'
           test -f "$DESTDIR/usr/local/include/keysharp_desktop/client.h"
           test -f "$DESTDIR/usr/local/lib/pkgconfig/keysharp-desktop.pc"
           for resource in \

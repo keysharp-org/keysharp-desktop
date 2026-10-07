@@ -6,7 +6,7 @@
 # Environment:
 #   VERSION        upstream version; defaults to the CMake project version
 #   SERIES         Ubuntu series to build for (default: "noble resolute")
-#   PPA_REVISION   the N in <version>-1~<series>N; raise it to upload the same version again
+#   PPA_REVISION   positive packaging revision N in <version>-1~<series>N
 #   PPA            owner/name; when that PPA already holds this version's upstream tarball, it is
 #                  reused, because Launchpad accepts no other file under the same name
 #   OUTPUT_DIR     default: dist/ppa
@@ -62,12 +62,6 @@ for series in ${SERIES}; do
   ln -s "${orig}" "${dir}/${orig_name}"
   tar -xJf "${orig}" -C "${dir}"
   cp -a "${HERE}/../debian" "${source_dir}/debian"
-  # Omit this backport when the tagged source already has the fixture handshake.
-  backport="${source_dir}/debian/patches/live-upgrade-readiness.patch"
-  if [[ -f "${backport}" ]] && (cd "${source_dir}" && patch --force --dry-run --silent --reverse --fuzz=0 -p1 < "${backport}") >/dev/null 2>&1; then
-    sed -i '/^live-upgrade-readiness\.patch$/d' "${source_dir}/debian/patches/series"
-    rm -f -- "${backport}"
-  fi
   chmod 0755 "${source_dir}/debian/rules"
   cat > "${source_dir}/debian/changelog" <<EOF
 ${NAME} (${debian_version}) ${series}; urgency=medium

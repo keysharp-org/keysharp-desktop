@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       ppa_revision:
-        description: PPA upload revision; raise it to upload a version Launchpad already has again
+        description: PPA packaging revision for this release
         required: false
         type: string
         default: "1"
@@ -148,10 +148,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
             libwayland-dev libwayland-bin wayland-protocols
 
-      # ubuntu-24.04 ships wayland-protocols 1.34, and ext-data-control-v1 --
-      # the clipboard protocol -- arrived in 1.39. The package is data only, so
-      # a pinned checkout is cheaper and more reproducible than a PPA, and it
-      # keeps the definitions read at build time rather than vendored here.
+      # Pinned build-time protocol definitions provide ext-data-control-v1 for clipboard operations.
       - name: Fetch wayland-protocols carrying ext-data-control
         run: >-
           git clone --depth 1 --branch 1.39
@@ -191,7 +188,7 @@ jobs:
           test "$(stat -c %a "$STAGE/usr/local/libexec/keysharp-desktop-capture-worker")" = 700
           test -e "$STAGE/usr/local/lib/libkeysharp-desktop.so.1"
           readelf -d "$STAGE/usr/local/bin/keysharp-desktop" | grep -q 'Shared library: \[libkeysharp-desktop.so.1\]'
-          readelf -d "$STAGE/usr/local/lib/libkeysharp-desktop.so.1.0.0" | grep -q 'Library soname: \[libkeysharp-desktop.so.1\]'
+          readelf -d "$STAGE/usr/local/lib/libkeysharp-desktop.so.${VERSION}" | grep -q 'Library soname: \[libkeysharp-desktop.so.1\]'
 
           mkdir -p dist
           archive_name="keysharp-desktop-${VERSION}-linux-${ASSET_ARCH}"
@@ -299,7 +296,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      # Packaging can be repaired without changing the released upstream tree.
+      # Packaging tools come from the workflow commit; upstream source comes from the release tag.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
@@ -354,7 +351,7 @@ jobs:
           SERIES: ${{ matrix.series }}
         run: bash packaging/ppa/rehearse.sh dist/ppa/keysharp-desktop_*~"$SERIES"*.dsc "$SERIES" dist/rehearsal
 
-  # PPA recovery does not replace already published GitHub assets.
+  # GitHub assets and PPA packages publish independently.
   publish-ppa:
     needs:
       - prepare

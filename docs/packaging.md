@@ -11,7 +11,7 @@ Runtime files:
 ```text
 bin/keysharp-desktop
 libexec/keysharp-desktop-capture-worker        root:root 0700
-lib/libkeysharp-desktop.so{,.0,.0.2.0}
+lib/libkeysharp-desktop.so{,.<abi-major>,.<product-version>}
 include/keysharp_desktop/client.h
 lib/pkgconfig/keysharp-desktop.pc
 lib/cmake/KeysharpDesktop/*
@@ -101,7 +101,7 @@ The standalone uninstaller removes only this project's manifest. It retains
 `/var/lib/keysharp-permissions/v1` because other authorities may use the same
 grants.
 
-The Debian package provides `keysharp-desktop-client-abi-0` with version `0.<minor>`
+The Debian package provides `keysharp-desktop-client-abi-<major>` with version `<major>.<minor>`
 derived from the public header, independent of the product release. Consumers can
 require an additive API with a versioned dependency. The package obtains ELF
 dependencies through `dpkg-shlibdeps`. Its preinstall guard rejects unmanaged
@@ -131,15 +131,14 @@ only what the PPA lacks.
 To repackage an existing release, dispatch `Release` from `main` with its `tag`,
 `ppa_only` set to `true`, and a `ppa_revision` above any Launchpad has accepted for
 it, including failed builds. The upstream tarball is the tagged tree, reused from the
-PPA; `debian/` and the PPA tools come from `main`:
+PPA; `debian/` and the PPA tools come from `main`. Upstream source changes require
+a new product version and release tag. Set `RELEASE_TAG` to the release's tag and
+`PPA_REVISION` to the next unused revision, then run:
 
 ```bash
 gh workflow run release.yml --repo keysharp-org/keysharp-desktop --ref main \
-  -f tag=v1.0.0 -f ppa_only=true -f ppa_revision=5
+  -f tag="$RELEASE_TAG" -f ppa_only=true -f ppa_revision="$PPA_REVISION"
 ```
-
-The live-upgrade test fix is carried as a Debian patch for older tagged source;
-the source builder omits it when that source already contains the fix.
 
 To rehearse locally, with Docker installed:
 

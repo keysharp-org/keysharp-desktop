@@ -9,4 +9,3 @@
 providers/gnome/extension.js text eol=lf
 providers/cinnamon/extension.js text eol=lf
 packaging/debian/** text eol=lf
-packaging/debian/patches/*.patch whitespace=-blank-at-eol
