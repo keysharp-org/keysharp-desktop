@@ -16,7 +16,7 @@ The pieces:
 - `keysharp-desktop-capture-worker` — a root-only KWin capture worker.
 - GNOME Shell and Cinnamon extensions — compositor operations over a private
   root-authenticated peer connection.
-- `libkeysharp-desktop.so.0` — the public client library, header
+- `libkeysharp-desktop.so.1` — the public client library, header
   `keysharp_desktop/client.h`.
 
 Applications connect directly to `/run/keysharp-desktop/keysharp-desktop.sock`. The
@@ -32,8 +32,8 @@ This is an independent project. [Keysharp](https://github.com/keysharp-org/Keysh
 is currently its main consumer, but it is a consumer like any other, and nothing here
 may assume Keysharp is the caller.
 
-- **The contract is the client ABI**, expressed as `libkeysharp-desktop.so.0`, the
-  pkg-config/CMake package, and the Debian capability `keysharp-desktop-client-abi-0`.
+- **The contract is the client ABI**, expressed as `libkeysharp-desktop.so.1`, the
+  pkg-config/CMake package, and the Debian capability `keysharp-desktop-client-abi-1`.
   Product versions select release artifacts; the client ABI decides compatibility.
 - **Releases are independent.** This project versions and releases on its own cadence.
   Keysharp resolves it at install time from this repository's own releases, so a release

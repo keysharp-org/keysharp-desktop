@@ -1,6 +1,6 @@
 # Private protocol
 
-Protocol 2.0 is an implementation detail between `libkeysharp-desktop.so.0`
+Protocol 3.0 is an implementation detail between `libkeysharp-desktop.so.1`
 and the matching service. Applications use the public C ABI. Private headers
 are neither installed nor a compatibility contract.
 
@@ -77,7 +77,7 @@ has an availability bit. Sensitive families map to exactly one durable scope;
 cursor position, work area, window handles, display topology, keyboard state,
 and clipboard writes have no scope and do not consult the grant store.
 
-Client ABI minor 8 adds these operations to protocol 2.0. All integers below
+Client ABI 1.0 includes these operations in protocol 3.0. All integers below
 are little-endian; JSON replies have a `u32` UTF-8 byte length followed by text.
 
 | Opcode | Operation bit | Request | Scope |

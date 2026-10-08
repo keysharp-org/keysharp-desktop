@@ -2,7 +2,7 @@
 
 A Linux desktop automation service and C library for capture, window inspection and
 control, clipboard access and compositor pointer operations. Applications use
-`libkeysharp-desktop.so.0`; available operations depend on the active compositor.
+`libkeysharp-desktop.so.1`; available operations depend on the active compositor.
 
 ## Install
 
@@ -28,7 +28,7 @@ See [installation](docs/install.md) for source builds, updates and removal.
 cc examples/list-windows.c $(pkg-config --cflags --libs keysharp-desktop) -o list-windows
 ```
 
-Or link `KeysharpDesktop::client` after `find_package(KeysharpDesktop 0.2 CONFIG REQUIRED)`.
+Or link `KeysharpDesktop::client` after `find_package(KeysharpDesktop 1.0 CONFIG REQUIRED)`.
 Complete examples demonstrate [listing windows](examples/list-windows.c) and
 [capturing an area](examples/capture-area.c). Running them can request permission.
 
@@ -81,7 +81,7 @@ Manage grants with `keysharp-desktop permissions list` and `keysharp-desktop per
 ## Project and distribution
 
 This project releases independently of Keysharp. Applications use its public C ABI;
-the socket protocol is private. The Debian capability `keysharp-desktop-client-abi-0`
+the socket protocol is private. The Debian capability `keysharp-desktop-client-abi-1`
 identifies the ABI, with its provided version recording the ABI major and minor.
 Applications should require or recommend the needed minor according to whether
 desktop features are optional, and leave the shared service installed on removal.

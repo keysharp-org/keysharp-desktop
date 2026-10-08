@@ -18,7 +18,7 @@
 
 
 #define KSD_PRODUCT_NAME "keysharp-desktop"
-#define KSD_PRODUCT_VERSION "1.0.0"
+#define KSD_PRODUCT_VERSION "1.0.1"
 
 #define KSD_CLIENT_PROTOCOL_NAME "keysharp-desktop/client"
 #define KSD_PROTOCOL_MAJOR 3u

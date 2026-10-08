@@ -1,6 +1,6 @@
 # Application integration
 
-Use `keysharp_desktop/client.h` and `libkeysharp-desktop.so.0`. The socket
+Use `keysharp_desktop/client.h` and `libkeysharp-desktop.so.1`. The socket
 protocol is private.
 
 ```cmake
@@ -90,7 +90,7 @@ the compositor cannot paint, reports `KSD_STATUS_UNAVAILABLE` on both backends.
 
 `ksd_capture_desktop` returns the complete logical desktop. It is a separate
 operation because screenshot portals capture a desktop or monitor, not an
-arbitrary rectangle. It was added in client ABI minor 7. Check
+arbitrary rectangle. It is available in client ABI 1.0. Check
 `KSD_OPERATION_CAPTURE_DESKTOP` before calling it; a client that needs a
 rectangle may decode and crop the returned image itself. Always inspect
 `ksd_capture.format`: captures may be PNG or premultiplied BGRA pixels depending
@@ -107,7 +107,7 @@ There is no PipeWire streaming API in this release.
 
 ## Window, display, and keyboard queries
 
-Client ABI minor 8 adds a single-window snapshot, parent/top-level relationships,
+Client ABI 1.0 includes a single-window snapshot, parent/top-level relationships,
 child enumeration, point hit-testing, monitor topology, keyboard keymaps/state,
 and X11 title, visibility, redraw, child focus, and client-directed button calls.
 Check each operation bit; support is independent of the ABI version.

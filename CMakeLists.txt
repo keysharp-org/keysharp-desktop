@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(keysharp-desktop
-    VERSION 1.0.0
+    VERSION 1.0.1
     DESCRIPTION "Per-application desktop capability broker for Linux"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
@@ -810,7 +810,7 @@ if(BUILD_TESTING)
 
     add_test(NAME version-command COMMAND keysharp-desktop version)
     set_tests_properties(version-command PROPERTIES
-        PASS_REGULAR_EXPRESSION "^keysharp-desktop 1.0.0")
+        PASS_REGULAR_EXPRESSION "^keysharp-desktop ${PROJECT_VERSION}")
     add_test(NAME info-command COMMAND keysharp-desktop info)
     set_tests_properties(info-command PROPERTIES
         PASS_REGULAR_EXPRESSION
