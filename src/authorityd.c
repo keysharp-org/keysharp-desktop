@@ -1037,8 +1037,15 @@ static bool build_response(const ksd_frame *request, uint32_t status,
     size_t diagnostic_length = diagnostic == NULL ? 0u : strlen(diagnostic);
     bool ok;
 
+    /* The client rejects a message that does not fit its fixed buffer, so a
+     * longer one is cut at a character boundary instead of failing the reply. */
+    if (diagnostic_length >= KSD_ERROR_MESSAGE_CAPACITY)
+        diagnostic_length = KSD_ERROR_MESSAGE_CAPACITY - 1u;
+    while (diagnostic_length != 0u
+        && !ksd_utf8_valid((const uint8_t *)diagnostic, diagnostic_length,
+                           false))
+        diagnostic_length--;
     if (request == NULL || response == NULL || request->request_id == 0u
-        || diagnostic_length > KSD_MAX_TEXT_BYTES
         || (status == KSD_STATUS_OK && diagnostic_length != 0u)
         || (tail_length != 0u && tail == NULL))
         return false;

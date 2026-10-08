@@ -66,6 +66,9 @@ static void queue_request(int socket_fd, uint16_t opcode, uint64_t request_id,
                == (ssize_t)payload_length);
 }
 
+/* The tail of the last error answer, which carries its diagnostic. */
+static char last_diagnostic[KSD_ERROR_MESSAGE_CAPACITY];
+
 /* Reads one answer and reports its status, or false at end of stream. */
 static bool take_answer(int socket_fd, uint64_t *request_id, uint32_t *status)
 {
@@ -92,12 +95,18 @@ static bool take_answer(int socket_fd, uint64_t *request_id, uint32_t *status)
     assert(payload_length >= sizeof(prologue));
     assert(read(socket_fd, prologue, sizeof(prologue))
            == (ssize_t)sizeof(prologue));
+    last_diagnostic[0] = '\0';
     if (payload_length > sizeof(prologue)) {
         uint32_t remaining = payload_length - (uint32_t)sizeof(prologue);
         uint8_t *tail = malloc(remaining);
 
         assert(tail != NULL);
         assert(read(socket_fd, tail, remaining) == (ssize_t)remaining);
+        if (ksd_decode_u32(prologue) != KSD_STATUS_OK
+            && remaining < sizeof(last_diagnostic)) {
+            memcpy(last_diagnostic, tail, remaining);
+            last_diagnostic[remaining] = '\0';
+        }
         free(tail);
     }
     *request_id = ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET);
@@ -213,6 +222,7 @@ static void check_bad_request_does_not_end_the_loop(void)
         fprintf(stderr, "invalid-request reply: id=%llu status=%u\n",
                  (unsigned long long)id, status);
     assert(id == 1u && status == KSD_STATUS_INVALID_REQUEST);
+    assert(strcmp(last_diagnostic, "invalid X11 request") == 0);
     assert(take_answer(far_end, &id, &status));
     assert(id == 2u && status != KSD_STATUS_OK);
     assert(take_answer(far_end, &id, &status));

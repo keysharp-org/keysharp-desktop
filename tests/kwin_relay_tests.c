@@ -479,13 +479,15 @@ static void check_unavailable_operation_keeps_transport(void)
         .major = KSD_PROTOCOL_MAJOR, .minor = KSD_PROTOCOL_MINOR,
         .opcode = KSD_OP_CLIPBOARD_TEXT, .request_id = 1u,
     };
+    static const char diagnostic[] = "the compositor has no clipboard";
     for (uint64_t id = 1u; id <= 2u; id++) {
-        uint8_t body[8] = { 0 };
+        uint8_t body[8u + sizeof(diagnostic) - 1u] = { 0 };
         ksd_encode_u32(body, id == 1u ? KSD_STATUS_UNAVAILABLE : KSD_STATUS_OK);
+        memcpy(body + 8u, diagnostic, sizeof(diagnostic) - 1u);
         ksd_frame answer = request;
         answer.request_id = id;
         answer.payload = body;
-        answer.payload_length = sizeof(body);
+        answer.payload_length = id == 1u ? sizeof(body) : 8u;
         assert(ksd_frame_write(pair[1], &answer));
     }
     for (unsigned index = 0u; index < 2u; index++) {
@@ -498,6 +500,7 @@ static void check_unavailable_operation_keeps_transport(void)
         assert(ksd_kwin_relay_call(relay, &request, deadline, &result));
         assert(result.status == (index == 0u
             ? KSD_STATUS_UNAVAILABLE : KSD_STATUS_OK));
+        assert(index != 0u || strcmp(result.diagnostic, diagnostic) == 0);
         assert(!ksd_kwin_relay_is_broken(relay));
         ksd_result_clear(&result);
     }

@@ -208,11 +208,13 @@ static bool read_one(ksd_kwin_relay *relay, uint64_t deadline_ms)
         }
         /* The prologue is dropped here rather than carried further: what the
          * caller wants is the tail, and every reader past this point would
-         * otherwise have to know to skip eight bytes. */
+         * otherwise have to know to skip eight bytes. The terminator lets an
+         * error's tail serve as its diagnostic. */
         if (!file_response && tail_length != 0u) {
-            slot->tail = malloc(tail_length);
+            slot->tail = malloc(tail_length + 1u);
             if (slot->tail != NULL) {
                 memcpy(slot->tail, body + 8u, tail_length);
+                slot->tail[tail_length] = 0u;
                 slot->tail_length = tail_length;
             } else
                 slot->status = KSD_STATUS_RESOURCE_EXHAUSTED;
@@ -359,7 +361,8 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
             answered = ksd_result_take(result, NULL, 0u);
         } else {
             ksd_result_error(result, slot->status, slot->detail,
-                             "the compositor refused the operation");
+                             slot->tail_length != 0u ? (const char *)slot->tail
+                             : "the compositor refused the operation");
             answered = true;
         }
     }

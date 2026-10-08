@@ -1248,13 +1248,17 @@ static bool serve_persistently(uint32_t backend, pid_t session_pid)
 
         bool capture_fd = result.status == KSD_STATUS_OK
             && result.payload_fd >= 0;
-        ksd_buffer_init(&payload, capture_fd ? 12u : result.tail_length + 8u);
+        /* An error has no tail, so its diagnostic travels in that place. */
+        const uint8_t *tail = result.status == KSD_STATUS_OK ? result.tail
+            : (const uint8_t *)result.diagnostic;
+        size_t tail_length = result.status == KSD_STATUS_OK
+            ? result.tail_length : strlen(result.diagnostic);
+        ksd_buffer_init(&payload, capture_fd ? 12u : tail_length + 8u);
         ok = ksd_buffer_u32(&payload, result.status)
             && ksd_buffer_u32(&payload, result.detail)
             && (capture_fd ? ksd_buffer_u32(&payload, result.tail_length)
-                : result.tail_length == 0u
-                || ksd_buffer_bytes(&payload, result.tail,
-                                    result.tail_length));
+                : tail_length == 0u
+                || ksd_buffer_bytes(&payload, tail, tail_length));
         memset(&answer, 0, sizeof(answer));
         answer.magic[0] = KSD_FRAME_MAGIC_0;
         answer.magic[1] = KSD_FRAME_MAGIC_1;
