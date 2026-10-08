@@ -318,6 +318,8 @@ static void bind_list(struct wl_client *client, void *data, uint32_t version,
 typedef struct test_cosmic_toplevel {
     struct wl_resource *foreign;
     struct wl_resource *info;
+    struct wl_resource *handle;
+    struct wl_event_source *state_timer;
     uint32_t states;
 } test_cosmic_toplevel;
 
@@ -325,7 +327,10 @@ static struct wl_resource *cosmic_output_resource;
 
 static void destroy_test_cosmic_toplevel(struct wl_resource *resource)
 {
-    free(wl_resource_get_user_data(resource));
+    test_cosmic_toplevel *state = wl_resource_get_user_data(resource);
+    if (state->state_timer != NULL)
+        wl_event_source_remove(state->state_timer);
+    free(state);
 }
 
 static void cosmic_handle_destroy(struct wl_client *client,
@@ -369,6 +374,42 @@ static void cosmic_send_state(struct wl_resource *handle, uint32_t state)
     cosmic_change_state(handle, state, true);
 }
 
+static int cosmic_delayed_state(void *data)
+{
+    test_cosmic_toplevel *window = data;
+    struct wl_array states;
+
+    (void)update_test_states(&states, window->states, 32u, false);
+    zcosmic_toplevel_handle_v1_send_state(window->handle, &states);
+    wl_array_release(&states);
+    zcosmic_toplevel_info_v1_send_done(window->info);
+    wl_event_source_remove(window->state_timer);
+    window->state_timer = NULL;
+    return 0;
+}
+
+static void cosmic_action_state(struct wl_resource *handle, uint32_t state,
+                                bool enabled)
+{
+    test_cosmic_toplevel *window = wl_resource_get_user_data(handle);
+
+    if (strcmp(server_mode(), "cosmic-delayed") != 0) {
+        cosmic_change_state(handle, state, enabled);
+        zcosmic_toplevel_info_v1_send_done(window->info);
+        return;
+    }
+    window->states = enabled ? window->states | (UINT32_C(1) << state)
+                             : window->states & ~(UINT32_C(1) << state);
+    if (window->state_timer == NULL) {
+        struct wl_display *display = wl_client_get_display(wl_resource_get_client(handle));
+        window->state_timer = wl_event_loop_add_timer(
+            wl_display_get_event_loop(display), cosmic_delayed_state, window);
+        assert(window->state_timer != NULL);
+    }
+    /* Sync replies stay immediate while the window state arrives later. */
+    assert(wl_event_source_timer_update(window->state_timer, 50) == 0);
+}
+
 static void cosmic_info_stop(struct wl_client *client,
                              struct wl_resource *resource)
 {
@@ -389,10 +430,13 @@ static void cosmic_info_get_toplevel(struct wl_client *client,
     assert(cosmic_output_resource != NULL);
     state->foreign = foreign;
     state->info = info;
+    state->handle = handle;
     wl_resource_set_implementation(handle, &cosmic_handle_impl, state,
                                    destroy_test_cosmic_toplevel);
     cosmic_send_state(handle, index == 1u
         ? ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED
+        : strcmp(server_mode(), "cosmic-delayed") == 0
+        ? ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN
         : ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED);
     zcosmic_toplevel_handle_v1_send_geometry(
         handle, cosmic_output_resource, (int32_t)index, 0, 2, 1);
@@ -458,46 +502,40 @@ static void cosmic_manager_set_maximized(struct wl_client *client,
                                          struct wl_resource *resource,
                                          struct wl_resource *toplevel)
 {
-    test_cosmic_toplevel *state = cosmic_state(toplevel);
     (void)client;
     (void)resource;
-    cosmic_send_state(toplevel,
-        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED);
-    zcosmic_toplevel_info_v1_send_done(state->info);
+    cosmic_action_state(toplevel,
+        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED, true);
 }
 
 static void cosmic_manager_unset_maximized(struct wl_client *client,
                                            struct wl_resource *resource,
                                            struct wl_resource *toplevel)
 {
-    test_cosmic_toplevel *state = cosmic_state(toplevel);
     (void)client;
     (void)resource;
-    cosmic_change_state(toplevel, ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED, false);
-    zcosmic_toplevel_info_v1_send_done(state->info);
+    cosmic_action_state(toplevel,
+        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MAXIMIZED, false);
 }
 
 static void cosmic_manager_set_minimized(struct wl_client *client,
                                          struct wl_resource *resource,
                                          struct wl_resource *toplevel)
 {
-    test_cosmic_toplevel *state = cosmic_state(toplevel);
     (void)client;
     (void)resource;
-    cosmic_send_state(toplevel,
-        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED);
-    zcosmic_toplevel_info_v1_send_done(state->info);
+    cosmic_action_state(toplevel,
+        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED, true);
 }
 
 static void cosmic_manager_unset_minimized(struct wl_client *client,
                                            struct wl_resource *resource,
                                            struct wl_resource *toplevel)
 {
-    test_cosmic_toplevel *state = cosmic_state(toplevel);
     (void)client;
     (void)resource;
-    cosmic_change_state(toplevel, ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED, false);
-    zcosmic_toplevel_info_v1_send_done(state->info);
+    cosmic_action_state(toplevel,
+        ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED, false);
 }
 
 static void cosmic_manager_set_fullscreen(struct wl_client *client,
@@ -1380,7 +1418,8 @@ static void run_server(const char *socket_name, int ready)
     if (wl_global_create(display, &wl_seat_interface, 1, NULL, bind_seat)
         == NULL)
         _exit(1);
-    if (mode != NULL && strcmp(mode, "cosmic") == 0) {
+    if (mode != NULL && (strcmp(mode, "cosmic") == 0
+                        || strcmp(mode, "cosmic-delayed") == 0)) {
         if (wl_global_create(display, &wl_output_interface, 4, NULL,
                              bind_output) == NULL
             || wl_global_create(display,
@@ -1854,6 +1893,60 @@ static void check_cosmic_windows(const char *socket_name)
     stop_server(child);
 }
 
+static void check_cosmic_delayed_states(const char *socket_name)
+{
+    ksd_wayland *connection = NULL;
+    ksd_operation_result result;
+    pid_t child = start_server(socket_name, "cosmic-delayed");
+    const struct {
+        uint32_t requested;
+        bool minimized;
+        bool maximized;
+    } transitions[] = {
+        { 2u, false, true },
+        { 1u, true, true },
+        { 3u, false, true },
+        { 0u, false, false },
+        { 3u, false, false },
+        { 0u, false, false },
+    };
+
+    assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+    ksd_result_init(&result);
+    ksd_wayland_window_list(connection, true, &result);
+    assert(result.status == KSD_STATUS_OK);
+    uint64_t first = window_handle_at(&result, 0u);
+    uint64_t fullscreen = window_handle_at(&result, 1u);
+    ksd_result_clear(&result);
+
+    /* Restoring leaves fullscreen alone, so it must not wait for it to end. */
+    ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
+                              fullscreen, 0u, &result);
+    assert(result.status == KSD_STATUS_OK);
+    ksd_result_clear(&result);
+
+    for (size_t i = 0u; i < sizeof(transitions) / sizeof(transitions[0]); i++) {
+        ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
+                                  first, transitions[i].requested, &result);
+        assert(result.status == KSD_STATUS_OK);
+        ksd_result_clear(&result);
+        ksd_wayland_window_query(connection, first, &result);
+        assert(result.status == KSD_STATUS_OK);
+        const char *body = (const char *)result.tail + 4u;
+        uint32_t length = framed_length(&result);
+        const char *minimized = transitions[i].minimized
+            ? "\"minimized\":true" : "\"minimized\":false";
+        const char *maximized = transitions[i].maximized
+            ? "\"maximized\":true" : "\"maximized\":false";
+        assert(memmem(body, length, minimized, strlen(minimized)) != NULL);
+        assert(memmem(body, length, maximized, strlen(maximized)) != NULL);
+        ksd_result_clear(&result);
+    }
+
+    ksd_wayland_close(connection);
+    stop_server(child);
+}
+
 static void check_screencopy(const char *socket_name)
 {
     ksd_wayland *connection = NULL;
@@ -2137,6 +2230,7 @@ int main(void)
     check_window_query(socket_name, "cosmic");
     check_wlr_windows(socket_name);
     check_cosmic_windows(socket_name);
+    check_cosmic_delayed_states(socket_name);
     check_screencopy(socket_name);
     check_image_copy(socket_name, false);
     check_image_copy(socket_name, true);

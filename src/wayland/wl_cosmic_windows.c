@@ -476,6 +476,29 @@ static uint32_t state(const ksd_wl_toplevel *item)
     return value;
 }
 
+typedef struct cosmic_state_wait {
+    const ksd_wl_toplevel *window;
+    uint32_t requested;
+} cosmic_state_wait;
+
+static bool requested_state_observed(void *data)
+{
+    const cosmic_state_wait *wait = data;
+    uint32_t flags = state(wait->window);
+
+    if (wait->window->closed)
+        return true;
+    if (wait->requested == 1u)
+        return (flags & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u;
+    if (wait->requested == 2u)
+        return (flags & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u;
+    if (wait->requested == 3u)
+        return (flags & KSD_WL_TOPLEVEL_STATE_MINIMIZED) == 0u;
+    /* Restoring does not leave fullscreen, which state() reports as maximized. */
+    return (wait->window->state & (KSD_WL_TOPLEVEL_STATE_MINIMIZED
+                                   | KSD_WL_TOPLEVEL_STATE_MAXIMIZED)) == 0u;
+}
+
 const ksd_wayland_window_view *ksd_wayland_cosmic_window_view(void)
 {
     static const ksd_wayland_window_view view = {
@@ -518,12 +541,10 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
                 connection->cosmic_toplevel_manager,
                 window->cosmic_handle);
         } else {
-            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
-                zcosmic_toplevel_manager_v1_unset_minimized(
-                    connection->cosmic_toplevel_manager,
-                    window->cosmic_handle);
-            if (value == 0u && (window->state
-                 & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
+            zcosmic_toplevel_manager_v1_unset_minimized(
+                connection->cosmic_toplevel_manager,
+                window->cosmic_handle);
+            if (value == 0u)
                 zcosmic_toplevel_manager_v1_unset_maximized(
                     connection->cosmic_toplevel_manager,
                     window->cosmic_handle);
@@ -537,6 +558,21 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
         ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
                          "the compositor did not acknowledge the request");
         return;
+    }
+    if (opcode == KSD_OP_WINDOW_SET_STATE) {
+        cosmic_state_wait wait = { .window = window, .requested = value };
+        /* A sync reply can precede the window's configure and state events. */
+        if (!ksd_wayland_dispatch_until(connection, requested_state_observed,
+                                        &wait, KSD_COSMIC_WINDOW_TIMEOUT_MS)) {
+            ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
+                             "the compositor did not report the requested window state");
+            return;
+        }
+        if (window->closed) {
+            ksd_result_error(result, KSD_STATUS_NOT_FOUND, 0u,
+                             "the window no longer exists");
+            return;
+        }
     }
     (void)ksd_result_copy(result, NULL, 0u);
 }
