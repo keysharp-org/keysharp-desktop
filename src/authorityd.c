@@ -1911,11 +1911,21 @@ typedef struct state_source {
     bool clipboard;
 } state_source;
 
+static ksd_frame state_watch_request(bool clipboard)
+{
+    return (ksd_frame) {
+        .magic = { KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1, KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3 },
+        .major = KSD_PROTOCOL_MAJOR, .minor = KSD_PROTOCOL_MINOR,
+        .opcode = clipboard ? KSD_OP_CLIPBOARD_WATCH : KSD_OP_WINDOW_WATCH,
+        .request_id = 1u,
+    };
+}
+
 static void *state_source_run(void *data)
 {
     state_source *source = data;
     watch_context context = { .session = &source->session, .snapshot = &source->backend, .scope = 0u };
-    ksd_frame request = { .opcode = source->clipboard ? KSD_OP_CLIPBOARD_WATCH : KSD_OP_WINDOW_WATCH, .request_id = 1u };
+    ksd_frame request = state_watch_request(source->clipboard);
     if (watch_uses_display_worker(source->session.backend))
         (void)start_display_watch(&source->session, &request, &context);
     else {
@@ -2975,6 +2985,27 @@ int ksd_authority_main(int argc, char **argv)
 }
 
 #ifdef KSD_AUTHORITY_TESTING
+bool ksd_authority_test_state_watch_request(void)
+{
+    const uint16_t opcodes[] = { KSD_OP_WINDOW_WATCH, KSD_OP_CLIPBOARD_WATCH };
+    for (unsigned index = 0u; index < sizeof(opcodes) / sizeof(opcodes[0]); index++) {
+        int sockets[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+            return false;
+        ksd_frame request = state_watch_request(index != 0u);
+        ksd_frame received = { 0 };
+        bool ok = ksd_frame_write(sockets[0], &request)
+            && ksd_frame_read(sockets[1], public_magic, KSD_PROTOCOL_MAJOR,
+                KSD_PROTOCOL_MINOR, 0u, true, &received) == 1
+            && ksd_frame_is_request(&received)
+            && received.opcode == opcodes[index] && received.payload_length == 0u;
+        ksd_frame_clear(&received);
+        close(sockets[0]); close(sockets[1]);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool ksd_authority_test_display_lanes(void)
 {
     authority_state state = { .mutex = PTHREAD_MUTEX_INITIALIZER };
