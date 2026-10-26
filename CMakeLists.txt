@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(keysharp-desktop
-    VERSION 1.0.2
+    VERSION 1.0.3
     DESCRIPTION "Per-application desktop capability broker for Linux"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
