@@ -391,20 +391,21 @@ function addClickThroughChrome(actor) {
 }
 
 function makeImageContent(content, frame, sameSize) {
-    if (content && sameSize) {
-        // frame.area is the part that changed. One without extent means the texture already holds the right
-        // pixels and only the actor's geometry moved.
-        const {x, y, width, height} = frame.area;
-        if (width <= 0 || height <= 0)
-            return content;
-        const pixels = frame.areaPixels;
+    content = sameSize ? content : null;
+    const {x, y, width, height} = frame.area;
+    // Empty damage changes only the actor's geometry.
+    if (content && (width <= 0 || height <= 0))
+        return content;
+    const wholeFrame = x === 0 && y === 0
+        && width === frame.width && height === frame.height;
+    if (content && !wholeFrame) {
         try {
             let updated = false;
             if (SHELL_MAJOR >= 48 && typeof content.get_texture === 'function') {
                 const texture = content.get_texture();
                 if (texture && typeof texture.set_region === 'function') {
                     updated = texture.set_region(0, 0, x, y, width, height, width, height,
-                        frame.format, frame.rowStride, pixels);
+                        frame.format, frame.rowStride, frame.areaPixels);
                     if (updated)
                         content.invalidate();
                 }
@@ -414,7 +415,7 @@ function makeImageContent(content, frame, sameSize) {
                 area.y = y;
                 area.width = width;
                 area.height = height;
-                updated = content.set_area(pixels, frame.format, area,
+                updated = content.set_area(frame.areaPixels, frame.format, area,
                     frame.rowStride);
             }
             if (updated)
@@ -424,7 +425,7 @@ function makeImageContent(content, frame, sameSize) {
     }
 
     if (SHELL_MAJOR >= 48) {
-        const image = new GnomeSt.ImageContent({
+        const image = content || new GnomeSt.ImageContent({
             preferredWidth: frame.width,
             preferredHeight: frame.height,
         });
@@ -434,8 +435,8 @@ function makeImageContent(content, frame, sameSize) {
         return image;
     }
 
-    const image = new GnomeClutter.Image();
-    image.set_data(frame.pixels, frame.format, frame.width, frame.height,
+    const image = content || new GnomeClutter.Image();
+    image.set_bytes(frame.bytes, frame.format, frame.width, frame.height,
         frame.rowStride);
     return image;
 }

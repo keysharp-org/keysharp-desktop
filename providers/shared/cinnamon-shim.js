@@ -330,25 +330,28 @@ function addClickThroughChrome(actor) {
 }
 
 function makeImageContent(content, frame, sameSize) {
-    if (content && sameSize && typeof content.set_area === 'function') {
-        // frame.area is the part that changed. One without extent means the texture already holds the right
-        // pixels and only the actor's geometry moved.
-        if (frame.area.width <= 0 || frame.area.height <= 0)
-            return content;
+    content = sameSize ? content : null;
+    const {x, y, width, height} = frame.area;
+    // Empty damage changes only the actor's geometry.
+    if (content && (width <= 0 || height <= 0))
+        return content;
+    const wholeFrame = x === 0 && y === 0
+        && width === frame.width && height === frame.height;
+    if (content && !wholeFrame && typeof content.set_area === 'function') {
         try {
             const area = new CinnamonCairoGI.RectangleInt();
-            area.x = frame.area.x;
-            area.y = frame.area.y;
-            area.width = frame.area.width;
-            area.height = frame.area.height;
+            area.x = x;
+            area.y = y;
+            area.width = width;
+            area.height = height;
             if (content.set_area(frame.areaPixels, frame.format, area, frame.rowStride))
                 return content;
         } catch (_e) {
         }
     }
 
-    const image = new CinnamonClutter.Image();
-    image.set_data(frame.pixels, frame.format, frame.width, frame.height,
+    const image = content || new CinnamonClutter.Image();
+    image.set_bytes(frame.bytes, frame.format, frame.width, frame.height,
         frame.rowStride);
     return image;
 }

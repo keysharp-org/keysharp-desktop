@@ -392,20 +392,21 @@ function addClickThroughChrome(actor) {
 }
 
 function makeImageContent(content, frame, sameSize) {
-    if (content && sameSize) {
-        // frame.area is the part that changed. One without extent means the texture already holds the right
-        // pixels and only the actor's geometry moved.
-        const {x, y, width, height} = frame.area;
-        if (width <= 0 || height <= 0)
-            return content;
-        const pixels = frame.areaPixels;
+    content = sameSize ? content : null;
+    const {x, y, width, height} = frame.area;
+    // Empty damage changes only the actor's geometry.
+    if (content && (width <= 0 || height <= 0))
+        return content;
+    const wholeFrame = x === 0 && y === 0
+        && width === frame.width && height === frame.height;
+    if (content && !wholeFrame) {
         try {
             let updated = false;
             if (SHELL_MAJOR >= 48 && typeof content.get_texture === 'function') {
                 const texture = content.get_texture();
                 if (texture && typeof texture.set_region === 'function') {
                     updated = texture.set_region(0, 0, x, y, width, height, width, height,
-                        frame.format, frame.rowStride, pixels);
+                        frame.format, frame.rowStride, frame.areaPixels);
                     if (updated)
                         content.invalidate();
                 }
@@ -415,7 +416,7 @@ function makeImageContent(content, frame, sameSize) {
                 area.y = y;
                 area.width = width;
                 area.height = height;
-                updated = content.set_area(pixels, frame.format, area,
+                updated = content.set_area(frame.areaPixels, frame.format, area,
                     frame.rowStride);
             }
             if (updated)
@@ -425,7 +426,7 @@ function makeImageContent(content, frame, sameSize) {
     }
 
     if (SHELL_MAJOR >= 48) {
-        const image = new GnomeSt.ImageContent({
+        const image = content || new GnomeSt.ImageContent({
             preferredWidth: frame.width,
             preferredHeight: frame.height,
         });
@@ -435,8 +436,8 @@ function makeImageContent(content, frame, sameSize) {
         return image;
     }
 
-    const image = new GnomeClutter.Image();
-    image.set_data(frame.pixels, frame.format, frame.width, frame.height,
+    const image = content || new GnomeClutter.Image();
+    image.set_bytes(frame.bytes, frame.format, frame.width, frame.height,
         frame.rowStride);
     return image;
 }
@@ -2417,11 +2418,8 @@ class KeysharpExtensionCore {
         return true;
     }
 
-    // The frame is memory the client shares rather than pixels it sends: the message carries a descriptor of
-    // the client's buffer, mapped once per buffer serial, and every later frame is one texture upload of the
-    // damaged rectangle straight out of that mapping. Nothing is decoded and nothing sizeable is allocated per
-    // frame, which is what keeps this process's garbage collector out of the way of an animation: a collection
-    // here blocks every JS callback, method calls included, and the client sees its frames dropped.
+    // Map each buffer serial once. Whole uploads use native bytes; regional upload APIs need a fresh
+    // array of the damage's row span, so newer GJS copies stay bounded to the region being uploaded.
     _showImageOverlay(invocation, id, ownerKey, busName, x, y, width, height, frameIndex,
                       frameSerial, pixelWidth, pixelHeight, stride, damage) {
         let fd = -1;
@@ -2488,8 +2486,7 @@ class KeysharpExtensionCore {
             // A short mapping would have the texture upload read past its end.
             if (mapped.get_length() < stride * height)
                 return null;
-            // No array is kept: GJS's toArray() copies, so a kept one would hold this frame's pixels while the
-            // client draws every later frame into the same buffer.
+            // Keep the mapping rather than a JS snapshot: newer GJS releases copy in toArray().
             shared = {serial, mapped, bytes: mapped.get_bytes(), width, height, stride};
             if (entry)
                 entry.shared = shared;
@@ -2501,13 +2498,8 @@ class KeysharpExtensionCore {
             area = {x: 0, y: 0, width, height};
 
         const bytes = shared.bytes;
-        const areaOffset = area.y * stride + area.x * 4;
-        const areaLength = area.width > 0 && area.height > 0 ? (area.height - 1) * stride + area.width * 4 : 0;
-
-        // Getters, because both copy out of the mapping and an upload reads at most one of them: a regional
-        // update copies only the rows its damage spans, and only the whole-image fallbacks copy everything.
+        // Regional uploads require an array; convert on demand so copying GJS versions read this frame.
         return {
-            get pixels() { return bytes.toArray(); },
             bytes,
             // Cairo's ARGB32, which is what the client draws into: premultiplied BGRA on little-endian.
             format: Cogl.PixelFormat.BGRA_8888_PRE,
@@ -2515,7 +2507,14 @@ class KeysharpExtensionCore {
             height,
             rowStride: stride,
             area,
-            get areaPixels() { return GLib.Bytes.new_from_bytes(bytes, areaOffset, areaLength).toArray(); },
+            get areaPixels() {
+                const offset = area.y * stride + area.x * 4;
+                const length = area.width > 0 && area.height > 0 ? (area.height - 1) * stride + area.width * 4 : 0;
+                const region = typeof bytes.new_from_bytes === 'function'
+                    ? bytes.new_from_bytes(offset, length)
+                    : GLib.Bytes.new_from_bytes(bytes, offset, length);
+                return region.toArray();
+            },
             shared,
         };
     }
