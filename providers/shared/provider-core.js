@@ -1549,12 +1549,9 @@ class KeysharpExtensionCore {
             // A short mapping would have the texture upload read past its end.
             if (mapped.get_length() < stride * height)
                 return null;
-            const bytes = mapped.get_bytes();
-            shared = {
-                serial, mapped, bytes, width, height, stride,
-                // A view onto the mapping rather than a copy of it, so this stays cheap at video rates.
-                pixels: bytes.toArray(),
-            };
+            // No array is kept: GJS's toArray() copies, so a kept one would hold this frame's pixels while the
+            // client draws every later frame into the same buffer.
+            shared = {serial, mapped, bytes: mapped.get_bytes(), width, height, stride};
             if (entry)
                 entry.shared = shared;
             remapped = true;
@@ -1564,17 +1561,22 @@ class KeysharpExtensionCore {
         if (remapped)
             area = {x: 0, y: 0, width, height};
 
+        const bytes = shared.bytes;
+        const areaOffset = area.y * stride + area.x * 4;
+        const areaLength = area.width > 0 && area.height > 0 ? (area.height - 1) * stride + area.width * 4 : 0;
+
+        // Getters, because both copy out of the mapping and an upload reads at most one of them: a regional
+        // update copies only the rows its damage spans, and only the whole-image fallbacks copy everything.
         return {
-            pixels: shared.pixels,
-            bytes: shared.bytes,
+            get pixels() { return bytes.toArray(); },
+            bytes,
             // Cairo's ARGB32, which is what the client draws into: premultiplied BGRA on little-endian.
             format: Cogl.PixelFormat.BGRA_8888_PRE,
             width,
             height,
             rowStride: stride,
             area,
-            areaPixels: area.x === 0 && area.y === 0
-                ? shared.pixels : shared.pixels.subarray(area.y * stride + area.x * 4),
+            get areaPixels() { return GLib.Bytes.new_from_bytes(bytes, areaOffset, areaLength).toArray(); },
             shared,
         };
     }
