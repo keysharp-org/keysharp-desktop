@@ -378,16 +378,8 @@ write_basic_package_version_file(
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion)
 
-# Both executables have to find libkeysharp-desktop wherever the tree was put.
-# A system installation gets this for free, because its library lands in a
-# directory the loader already searches; a user installation does not, and
-# without an rpath the daemon cannot start at all outside /usr.
-#
-# Relative to the binary rather than absolute, so the tree can be moved or
-# installed anywhere. This is not the usual risk that carries -- neither binary
-# is setuid, and the directory it resolves to is owned by whoever the
-# installation belongs to: root for a system installation, and for a user one,
-# the same user the authority already runs as.
+# The executables also run from an unpacked or per-user installation, before
+# system-wide library discovery has been configured.
 set_target_properties(keysharp-desktop keysharp-desktop-capture-worker
     PROPERTIES
         INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
@@ -466,9 +458,15 @@ if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
         execute_process(COMMAND id -u OUTPUT_VARIABLE _install_uid
             OUTPUT_STRIP_TRAILING_WHITESPACE)
         if(\"\$ENV{DESTDIR}\" STREQUAL \"\" AND _install_uid STREQUAL \"0\")
-            find_program(_ldconfig ldconfig PATHS /sbin /usr/sbin NO_CACHE)
-            if(_ldconfig)
-                execute_process(COMMAND \"\${_ldconfig}\")
+            set(_libdir \"${CMAKE_INSTALL_LIBDIR}\")
+            if(NOT IS_ABSOLUTE \"\${_libdir}\")
+                set(_libdir \"\${CMAKE_INSTALL_PREFIX}/\${_libdir}\")
+            endif()
+            execute_process(COMMAND sh
+                \"${CMAKE_CURRENT_SOURCE_DIR}/packaging/configure-library-path.sh\"
+                \"\${_libdir}\" RESULT_VARIABLE _library_path_result)
+            if(NOT _library_path_result EQUAL 0)
+                message(FATAL_ERROR \"keysharp-desktop library registration or cache refresh failed\")
             endif()
             find_program(_tmpfiles systemd-tmpfiles NO_CACHE)
             if(_tmpfiles)
@@ -853,6 +851,10 @@ if(BUILD_TESTING)
 
     add_test(NAME portable-compatibility-tests
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/portable_compatibility_tests.sh
+            ${CMAKE_CURRENT_SOURCE_DIR})
+
+    add_test(NAME library-path-tests
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/library_path_tests.sh
             ${CMAKE_CURRENT_SOURCE_DIR})
 
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

@@ -10,6 +10,10 @@ expected_client_abi_minor=0
 
 skip_compatible=false
 
+configure_library_path() {
+    sh "$archive_root/configure-library-path.sh" /usr/local/lib
+}
+
 usage() {
     printf '%s\n' "usage: sudo $0 [--skip-if-compatible]"
 }
@@ -646,14 +650,20 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# shellcheck disable=SC1007 # CDPATH= is a prefix assignment scoped to cd
+archive_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 if [ "$skip_compatible" = true ]; then
     for candidate in /usr/bin/keysharp-desktop \
         /run/current-system/sw/bin/keysharp-desktop \
         /usr/local/bin/keysharp-desktop; do
         is_root_protected_executable "$candidate" || continue
         if installation_complete "$candidate"; then
+            if [ "$install_prefix" = /usr/local ]; then
+                configure_library_path
+            fi
             printf '%s\n' \
-                "A compatible keysharp-desktop is already installed; leaving it unchanged."
+                "A compatible keysharp-desktop is already installed."
             refresh_or_handoff_user_service false "$candidate"
             exit 0
         fi
@@ -667,8 +677,6 @@ if layered_install_present; then
     exit 1
 fi
 
-# shellcheck disable=SC1007 # CDPATH= is a prefix assignment scoped to cd
-archive_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 payload="$archive_root/payload/usr/local"
 policy="$archive_root/payload/usr/share/polkit-1/actions/org.keysharp.desktop.policy"
 payload_library=$(library_payload_under "$payload" || true)
@@ -678,6 +686,7 @@ if [ ! -x "$payload/bin/keysharp-desktop" ] \
     || ! has_client_artifacts "$payload" \
     || ! resource_configuration_matches \
         "$payload" /usr/local/bin/keysharp-desktop "$policy" \
+    || [ ! -f "$archive_root/configure-library-path.sh" ] \
     || [ ! -x "$archive_root/uninstall.sh" ]; then
     printf '%s\n' "keysharp-desktop: release payload is incomplete" >&2
     exit 1
@@ -722,7 +731,7 @@ current_library=$(portable_library_payload) || {
 }
 install -m 0755 "$archive_root/uninstall.sh" \
     /usr/local/share/doc/keysharp-desktop/uninstall.sh
-[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
+configure_library_path
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create \

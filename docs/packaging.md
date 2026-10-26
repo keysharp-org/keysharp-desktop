@@ -65,10 +65,17 @@ A manager environment naming no display of either kind is ignored rather than
 adopted, because a session that never imported its environment leaves that
 block behind and adopting it would restart the daemon on every recheck.
 
-Install and removal scripts reload the dynamic-linker cache after adding or
-removing the SONAME library. They reload systemd, enable the system socket,
-and refresh the invoking graphical user's service. Other active users refresh
-at their next login or with `systemctl --user daemon-reload`.
+Root source and portable installs register their library directory in
+`/etc/ld.so.conf.d/keysharp-desktop.conf` and refresh the dynamic-linker cache
+before service setup. Archives use `/usr/local/lib`; source installs use the
+configured full library directory.
+`DESTDIR` staging and `KEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF` skip live linker
+configuration and service setup. Debian packages use the distribution's library
+directory and maintainer scripts to refresh the cache.
+
+Installers reload systemd, enable the system socket, and refresh the invoking
+graphical user's service. Other active users refresh at their next login or with
+`systemctl --user daemon-reload`.
 
 ## Compositor scripts
 
@@ -97,7 +104,9 @@ partial, package-managed, or differently rooted installation. Compatibility
 reuse requires the ABI library and development metadata plus every service,
 policy, provider, and root-only worker resource.
 
-The standalone uninstaller removes only this project's manifest. It retains
+The standalone uninstaller removes only this project's manifest and its unchanged
+`/usr/local/lib` linker registration, then refreshes the cache. It preserves custom
+or modified linker configuration. It retains
 `/var/lib/keysharp-permissions/v1` because other authorities may use the same
 grants.
 

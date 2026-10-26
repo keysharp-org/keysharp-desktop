@@ -202,6 +202,11 @@ rm -rf -- \
     /usr/local/share/cinnamon/extensions/keysharp@keysharp.io \
     /usr/local/share/doc/keysharp-desktop \
     /run/keysharp-desktop
+configuration=/etc/ld.so.conf.d/keysharp-desktop.conf
+if [ ! -L "$configuration" ] && [ -f "$configuration" ] \
+    && printf '%s\n' /usr/local/lib | cmp -s - "$configuration"; then
+    rm -f -- "$configuration"
+fi
 [ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 printf '%s\n' "Removed keysharp-desktop."

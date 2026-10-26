@@ -1,4 +1,5 @@
 file(READ "${SOURCE_DIR}/packaging/install-release.sh" release_installer)
+string(REPLACE "\r\n" "\n" release_installer "${release_installer}")
 file(READ "${SOURCE_DIR}/install.sh" source_installer)
 file(READ "${SOURCE_DIR}/packaging/debian/postinst" debian_postinst)
 file(READ "${SOURCE_DIR}/packaging/debian/preinst" debian_preinst)
@@ -119,13 +120,43 @@ foreach(installer_source release_installer source_installer debian_postinst)
     endforeach()
 endforeach()
 foreach(lifecycle_source
-        release_installer source_installer debian_postinst
-        portable_uninstaller debian_postrm)
+        debian_postinst portable_uninstaller debian_postrm)
     string(FIND "${${lifecycle_source}}" "/sbin/ldconfig" found)
     if(found EQUAL -1)
         message(FATAL_ERROR "${lifecycle_source} does not refresh the loader cache")
     endif()
 endforeach()
+
+foreach(required
+        [[if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)]]
+        [[if(\"\$ENV{DESTDIR}\" STREQUAL \"\" AND _install_uid STREQUAL \"0\")]]
+        [[set(_libdir \"${CMAKE_INSTALL_LIBDIR}\")]]
+        [[if(NOT IS_ABSOLUTE \"\${_libdir}\")]]
+        [[set(_libdir \"\${CMAKE_INSTALL_PREFIX}/\${_libdir}\")]]
+        [[${CMAKE_CURRENT_SOURCE_DIR}/packaging/configure-library-path.sh]]
+        [[if(NOT _library_path_result EQUAL 0)]])
+    string(FIND "${cmake_source}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "direct install library setup is missing ${required}")
+    endif()
+endforeach()
+foreach(required
+        [[sh "$archive_root/configure-library-path.sh" /usr/local/lib]]
+        [[if [ "$install_prefix" = /usr/local ]; then
+                configure_library_path]]
+        [[configure_library_path
+
+if command -v systemd-tmpfiles]])
+    string(FIND "${release_installer}" "${required}" found)
+    if(found EQUAL -1)
+        message(FATAL_ERROR "portable install library setup is missing ${required}")
+    endif()
+endforeach()
+string(FIND "${release_workflow}"
+    [[packaging/configure-library-path.sh "$archive_root/configure-library-path.sh"]] helper_packaged)
+if(helper_packaged EQUAL -1)
+    message(FATAL_ERROR "portable archive does not include its library registration helper")
+endif()
 string(FIND "${broker_unit}" "/keysharp-desktop daemon" broker_mode)
 if(broker_mode EQUAL -1)
     message(FATAL_ERROR "user service does not select the daemon mode")

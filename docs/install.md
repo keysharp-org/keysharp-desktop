@@ -36,6 +36,10 @@ changing anything; `sudo ./check-runtime.sh --install` installs missing dependen
 Other distributions must supply them through their package manager. Archives target
 glibc 2.35 or newer.
 
+The archive installer registers `/usr/local/lib` in
+`/etc/ld.so.conf.d/keysharp-desktop.conf` and refreshes the dynamic-linker cache
+before service setup, so applications can find `libkeysharp-desktop.so.1` by name.
+
 Both routes install and enable the system authority and the graphical session service.
 On GNOME or Cinnamon, the service configures the bundled extension once for each
 user and desktop, when the shell first becomes available during startup or later
@@ -113,7 +117,9 @@ installation with:
 sudo /usr/local/share/doc/keysharp-desktop/uninstall.sh
 ```
 
-Uninstall keeps shared system grants under `/var/lib/keysharp-permissions/v1`.
+Uninstall removes the unchanged library-directory registration it owns and
+refreshes the linker cache; custom or modified configuration is preserved.
+It keeps shared system grants under `/var/lib/keysharp-permissions/v1`.
 Revoke unwanted grants with `keysharp-desktop permissions revoke` before removal.
 
 ## Build from source
@@ -146,6 +152,10 @@ invoking user's session. Install development dependencies first. `PREFIX` and
 standalone uninstaller. Configure with `-DKEYSHARP_DESKTOP_SETUP_ON_INSTALL=OFF`
 or install under `DESTDIR` for file-only staging. To use another permissions
 checkout, set `-DKEYSHARP_PERMISSIONS_SOURCE_DIR=/absolute/path`.
+
+A root source install registers its configured library directory in
+`/etc/ld.so.conf.d/keysharp-desktop.conf` and refreshes the linker cache before
+service setup. File-only staging leaves the system linker configuration unchanged.
 
 ## Install for one user
 

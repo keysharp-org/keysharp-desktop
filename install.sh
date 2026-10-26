@@ -84,7 +84,6 @@ refresh_invoking_user_manager() {
 cmake -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --build "$build_dir" --parallel
 cmake --install "$build_dir"
-[ ! -x /sbin/ldconfig ] || /sbin/ldconfig
 
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create "$prefix/lib/tmpfiles.d/keysharp-desktop-permissions.conf" || true
