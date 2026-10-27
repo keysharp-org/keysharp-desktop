@@ -53,6 +53,7 @@ extern int ksd_wayland_clipboard_timeout_ms;
 static int observed_requests_fd = -1;
 static struct wl_client *watch_update_client;
 static unsigned watch_update_serial;
+static bool watch_repeat_auxiliary;
 
 /* ---------------------------------------------------------------- server -- */
 
@@ -214,28 +215,35 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r,
 {
     (void)c; (void)r; (void)id;
 }
+static void send_test_keymap(struct wl_resource *keyboard, const char *layout)
+{
+    char map[512];
+    int length = snprintf(map, sizeof(map),
+        "xkb_keymap { xkb_keycodes { minimum=8; maximum=255; <AD01>=24; };"
+        "xkb_types { type \"ONE_LEVEL\" { modifiers=None; map[None]=Level1; }; };"
+        "xkb_compatibility {}; xkb_symbols { name[Group1]=\"%s\";"
+        "key <AD01> { type=\"ONE_LEVEL\", [q] }; }; };", layout);
+    assert(length > 0 && (size_t)length < sizeof(map));
+    int descriptor = memfd_create("ksd-test-keymap", MFD_CLOEXEC);
+    assert(descriptor >= 0);
+    assert(write(descriptor, map, (size_t)length + 1u) == length + 1);
+    wl_keyboard_send_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                             descriptor, (uint32_t)length + 1u);
+    if (strcmp(getenv("KSD_TEST_WL_MODE"), "keyboard-invalid") == 0)
+        wl_keyboard_send_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
+                                 descriptor, (uint32_t)length + 1u);
+    close(descriptor);
+}
+
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
                               uint32_t id)
 {
     (void)r;
-    static const char map[] =
-        "xkb_keymap { xkb_keycodes { minimum=8; maximum=255; <AD01>=24; };"
-        "xkb_types { type \"ONE_LEVEL\" { modifiers=None; map[None]=Level1; }; };"
-        "xkb_compatibility {}; xkb_symbols { name[Group1]=\"Test layout\";"
-        "key <AD01> { type=\"ONE_LEVEL\", [q] }; }; };";
     struct wl_resource *keyboard = wl_resource_create(c,
         &wl_keyboard_interface, 1, id);
     assert(keyboard != NULL);
-    int descriptor = memfd_create("ksd-test-keymap", MFD_CLOEXEC);
-    assert(descriptor >= 0);
-    assert(write(descriptor, map, sizeof(map)) == (ssize_t)sizeof(map));
-    wl_keyboard_send_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
-                             descriptor, sizeof(map));
+    send_test_keymap(keyboard, "Test layout");
     wl_keyboard_send_modifiers(keyboard, 1u, 1u, 2u, 4u, 3u);
-    if (strcmp(getenv("KSD_TEST_WL_MODE"), "keyboard-invalid") == 0)
-        wl_keyboard_send_keymap(keyboard, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
-                                 descriptor, sizeof(map));
-    close(descriptor);
 }
 static void seat_get_touch(struct wl_client *c, struct wl_resource *r,
                            uint32_t id)
@@ -1457,6 +1465,28 @@ static int trigger_watch_update(int number, void *data)
     return 0;
 }
 
+static enum wl_iterator_result update_watch_auxiliary(struct wl_resource *resource, void *data)
+{
+    (void)data;
+    const char *type = wl_resource_get_class(resource);
+    if (strcmp(type, "wl_keyboard") == 0)
+        send_test_keymap(resource, "Updated layout");
+    else if (strcmp(type, "zxdg_output_v1") == 0) {
+        zxdg_output_v1_send_logical_size(resource, 6, 3);
+        zxdg_output_v1_send_done(resource);
+    }
+    return WL_ITERATOR_CONTINUE;
+}
+
+static int trigger_watch_auxiliary(int number, void *data)
+{
+    (void)number; (void)data;
+    assert(watch_update_client != NULL);
+    watch_repeat_auxiliary = true;
+    wl_client_for_each_resource(watch_update_client, update_watch_auxiliary, NULL);
+    return 0;
+}
+
 static void observe_window_requests(void *data, enum wl_protocol_logger_type direction,
                                      const struct wl_protocol_logger_message *message)
 {
@@ -1482,6 +1512,9 @@ static void observe_window_requests(void *data, enum wl_protocol_logger_type dir
         watch_update_client = wl_resource_get_client(message->resource);
         /* Every round trip changes a window, including keyboard/display queries. */
         wl_client_for_each_resource(watch_update_client, update_watch_title, title);
+        /* Repeated identical metadata must leave the watcher idle. */
+        if (watch_repeat_auxiliary)
+            wl_client_for_each_resource(watch_update_client, update_watch_auxiliary, NULL);
     }
     if (marker != 0) assert(write(observed_requests_fd, &marker, 1u) == 1);
 }
@@ -1502,9 +1535,12 @@ static void run_server(const char *socket_name, int ready)
         _exit(1);
     if (observed_requests_fd >= 0)
         assert(wl_display_add_protocol_logger(display, observe_window_requests, NULL) != NULL);
-    if (strcmp(server_mode(), "cosmic-watch-updates") == 0)
+    if (strcmp(server_mode(), "cosmic-watch-updates") == 0) {
         assert(wl_event_loop_add_signal(wl_display_get_event_loop(display), SIGUSR1,
                                         trigger_watch_update, NULL) != NULL);
+        assert(wl_event_loop_add_signal(wl_display_get_event_loop(display), SIGUSR2,
+                                        trigger_watch_auxiliary, NULL) != NULL);
+    }
     if (wl_display_add_socket(display, socket_name) != 0)
         _exit(1);
     if (wl_global_create(display, &ext_data_control_manager_v1_interface, 1,
@@ -1778,8 +1814,33 @@ static void check_window_watch(const char *socket_name, const char *mode)
         assert(poll(&marker, 1u, 350) == 0);
         assert(kill(server, SIGUSR1) == 0);
         title_revision = read_watch_update(stream[0]);
+        /* A window-only event must not query keyboard or display state. */
+        assert(read_watch_syncs(syncs[0]) == 1u);
+        total_syncs++;
+        assert(title_revision == total_syncs);
+        assert(poll(&marker, 1u, 350) == 0);
+        assert(kill(server, SIGUSR2) == 0);
+        bool changed_keyboard = false, changed_displays = false;
+        while (!changed_keyboard || !changed_displays) {
+            frame = read_watch_frame(stream[0]);
+            ksd_state_event event; ksd_state_event_init(&event);
+            assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
+            if (event.domain == KSD_STATE_WINDOWS)
+                title_revision = watch_title_revision(&event.window);
+            if (event.domain == KSD_STATE_KEYBOARD && event.kind == KSD_STATE_CHANGED) {
+                assert(memmem(event.data.data, event.data.length, "Updated layout", 14u) != NULL);
+                changed_keyboard = true;
+            }
+            if (event.domain == KSD_STATE_DISPLAYS && event.kind == KSD_STATE_CHANGED) {
+                assert(memmem(event.data.data, event.data.length, "\"width\":6", 9u) != NULL);
+                assert(memmem(event.data.data, event.data.length, "\"height\":3", 10u) != NULL);
+                changed_displays = true;
+            }
+            ksd_state_event_clear(&event); ksd_frame_clear(&frame);
+        }
         total_syncs += read_watch_syncs(syncs[0]);
-        /* The final title includes changes dispatched by both auxiliary queries. */
+        if (title_revision < total_syncs)
+            title_revision = read_watch_update(stream[0]);
         assert(title_revision == total_syncs);
         assert(poll(&marker, 1u, 350) == 0);
         const uint8_t refreshes[3] = {

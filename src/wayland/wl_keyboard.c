@@ -195,8 +195,17 @@ void ksd_wayland_keyboard_state(ksd_wayland *connection,
 void ksd_wayland_keyboard_state_since(ksd_wayland *connection,
     const uint8_t *revision, uint32_t length, ksd_operation_result *result)
 {
-    if (!ksd_wayland_roundtrip(connection, 2000)
-        || connection->keymap == NULL) {
+    if (ksd_wayland_roundtrip(connection, 2000))
+        ksd_wayland_keyboard_snapshot_since(connection, revision, length, result);
+    else
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "the compositor has not supplied a keyboard keymap");
+}
+
+void ksd_wayland_keyboard_snapshot_since(ksd_wayland *connection,
+    const uint8_t *revision, uint32_t length, ksd_operation_result *result)
+{
+    if (connection->keymap == NULL) {
         ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
                          "the compositor has not supplied a keyboard keymap");
         return;

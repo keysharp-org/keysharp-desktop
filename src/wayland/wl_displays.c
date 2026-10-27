@@ -184,8 +184,8 @@ static bool append_display(ksd_buffer *out, const ksd_wl_output *output,
         && ksd_buffer_bytes(out, text, (size_t)length);
 }
 
-void ksd_wayland_display_list(ksd_wayland *connection,
-                              ksd_operation_result *result)
+static void serialize_displays(ksd_wayland *connection,
+                                ksd_operation_result *result)
 {
     ksd_hypr_monitor *monitors = NULL;
     size_t count = 0u;
@@ -194,16 +194,6 @@ void ksd_wayland_display_list(ksd_wayland *connection,
     bool ok;
     bool first = true;
 
-    if (!ksd_wayland_display_list_available(connection)) {
-        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
-                         "the compositor does not report logical outputs");
-        return;
-    }
-    if (!settle_outputs(connection)) {
-        ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
-                         "the compositor did not answer");
-        return;
-    }
     /* Without Hyprland the list simply carries no work areas. */
     if (connection->hypr)
         (void)ksd_wayland_hypr_monitors(connection->session_pid, &monitors,
@@ -235,6 +225,36 @@ void ksd_wayland_display_list(ksd_wayland *connection,
         (void)ksd_result_take_framed_text(&out, result,
             KSD_STATUS_RESOURCE_EXHAUSTED, "the display list is too large");
     ksd_buffer_clear(&out);
+}
+
+void ksd_wayland_display_list(ksd_wayland *connection,
+                              ksd_operation_result *result)
+{
+    if (!ksd_wayland_display_list_available(connection))
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "the compositor does not report logical outputs");
+    else if (!settle_outputs(connection))
+        ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u, "the compositor did not answer");
+    else
+        serialize_displays(connection, result);
+}
+
+void ksd_wayland_display_snapshot(ksd_wayland *connection,
+                                  ksd_operation_result *result)
+{
+    if (!ksd_wayland_display_list_available(connection)) {
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         "the compositor does not report logical outputs");
+        return;
+    }
+    for (const ksd_wl_output *output = connection->outputs; output != NULL; output = output->next) {
+        if (!output->logical_position || !output->logical_size) {
+            ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                             "the compositor has not finished its output metadata");
+            return;
+        }
+    }
+    serialize_displays(connection, result);
 }
 
 void ksd_wayland_work_area(ksd_wayland *connection,

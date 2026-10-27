@@ -16,6 +16,9 @@ bool ksd_wayland_display_list_available(const ksd_wayland *connection);
 bool ksd_wayland_work_area_available(const ksd_wayland *connection);
 void ksd_wayland_display_list(ksd_wayland *connection,
                               ksd_operation_result *result);
+/* Incomplete output metadata must not replace a published topology. */
+void ksd_wayland_display_snapshot(ksd_wayland *connection,
+                                  ksd_operation_result *result);
 void ksd_wayland_work_area(ksd_wayland *connection,
                            ksd_operation_result *result);
 

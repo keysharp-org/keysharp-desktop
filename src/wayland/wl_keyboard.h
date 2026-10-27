@@ -10,6 +10,9 @@ void ksd_wayland_keyboard_state(ksd_wayland *connection,
                                 ksd_operation_result *result);
 void ksd_wayland_keyboard_state_since(ksd_wayland *connection,
     const uint8_t *revision, uint32_t length, ksd_operation_result *result);
+/* Serializes already dispatched metadata without another round trip. */
+void ksd_wayland_keyboard_snapshot_since(ksd_wayland *connection,
+    const uint8_t *revision, uint32_t length, ksd_operation_result *result);
 
 /* The group layout names within keymap. False unless its index is in range
  * and names the same layout, which guards against a keymap that differs from

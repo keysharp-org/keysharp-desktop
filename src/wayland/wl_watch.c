@@ -154,10 +154,14 @@ static bool auxiliary_state(window_watch *watch, uint32_t domain, bool initial)
     ksd_operation_result result; ksd_result_init(&result);
     ksd_buffer *previous = domain == KSD_STATE_KEYBOARD ? &watch->keyboard_state : &watch->display_state;
     if (domain == KSD_STATE_KEYBOARD) {
-        ksd_wayland_keyboard_state_since(watch->connection, (const uint8_t *)watch->revision,
-            watch->revision[0] == '\0' ? 0u : 64u, &result);
-        if (watch->connection->keymap_revision != NULL) memcpy(watch->revision, watch->connection->keymap_revision, 65u);
-    } else ksd_wayland_display_list(watch->connection, &result);
+        if (initial)
+            ksd_wayland_keyboard_state_since(watch->connection, (const uint8_t *)watch->revision,
+                watch->revision[0] == '\0' ? 0u : 64u, &result);
+        else
+            ksd_wayland_keyboard_snapshot_since(watch->connection, (const uint8_t *)watch->revision,
+                watch->revision[0] == '\0' ? 0u : 64u, &result);
+    } else if (initial) ksd_wayland_display_list(watch->connection, &result);
+    else ksd_wayland_display_snapshot(watch->connection, &result);
     bool ok = true;
     if (result.status == KSD_STATUS_OK && result.tail_length >= 4u) {
         size_t length = result.tail_length - 4u; const uint8_t *json = result.tail + 4u;
@@ -167,6 +171,8 @@ static bool auxiliary_state(window_watch *watch, uint32_t domain, bool initial)
                 && (!initial || emit_state(watch, domain, KSD_STATE_SNAPSHOT_END, NULL, NULL, 0u));
             previous->length = 0u; ok = ksd_buffer_bytes(previous, json, length) && ok;
         }
+        if (ok && domain == KSD_STATE_KEYBOARD && watch->connection->keymap_revision != NULL)
+            memcpy(watch->revision, watch->connection->keymap_revision, 65u);
     }
     ksd_result_clear(&result); return ok;
 }
@@ -217,8 +223,6 @@ static bool refresh(window_watch *watch, bool emit, bool auxiliary)
         && (!auxiliary_state(watch, KSD_STATE_KEYBOARD, false)
             || !auxiliary_state(watch, KSD_STATE_DISPLAYS, false))))
         return false;
-    /* Auxiliary round trips dispatch window events too; capture their changes
-     * before returning to an idle native watch. */
     return update_windows(watch, emit);
 }
 
