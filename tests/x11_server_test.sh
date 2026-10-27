@@ -33,7 +33,8 @@ for display in 190 191 192 193 194 195 196 197 198 199; do
         echo "private Unix X server unavailable; shared-memory tests require local transport: skipping"
         exit 77
     fi
-    Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>/dev/null &
+    Xvfb ":${display}" -screen 0 1279x1024x24 -screen 1 640x480x24 \
+        -noreset -nolisten tcp >/dev/null 2>/dev/null &
     server=$!
     attempt=0
     while [ "$attempt" -lt 40 ] && kill -0 "$server" 2>/dev/null; do

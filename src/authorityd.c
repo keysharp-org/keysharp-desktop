@@ -2320,9 +2320,10 @@ static bool operation_sync(authority_session *session, const ksd_frame *request,
     if (lease == NULL) return false;
     uint64_t deadline = ksd_monotonic_milliseconds() + 2000u;
     pthread_mutex_lock(&lease->mutex);
-    /* Generic restacking has no global-edge fence across compositor layers and monitors. */
+    /* Restacking cannot reach a global edge across compositor layers. X11 also
+     * enumerates unmapped root support windows outside the managed stack. */
     bool monitoring = (lease->domains & KSD_STATE_WINDOWS) != 0u
-        && !(session->backend == KSD_BACKEND_GENERIC
+        && !((session->backend == KSD_BACKEND_GENERIC || session->backend == KSD_BACKEND_X11)
             && (request->opcode == KSD_OP_WINDOW_RAISE || request->opcode == KSD_OP_WINDOW_LOWER));
     int result = 0;
     while (monitoring && lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
@@ -3373,9 +3374,28 @@ bool ksd_authority_test_state_model(void)
     ok = ok && !operation_sync(&waiting, &focus_request, NULL);
     uint64_t elapsed = ksd_monotonic_milliseconds() - started;
     ok = ok && elapsed >= 1500u && elapsed < 3000u;
-    waiting.backend = KSD_BACKEND_GENERIC;
-    focus_request.opcode = KSD_OP_WINDOW_RAISE;
-    ok = ok && operation_sync(&waiting, &focus_request, NULL) && waiting.effective_sequence == 0u;
+    const ksd_backend restack_backends[] = { KSD_BACKEND_GENERIC, KSD_BACKEND_X11 };
+    const uint16_t restack_opcodes[] = { KSD_OP_WINDOW_RAISE, KSD_OP_WINDOW_LOWER };
+    state_window support = { .value = { .handle = 43u,
+        .valid_fields = KSD_FIELD_ID | KSD_FIELD_STACKING_ORDER } };
+    state_window primary = { .next = &support, .value = { .handle = 42u,
+        .valid_fields = KSD_FIELD_ID | KSD_FIELD_STACKING_ORDER | KSD_FIELD_VISIBLE,
+        .flags = KSD_WINDOW_VISIBLE, .stacking_order = 50u } };
+    lease.windows = &primary;
+    for (size_t i = 0u; i < sizeof(restack_backends) / sizeof(restack_backends[0]); i++) {
+        waiting.backend = restack_backends[i];
+        for (size_t j = 0u; j < sizeof(restack_opcodes) / sizeof(restack_opcodes[0]); j++) {
+            focus_request.opcode = restack_opcodes[j];
+            support.value.stacking_order = j == 0u ? 100u : 0u;
+            ok = ok && !operation_observed(&lease, &focus_request, NULL);
+            waiting.effective_sequence = 99u;
+            started = ksd_monotonic_milliseconds();
+            ok = ok && operation_sync(&waiting, &focus_request, NULL)
+                && waiting.effective_sequence == 0u
+                && ksd_monotonic_milliseconds() - started < 500u;
+        }
+    }
+    lease.windows = NULL;
     setsockopt(sockets[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     uint8_t padding[4096] = { 0 };
     while (send(sockets[0], padding, sizeof(padding), MSG_DONTWAIT | MSG_NOSIGNAL) > 0) {}

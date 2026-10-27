@@ -28,7 +28,8 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
         "_NET_WM_STATE_MAXIMIZED_VERT",
         "_NET_WM_STATE_MAXIMIZED_HORZ", "WM_CHANGE_STATE",
         "_NET_FRAME_EXTENTS", "_NET_WM_WINDOW_OPACITY", "_MOTIF_WM_HINTS",
-        "UTF8_STRING", "_NET_CLIENT_LIST_STACKING",
+        "UTF8_STRING", "_NET_CLIENT_LIST_STACKING", "_NET_SUPPORTED",
+        "_NET_RESTACK_WINDOW",
     };
     size_t count = sizeof(names) / sizeof(names[0]);
     xcb_intern_atom_cookie_t cookies[sizeof(names) / sizeof(names[0])];
@@ -56,6 +57,8 @@ void ksd_x11_load_atoms(xcb_connection_t *c, x11_atoms *atoms)
     fields[19] = &atoms->motif_hints;
     fields[20] = &atoms->utf8_string;
     fields[21] = &atoms->client_list_stacking;
+    fields[22] = &atoms->supported;
+    fields[23] = &atoms->restack_window;
 
     for (size_t index = 0u; index < count; index++)
         cookies[index] = xcb_intern_atom(c, 0,

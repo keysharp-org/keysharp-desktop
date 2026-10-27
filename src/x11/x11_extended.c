@@ -1,9 +1,11 @@
 #include "x11_extended.h"
 #include "x11_internal.h"
 #include "protocol.h"
+#include "transport.h"
 
 #include <limits.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/random.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +15,8 @@
 #include <xcb/xkb.h>
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-x11.h>
+
+static void keyboard_event(ksd_x11 *, const xcb_generic_event_t *);
 
 static void finish(ksd_buffer *out, bool ok, ksd_operation_result *result)
 {
@@ -211,11 +215,144 @@ void ksd_x11_window_set_title(ksd_x11 *connection, uint32_t window,
     free(n); free(u);
 }
 
+static bool request_withdrawal(ksd_x11 *connection, xcb_window_t window,
+                               xcb_window_t root, ksd_operation_result *result)
+{
+    xcb_connection_t *c = connection->connection;
+    union { xcb_unmap_notify_event_t unmap; char bytes[32]; } event = { 0 };
+    event.unmap.response_type = XCB_UNMAP_NOTIFY;
+    event.unmap.event = root;
+    event.unmap.window = window;
+    xcb_void_cookie_t unmap = xcb_unmap_window_checked(c, window);
+    xcb_void_cookie_t notify = xcb_send_event_checked(c, 0u, root,
+        XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY, event.bytes);
+    bool ok = checked(connection, unmap, result);
+    xcb_generic_error_t *error = xcb_request_check(c, notify);
+    if (ok && (error != NULL || ksd_x11_connection_failed(connection))) {
+        ksd_x11_window_error(result, error, "the X server rejected withdrawal");
+        ok = false;
+    }
+    free(error);
+    return ok;
+}
+
+static bool wait_for_withdrawal(ksd_x11 *connection, xcb_window_t window,
+                                 xcb_window_t root, ksd_operation_result *result)
+{
+    xcb_connection_t *c = connection->connection;
+    uint64_t deadline = ksd_monotonic_milliseconds() + 2000u;
+    for (;;) {
+        xcb_generic_error_t *error = NULL;
+        xcb_get_property_reply_t *state = xcb_get_property_reply(c,
+            xcb_get_property(c, 0u, window, connection->atoms.icccm_wm_state,
+                XCB_ATOM_ANY, 0u, 2u), &error);
+        if (state == NULL) {
+            ksd_x11_window_error(result, error, "the X server did not report withdrawal state");
+            free(error);
+            return false;
+        }
+        bool withdrawn = state->type == XCB_ATOM_NONE
+            || (state->type == connection->atoms.icccm_wm_state && state->format == 32u
+                && xcb_get_property_value_length(state) >= 8
+                && *(const uint32_t *)xcb_get_property_value(state) == 0u);
+        free(state);
+        if (withdrawn) {
+            xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c,
+                xcb_query_tree(c, window), &error);
+            if (tree == NULL) {
+                ksd_x11_window_error(result, error, "the X server did not report the withdrawn window");
+                free(error);
+                return false;
+            }
+            /* Some managers publish WithdrawnState before removing the frame.
+             * Reuse must wait until that reparent can no longer undo a map. */
+            bool released = tree->parent == tree->root;
+            free(tree);
+            if (released) return true;
+        }
+        if (ksd_monotonic_milliseconds() >= deadline) break;
+        unsigned pending = 0u;
+        bool remapped = false;
+        xcb_generic_event_t *event;
+        while (pending < 256u && (event = xcb_poll_for_event(c)) != NULL) {
+            pending++;
+            uint8_t type = event->response_type & 0x7fu;
+            remapped |= (type == XCB_MAP_NOTIFY && ((xcb_map_notify_event_t *)event)->window == window)
+                || (type == XCB_REPARENT_NOTIFY && ((xcb_reparent_notify_event_t *)event)->window == window);
+            keyboard_event(connection, event);
+            free(event);
+        }
+        /* A pending caption change can create a replacement frame after the
+         * first acknowledgment. Withdraw that remap within the same deadline. */
+        if (remapped && !request_withdrawal(connection, window, root, result)) return false;
+        /* A property reply can queue the notification that changes its value.
+         * Re-read after draining events before waiting on the server socket. */
+        if (pending != 0u) continue;
+        if (!ksd_wait_until(xcb_get_file_descriptor(c), POLLIN, deadline)) {
+            if (errno == ETIMEDOUT) break;
+            ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                "the X server stopped while withdrawing the window");
+            return false;
+        }
+    }
+    ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
+        "the window manager did not acknowledge withdrawal within 2 seconds");
+    return false;
+}
+
 void ksd_x11_window_set_visible(ksd_x11 *connection, uint32_t window,
                                 bool visible, ksd_operation_result *result)
 {
-    (void)checked(connection, visible ? xcb_map_window_checked(connection->connection, window)
-        : xcb_unmap_window_checked(connection->connection, window), result);
+    xcb_connection_t *c = connection->connection;
+    if (visible) {
+        (void)checked(connection, xcb_map_window_checked(c, window), result);
+        return;
+    }
+    xcb_get_property_cookie_t state_cookie = xcb_get_property(c, 0u, window,
+        connection->atoms.icccm_wm_state, XCB_ATOM_ANY, 0u, 2u);
+    xcb_get_window_attributes_cookie_t attributes_cookie = xcb_get_window_attributes(c, window);
+    xcb_query_tree_cookie_t tree_cookie = xcb_query_tree(c, window);
+    xcb_generic_error_t *state_error = NULL, *attributes_error = NULL, *tree_error = NULL;
+    xcb_get_property_reply_t *state = xcb_get_property_reply(c, state_cookie, &state_error);
+    xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(c,
+        attributes_cookie, &attributes_error);
+    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c, tree_cookie, &tree_error);
+    if (state == NULL || attributes == NULL || tree == NULL) {
+        ksd_x11_window_error(result, state == NULL ? state_error
+            : attributes == NULL ? attributes_error : tree_error,
+            "the X server did not report the window");
+        free(state); free(attributes); free(tree);
+        free(state_error); free(attributes_error); free(tree_error);
+        return;
+    }
+    bool managed = !attributes->override_redirect && state->type == connection->atoms.icccm_wm_state
+        && state->format == 32u && xcb_get_property_value_length(state) >= 8
+        && (*(const uint32_t *)xcb_get_property_value(state) == 1u
+            || *(const uint32_t *)xcb_get_property_value(state) == 3u);
+    xcb_window_t root = tree->root;
+    bool toplevel = tree->parent == root && !attributes->override_redirect;
+    uint32_t saved_mask = attributes->your_event_mask;
+    free(state); free(tree); free(attributes);
+    if (!managed) {
+        /* A pending MapRequest can precede publication of WM_STATE. Its
+         * withdrawal notification must follow it even when already unmapped. */
+        if (toplevel) (void)request_withdrawal(connection, window, root, result);
+        else (void)checked(connection, xcb_unmap_window_checked(c, window), result);
+        return;
+    }
+    uint32_t mask = saved_mask | XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+    if (!checked(connection, xcb_change_window_attributes_checked(c, window,
+        XCB_CW_EVENT_MASK, &mask), result)) return;
+    /* ICCCM withdrawal needs a synthetic notification even if a pending
+     * decoration reparent has already unmapped the client. */
+    if (request_withdrawal(connection, window, root, result)
+        && wait_for_withdrawal(connection, window, root, result)) {
+        /* Reparenting can queue a new root MapNotify after the old manager
+         * releases the client. Follow it with the complete withdrawal again. */
+        (void)request_withdrawal(connection, window, root, result);
+    }
+    free(xcb_request_check(c, xcb_change_window_attributes_checked(c, window,
+        XCB_CW_EVENT_MASK, &saved_mask)));
 }
 
 void ksd_x11_window_redraw(ksd_x11 *connection, uint32_t window, ksd_operation_result *result)
@@ -449,18 +586,24 @@ void ksd_x11_keyboard_clear(ksd_x11 *connection)
     connection->keyboard = NULL;
 }
 
+static void keyboard_event(ksd_x11 *connection, const xcb_generic_event_t *event)
+{
+    /* Window RPCs share this connection with keyboard queries. Preserve XKB
+     * cache invalidation when a withdrawal consumes their notifications. */
+    if (connection->keyboard != NULL
+        && (event->response_type & 0x7fu) == connection->keyboard->event_base)
+        ksd_x11_keyboard_clear(connection);
+}
+
 static bool keyboard_keymap(ksd_x11 *connection)
 {
-    struct ksd_x11_keyboard_cache *cache = connection->keyboard;
     xcb_generic_event_t *event;
-    bool changed = false;
     while ((event = xcb_poll_for_event(connection->connection)) != NULL) {
-        if (cache != NULL && (event->response_type & 0x7fu) == cache->event_base) changed = true;
+        keyboard_event(connection, event);
         free(event);
     }
-    if (cache != NULL && !changed) return true;
-    ksd_x11_keyboard_clear(connection);
-    cache = calloc(1u, sizeof(*cache));
+    if (connection->keyboard != NULL) return true;
+    struct ksd_x11_keyboard_cache *cache = calloc(1u, sizeof(*cache));
     if (cache == NULL) return false;
     connection->keyboard = cache;
     cache->context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);

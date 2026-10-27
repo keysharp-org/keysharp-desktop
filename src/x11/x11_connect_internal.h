@@ -6,6 +6,8 @@
 typedef struct x11_atoms {
     xcb_atom_t client_list;
     xcb_atom_t client_list_stacking;
+    xcb_atom_t supported;
+    xcb_atom_t restack_window;
     xcb_atom_t active_window;
     xcb_atom_t close_window;
     xcb_atom_t moveresize_window;

@@ -1,6 +1,7 @@
 #include "operation_result.h"
 #include "protocol.h"
 #include "protocol_io.h"
+#include "transport.h"
 #include "x11_capture.h"
 #include "x11_clipboard.h"
 #include "x11_control.h"
@@ -1056,6 +1057,16 @@ static void check_extended_windows(ksd_x11 *connection, xcb_connection_t *owner,
     assert_window_id(&result, popup);
     assert_window_id(&result, client);
     ksd_result_clear(&result);
+    /* Override-redirect bypasses the manager even with a stale WM_STATE.
+     * Hiding it must not wait for a withdrawal acknowledgment. */
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, popup, wm_state,
+        wm_state, 32u, 2u, state);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    ksd_result_init(&result);
+    uint64_t hide_started = ksd_monotonic_milliseconds();
+    ksd_x11_window_set_visible(connection, popup, false, &result);
+    assert(result.status == KSD_STATUS_OK && ksd_monotonic_milliseconds() - hide_started < 500u);
+    ksd_result_clear(&result);
     xcb_delete_property(owner, screen->root, clients_atom);
     xcb_delete_property(owner, screen->root, stacking_atom);
     xcb_set_input_focus(owner, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_INPUT_FOCUS_POINTER_ROOT, XCB_CURRENT_TIME);
@@ -1425,6 +1436,253 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     (void)canonical;
 }
 
+static void expect_withdrawal(xcb_connection_t *wm, int completion_fd,
+                               xcb_window_t root, xcb_window_t window)
+{
+    for (;;) {
+        bool notified = false;
+        xcb_generic_event_t *event;
+        while ((event = xcb_poll_for_event(wm)) != NULL) {
+            if (event->response_type == (XCB_UNMAP_NOTIFY | 0x80u)
+                && ((xcb_unmap_notify_event_t *)event)->window == window) {
+                xcb_unmap_notify_event_t *unmap = (xcb_unmap_notify_event_t *)event;
+                assert(unmap->event == root && unmap->from_configure == 0u);
+                notified = true;
+            }
+            free(event);
+        }
+        if (notified) return;
+        struct pollfd descriptors[] = {
+            { .fd = xcb_get_file_descriptor(wm), .events = POLLIN },
+            { .fd = completion_fd, .events = POLLIN },
+        };
+        assert(poll(descriptors, 2u, 3000) > 0);
+        assert(descriptors[1].revents == 0);
+    }
+}
+
+static void check_window_withdrawal(ksd_x11 *connection, xcb_connection_t *owner,
+                                    xcb_screen_t *primary_screen, xcb_screen_t *other_screen,
+                                    const char *canonical)
+{
+    xcb_atom_t state = intern_in(owner, "WM_STATE");
+    for (unsigned mode = 0u; mode < 5u; mode++) {
+        xcb_screen_t *screen = mode == 1u ? other_screen : primary_screen;
+        uint32_t expected_status = mode == 2u ? KSD_STATUS_NOT_FOUND
+            : mode == 3u ? KSD_STATUS_TIMEOUT : KSD_STATUS_OK;
+        xcb_keycode_t keycode = xcb_get_setup(owner)->min_keycode;
+        xcb_get_keyboard_mapping_reply_t *mapping = NULL;
+        char revision[33] = { 0 };
+        if (mode == 0u) {
+            mapping = xcb_get_keyboard_mapping_reply(owner,
+                xcb_get_keyboard_mapping(owner, keycode, 1u), NULL);
+            assert(mapping != NULL && mapping->keysyms_per_keycode != 0u);
+            ksd_operation_result keyboard; ksd_result_init(&keyboard);
+            ksd_x11_keyboard_state_since(connection, NULL, 0u, &keyboard);
+            assert(keyboard.status == KSD_STATUS_OK);
+            const char *current = ksd_x11_keyboard_revision(connection);
+            assert(current != NULL && strlen(current) == 32u);
+            memcpy(revision, current, sizeof(revision));
+            ksd_result_clear(&keyboard);
+        }
+        xcb_window_t frame = xcb_generate_id(owner), window = xcb_generate_id(owner);
+        if (mode != 4u)
+            xcb_create_window(owner, XCB_COPY_FROM_PARENT, frame, screen->root,
+                10, 20, 80u, 80u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+        xcb_create_window(owner, XCB_COPY_FROM_PARENT, window, mode == 4u ? screen->root : frame,
+            0, 0, 64u, 64u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+        uint32_t normal[] = { mode == 4u ? 0u : 1u, XCB_WINDOW_NONE };
+        xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, state, state, 32u, 2u, normal);
+        if (mode != 4u) xcb_map_window(owner, frame);
+        free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+        uint32_t saved_mask = XCB_EVENT_MASK_ENTER_WINDOW | XCB_EVENT_MASK_BUTTON_PRESS;
+        xcb_change_window_attributes(connection->connection, window, XCB_CW_EVENT_MASK, &saved_mask);
+        settle(connection);
+        int pair[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            alarm(5u);
+            close(pair[0]);
+            close(xcb_get_file_descriptor(connection->connection));
+            close(xcb_get_file_descriptor(owner));
+            xcb_connection_t *wm = xcb_connect(canonical, NULL);
+            assert(xcb_connection_has_error(wm) == 0);
+            uint32_t root_mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY;
+            xcb_change_window_attributes(wm, screen->root, XCB_CW_EVENT_MASK, &root_mask);
+            free(xcb_get_input_focus_reply(wm, xcb_get_input_focus(wm), NULL));
+            const uint8_t ready = 1u;
+            assert(write(pair[1], &ready, sizeof(ready)) == sizeof(ready));
+            expect_withdrawal(wm, mode == 4u ? -1 : pair[1], screen->root, window);
+            if (mode < 2u) {
+                /* A pending reparent can remap an already-unmapped client. The
+                 * caller must wait for withdrawal and the later frame removal. */
+                if (mode == 1u) xcb_map_window(wm, window);
+                if (mode == 0u) {
+                    /* Withdrawal drains this shared connection's notifications;
+                     * an XKB map change must still invalidate its cached map. */
+                    xcb_keysym_t *symbols = xcb_get_keyboard_mapping_keysyms(mapping);
+                    symbols[0] = symbols[0] == 0x0041u ? 0x0042u : 0x0041u;
+                    xcb_generic_error_t *error = xcb_request_check(wm,
+                        xcb_change_keyboard_mapping_checked(wm, 1u, keycode,
+                            mapping->keysyms_per_keycode, symbols));
+                    assert(error == NULL);
+                    uint32_t withdrawn[] = { 0u, XCB_WINDOW_NONE };
+                    xcb_change_property(wm, XCB_PROP_MODE_REPLACE, window,
+                        state, state, 32u, 2u, withdrawn);
+                } else xcb_delete_property(wm, window, state);
+                free(xcb_get_input_focus_reply(wm, xcb_get_input_focus(wm), NULL));
+                struct pollfd done = { .fd = pair[1], .events = POLLIN };
+                assert(poll(&done, 1u, 30) == 0);
+                if (mode == 0u) {
+                    /* A compositor can replace the frame after publishing its
+                     * first acknowledgment and temporarily reclaim the client. */
+                    xcb_window_t replacement = xcb_generate_id(wm);
+                    xcb_create_window(wm, XCB_COPY_FROM_PARENT, replacement, screen->root,
+                        10, 20, 80u, 80u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+                    xcb_reparent_window(wm, window, replacement, 0, 0);
+                    xcb_change_property(wm, XCB_PROP_MODE_REPLACE, window, state, state, 32u, 2u, normal);
+                    xcb_map_window(wm, replacement);
+                    xcb_map_window(wm, window);
+                    free(xcb_get_input_focus_reply(wm, xcb_get_input_focus(wm), NULL));
+                    expect_withdrawal(wm, pair[1], screen->root, window);
+                    uint32_t withdrawn[] = { 0u, XCB_WINDOW_NONE };
+                    xcb_change_property(wm, XCB_PROP_MODE_REPLACE, window, state, state, 32u, 2u, withdrawn);
+                }
+                xcb_reparent_window(wm, window, screen->root, 10, 20);
+                xcb_map_window(wm, window);
+                free(xcb_get_input_focus_reply(wm, xcb_get_input_focus(wm), NULL));
+            } else if (mode == 2u) {
+                xcb_destroy_window(wm, window);
+                xcb_flush(wm);
+            }
+            uint32_t status = UINT32_MAX;
+            assert(read(pair[1], &status, sizeof(status)) == sizeof(status));
+            assert(status == expected_status);
+            if (mode < 2u || mode == 4u) {
+                xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(wm,
+                    xcb_get_window_attributes(wm, window), NULL);
+                assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_UNMAPPED);
+                free(attributes);
+            }
+            xcb_disconnect(wm);
+            close(pair[1]);
+            _exit(0);
+        }
+        close(pair[1]);
+        uint8_t ready = 0u;
+        assert(read(pair[0], &ready, sizeof(ready)) == sizeof(ready) && ready == 1u);
+        uint64_t started = ksd_monotonic_milliseconds();
+        ksd_operation_result result; ksd_result_init(&result);
+        ksd_x11_window_set_visible(connection, window, false, &result);
+        uint32_t status = result.status;
+        assert(write(pair[0], &status, sizeof(status)) == sizeof(status));
+        assert(status == expected_status);
+        if (mode == 3u) {
+            uint64_t elapsed = ksd_monotonic_milliseconds() - started;
+            assert(elapsed >= 1500u && elapsed < 3000u);
+        } else if (mode == 4u)
+            assert(ksd_monotonic_milliseconds() - started < 500u);
+        ksd_result_clear(&result);
+        int wait_status = -1;
+        assert(waitpid(child, &wait_status, 0) == child);
+        assert(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+        close(pair[0]);
+        if (mode == 0u) {
+            ksd_result_init(&result);
+            ksd_x11_keyboard_state_since(connection, (const uint8_t *)revision, 32u, &result);
+            assert(result.status == KSD_STATUS_OK);
+            assert_json_has(&result, "\"keymap\":");
+            assert_json_has(&result, "xkb_keymap");
+            assert(strcmp(ksd_x11_keyboard_revision(connection), revision) != 0);
+            ksd_result_clear(&result);
+            xcb_generic_error_t *error = xcb_request_check(owner,
+                xcb_change_keyboard_mapping_checked(owner, 1u, keycode,
+                    mapping->keysyms_per_keycode, xcb_get_keyboard_mapping_keysyms(mapping)));
+            assert(error == NULL);
+            free(mapping);
+        }
+        if (mode != 2u) {
+            xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(connection->connection,
+                xcb_get_window_attributes(connection->connection, window), NULL);
+            assert(attributes != NULL && attributes->your_event_mask == saved_mask);
+            free(attributes);
+            xcb_destroy_window(owner, window);
+        }
+        if (mode != 4u) xcb_destroy_window(owner, frame);
+        free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+    }
+}
+
+static void check_pager_restack(ksd_x11 *connection, xcb_connection_t *owner,
+                                xcb_screen_t *screen)
+{
+    xcb_window_t window = xcb_generate_id(owner);
+    xcb_atom_t supported = intern_in(owner, "_NET_SUPPORTED");
+    xcb_atom_t restack = intern_in(owner, "_NET_RESTACK_WINDOW");
+    xcb_atom_t wm_state = intern_in(owner, "_NET_WM_STATE");
+    xcb_atom_t below = intern_in(owner, "_NET_WM_STATE_BELOW");
+    xcb_atom_t state = intern_in(owner, "WM_STATE");
+    uint32_t normal[] = { 1u, XCB_WINDOW_NONE };
+    uint32_t mask = XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
+    xcb_change_window_attributes(owner, screen->root, XCB_CW_EVENT_MASK, &mask);
+    xcb_create_window(owner, XCB_COPY_FROM_PARENT, window, screen->root,
+        10, 20, 64u, 64u, 0u, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0u, NULL);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, screen->root, supported,
+        XCB_ATOM_ATOM, 32u, 1u, &restack);
+    xcb_change_property(owner, XCB_PROP_MODE_REPLACE, window, state,
+        state, 32u, 2u, normal);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+
+    for (unsigned operation = 0u; operation < 4u; operation++) {
+        unsigned raise = operation % 2u;
+        bool unmanaged = operation >= 2u;
+        if (operation == 2u) {
+            /* Stale WM_STATE does not make an override-redirect client managed. */
+            uint32_t override_redirect = 1u;
+            xcb_change_window_attributes(owner, window, XCB_CW_OVERRIDE_REDIRECT, &override_redirect);
+            free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+        }
+        xcb_generic_event_t *event;
+        while ((event = xcb_poll_for_event(owner)) != NULL) free(event);
+        ksd_operation_result result; ksd_result_init(&result);
+        ksd_x11_window_raise(connection, window, raise != 0u, &result);
+        assert(result.status == KSD_STATUS_OK);
+        ksd_result_clear(&result);
+        settle(connection);
+        free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+        unsigned restacks = 0u, states = 0u, direct = 0u;
+        while ((event = xcb_poll_for_event(owner)) != NULL) {
+            uint8_t type = event->response_type & 0x7fu;
+            if (type == XCB_CLIENT_MESSAGE) {
+                xcb_client_message_event_t *message = (xcb_client_message_event_t *)event;
+                assert(message->window == window && message->format == 32u);
+                if (message->type == restack) {
+                    restacks++;
+                    assert(message->data.data32[0] == 2u);
+                    assert(message->data.data32[1] == XCB_WINDOW_NONE);
+                    assert(message->data.data32[2] == (raise != 0u ? XCB_STACK_MODE_ABOVE : XCB_STACK_MODE_BELOW));
+                    assert(message->data.data32[3] == 0u && message->data.data32[4] == 0u);
+                } else {
+                    states++;
+                    assert(message->type == wm_state && (unmanaged || raise != 0u));
+                    assert(message->data.data32[0] == (raise != 0u ? 0u : 1u)
+                        && message->data.data32[1] == below);
+                }
+            } else if (type == XCB_CONFIGURE_REQUEST) direct++;
+            free(event);
+        }
+        assert(restacks == (unmanaged ? 0u : 1u)
+            && states == (unmanaged ? 1u : raise) && direct == 0u);
+    }
+    xcb_destroy_window(owner, window);
+    xcb_delete_property(owner, screen->root, supported);
+    mask = 0u;
+    xcb_change_window_attributes(owner, screen->root, XCB_CW_EVENT_MASK, &mask);
+    free(xcb_get_input_focus_reply(owner, xcb_get_input_focus(owner), NULL));
+}
+
 int main(void)
 {
     const char *display = getenv("KSD_TEST_DISPLAY");
@@ -1470,13 +1728,21 @@ int main(void)
      * see them the way any other client would. */
     xcb_connection_t *owner = xcb_connect(canonical, NULL);
     assert(xcb_connection_has_error(owner) == 0);
-    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(owner)).data;
+    xcb_screen_iterator_t screens = xcb_setup_roots_iterator(xcb_get_setup(owner));
+    xcb_screen_t *screen = screens.data;
     assert(screen != NULL);
+    xcb_screen_next(&screens);
+    assert(screens.rem != 0);
+    xcb_screen_t *other_screen = screens.data;
+    assert(other_screen->root != connection->screen->root);
     check_window_handles_with_manager(connection, owner, screen);
     check_extended_windows(connection, owner, screen);
     check_window_watch(connection, owner, screen, canonical);
     check_capture(connection, owner, screen);
     check_clipboard(connection, owner, canonical);
+    check_window_withdrawal(connection, owner, screen, other_screen, canonical);
+    check_pager_restack(connection, owner, screen);
+    check_pager_restack(connection, owner, other_screen);
     check_control(connection, owner, screen, canonical);
     xcb_disconnect(owner);
 

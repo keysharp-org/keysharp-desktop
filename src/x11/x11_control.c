@@ -61,7 +61,7 @@ static void missing(ksd_operation_result *result)
  * names. The window manager selects for substructure events on the root, and
  * that is where it is listening; sending to the window itself would reach the
  * application, which is not who is being asked. */
-static void send_to_root(xcb_connection_t *c, const xcb_screen_t *screen,
+static void send_to_root(xcb_connection_t *c, xcb_window_t root,
                          xcb_window_t window, xcb_atom_t type,
                          const uint32_t data[5])
 {
@@ -74,7 +74,7 @@ static void send_to_root(xcb_connection_t *c, const xcb_screen_t *screen,
     event.type = type;
     for (size_t index = 0u; index < 5u; index++)
         event.data.data32[index] = data[index];
-    xcb_send_event(c, 0, screen->root,
+    xcb_send_event(c, 0, root,
                    XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY
                        | XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT,
                    (const char *)&event);
@@ -84,7 +84,7 @@ static void send_to_root(xcb_connection_t *c, const xcb_screen_t *screen,
 /* Adds or removes one _NET_WM_STATE atom. Two may be given, because maximized
  * is two atoms -- vertical and horizontal -- and a window maximized in only
  * one direction is a different state, not a half-done one. */
-static void change_state(xcb_connection_t *c, const xcb_screen_t *screen,
+static void change_state(xcb_connection_t *c, xcb_window_t root,
                          const x11_atoms *atoms, xcb_window_t window,
                          uint32_t action, xcb_atom_t first, xcb_atom_t second)
 {
@@ -92,7 +92,7 @@ static void change_state(xcb_connection_t *c, const xcb_screen_t *screen,
         action, (uint32_t)first, (uint32_t)second, KSD_EWMH_SOURCE_PAGER, 0u,
     };
 
-    send_to_root(c, screen, window, atoms->wm_state, data);
+    send_to_root(c, root, window, atoms->wm_state, data);
 }
 
 #define CONTROL_PROLOGUE(connection, window, result)                          \
@@ -112,7 +112,7 @@ void ksd_x11_window_focus(ksd_x11 *connection, uint32_t window,
      * flag the window, and inventing a current time would defeat that
      * deliberately -- this service has no user interaction to report. */
     uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
-    send_to_root(c, connection->screen, window, atoms->active_window, data);
+    send_to_root(c, connection->screen->root, window, atoms->active_window, data);
     applied(result);
 }
 
@@ -121,33 +121,64 @@ void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
 {
     const x11_atoms *atoms = &connection->atoms;
     xcb_connection_t *c = connection->connection;
-    /* The required tree reply also establishes that the target still exists. */
-    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c,
-        xcb_query_tree(c, window), NULL);
-    if (tree == NULL) {
-        missing(result);
+    xcb_query_tree_cookie_t tree_cookie = xcb_query_tree(c, window);
+    xcb_get_property_cookie_t supported_cookie = ksd_x11_property_cookie(c,
+        connection->screen->root, atoms->supported, XCB_ATOM_ATOM, 1024u);
+    xcb_get_property_cookie_t managed_cookie = ksd_x11_property_cookie(c,
+        window, atoms->icccm_wm_state, XCB_ATOM_ANY, 2u);
+    xcb_get_window_attributes_cookie_t attributes_cookie = xcb_get_window_attributes(c, window);
+    xcb_generic_error_t *tree_error = NULL, *supported_error = NULL, *managed_error = NULL, *attributes_error = NULL;
+    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c, tree_cookie, &tree_error);
+    xcb_get_property_reply_t *supported = xcb_get_property_reply(c, supported_cookie, &supported_error);
+    xcb_get_property_reply_t *managed = xcb_get_property_reply(c, managed_cookie, &managed_error);
+    xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(c, attributes_cookie, &attributes_error);
+    if (tree != NULL && supported != NULL && managed != NULL && attributes != NULL
+        && tree->root != connection->screen->root) {
+        free(supported);
+        supported = xcb_get_property_reply(c, xcb_get_property(c, 0u, tree->root,
+            atoms->supported, XCB_ATOM_ATOM, 0u, 1024u), &supported_error);
+    }
+    if (tree == NULL || supported == NULL || managed == NULL || attributes == NULL) {
+        ksd_x11_window_error(result, tree == NULL ? tree_error
+            : managed == NULL ? managed_error : attributes == NULL ? attributes_error : supported_error,
+            "the X server did not report restacking support");
+        free(tree); free(supported); free(managed); free(attributes);
+        free(tree_error); free(supported_error); free(managed_error); free(attributes_error);
         return;
     }
-    /* Reparenting managers may ignore a direct restack of the client or its
-     * frame. BELOW is the manager-owned equivalent; remove it when raising so
-     * a prior lower does not pin the window beneath later restacks. */
-    change_state(c, connection->screen, atoms, window,
-                 raise ? KSD_NET_WM_STATE_REMOVE : KSD_NET_WM_STATE_ADD,
-                 atoms->state_below, XCB_ATOM_NONE);
+    xcb_window_t root = tree->root;
+    bool pager_restack = !attributes->override_redirect
+        && supported->type == XCB_ATOM_ATOM && supported->format == 32u
+        && ksd_x11_state_has(supported, atoms->restack_window)
+        && managed->type == atoms->icccm_wm_state
+        && managed->format == 32u && xcb_get_property_value_length(managed) >= 8
+        && (*(const uint32_t *)xcb_get_property_value(managed) == 1u
+            || *(const uint32_t *)xcb_get_property_value(managed) == 3u);
+    free(supported); free(managed); free(attributes);
+    uint32_t stack_mode = raise ? (uint32_t)XCB_STACK_MODE_ABOVE : (uint32_t)XCB_STACK_MODE_BELOW;
+    /* Only legacy lowering needs persistent BELOW; pager restacks are momentary. */
+    if (raise || !pager_restack)
+        change_state(c, root, atoms, window,
+            raise ? KSD_NET_WM_STATE_REMOVE : KSD_NET_WM_STATE_ADD,
+            atoms->state_below, XCB_ATOM_NONE);
+    if (pager_restack) {
+        free(tree);
+        uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, XCB_WINDOW_NONE, stack_mode, 0u, 0u };
+        send_to_root(c, root, window, atoms->restack_window, data);
+        applied(result);
+        return;
+    }
     /* Restacking is one of the few verbs a client may do directly, and doing
      * it directly is what makes raise and lower work with no window manager
      * running. A reparenting manager will have made the frame the child of the
      * root, so the request is issued against the frame when there is one. */
     xcb_window_t target = window;
-    uint32_t values[] = {
-        raise ? (uint32_t)XCB_STACK_MODE_ABOVE : (uint32_t)XCB_STACK_MODE_BELOW,
-    };
 
     if (tree->parent != XCB_WINDOW_NONE
-        && tree->parent != connection->screen->root)
+        && tree->parent != root)
         target = tree->parent;
     free(tree);
-    xcb_configure_window(c, target, XCB_CONFIG_WINDOW_STACK_MODE, values);
+    xcb_configure_window(c, target, XCB_CONFIG_WINDOW_STACK_MODE, &stack_mode);
     xcb_flush(c);
     applied(result);
 }
@@ -161,7 +192,7 @@ void ksd_x11_window_close(ksd_x11 *connection, uint32_t window,
      * a dialog, and this service reports that the ask was delivered rather
      * than that the window went away. */
     uint32_t data[5] = { 0u, KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u };
-    send_to_root(c, connection->screen, window, atoms->close_window, data);
+    send_to_root(c, connection->screen->root, window, atoms->close_window, data);
     applied(result);
 }
 
@@ -221,7 +252,7 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
         flags, (uint32_t)x, (uint32_t)y, width, height,
     };
 
-    send_to_root(c, connection->screen, window, atoms->moveresize_window, data);
+    send_to_root(c, connection->screen->root, window, atoms->moveresize_window, data);
     /* Also configured directly, so the verb does something on a bare display
      * where no window manager will act on the message above. A managed window
      * has its configure request redirected to the manager, which is exactly
@@ -253,27 +284,27 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
              * describes a window that IS minimized and is set by the manager,
              * not a request to minimize one. */
             uint32_t data[5] = { KSD_ICCCM_ICONIC_STATE, 0u, 0u, 0u, 0u };
-            send_to_root(c, connection->screen, window, atoms->change_state,
+            send_to_root(c, connection->screen->root, window, atoms->change_state,
                          data);
         } else if (state == 2u) {
             /* Restore an iconic window even when the manager declines activation. */
             xcb_map_window(c, window);
-            change_state(c, connection->screen, atoms, window,
+            change_state(c, connection->screen->root, atoms, window,
                          KSD_NET_WM_STATE_ADD, atoms->state_max_vert,
                          atoms->state_max_horz);
             uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
-            send_to_root(c, connection->screen, window,
+            send_to_root(c, connection->screen->root, window,
                          atoms->active_window, data);
         } else {
             /* Mapping unminimizes independently of focus-stealing policy.
              * Only Normal clears the saved maximized state. */
             if (state == 0u)
-                change_state(c, connection->screen, atoms, window,
+                change_state(c, connection->screen->root, atoms, window,
                              KSD_NET_WM_STATE_REMOVE, atoms->state_max_vert,
                              atoms->state_max_horz);
             xcb_map_window(c, window);
             uint32_t data[5] = { KSD_EWMH_SOURCE_PAGER, 0u, 0u, 0u, 0u };
-            send_to_root(c, connection->screen, window,
+            send_to_root(c, connection->screen->root, window,
                          atoms->active_window, data);
         }
         applied(result);
@@ -314,7 +345,7 @@ void ksd_x11_window_set_above(ksd_x11 *connection, uint32_t window,
 {
     const x11_atoms *atoms = &connection->atoms;
     CONTROL_PROLOGUE(connection, window, result)
-    change_state(c, connection->screen, atoms, window,
+    change_state(c, connection->screen->root, atoms, window,
                  above ? KSD_NET_WM_STATE_ADD : KSD_NET_WM_STATE_REMOVE,
                  atoms->state_above, XCB_ATOM_NONE);
     applied(result);

@@ -82,6 +82,21 @@ X11 control operations reuse required tree or property replies to validate a
 window, avoiding a separate attributes query. Window enumeration continues to
 issue its property requests in batches rather than wait for each property.
 
+Hiding a managed X11 client sends the ICCCM withdrawal notification and waits
+for the manager to acknowledge `WM_STATE` and release its reparenting frame.
+Map and reparent notifications reassert withdrawal within the original
+two-second deadline. A final withdrawal follows frame release to cover queued
+remaps. Normal toplevels with a pending map still send the notification before
+`WM_STATE` appears; child and override-redirect windows use direct unmaps.
+
+X11 restacking uses the window manager's advertised `_NET_RESTACK_WINDOW`
+request for managed clients, with the native fallback on older managers and
+bare displays. X11 and generic Wayland restacks return sequence zero: compositor
+layers can keep docks or keep-above windows above a raised client, and desktop
+windows below a lowered one. X11 enumeration also includes unmapped support
+windows outside the managed stack. These calls confirm delivery without claiming
+a global stacking edge; subscriptions continue to report the resulting order.
+
 The shared KWin/display relay uses monotonic condition deadlines instead of
 periodic response polling. Waiting for another writer and writing to the peer
 both respect each request's deadline. Work that has not been sent can return
