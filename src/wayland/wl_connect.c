@@ -561,7 +561,11 @@ ksd_wayland_features ksd_wayland_supported(const ksd_wayland *connection)
     features.toplevel_kill = hypr_windows;
     features.toplevel_opacity = hypr_windows;
     features.toplevel_above = hypr_windows;
-    features.toplevel_events = hypr_windows && connection->handle_salt_ready;
+    /* Separate query and watch workers must name windows alike. The selected
+     * COSMIC view retains ext-list identifiers; the preferred wlroots view does not. */
+    features.toplevel_events = connection->handle_salt_ready
+        && (hypr_windows || (connection->toplevel_manager == NULL
+                             && ksd_wayland_cosmic_can_list(connection)));
     features.display_list = ksd_wayland_display_list_available(connection);
     features.work_area = ksd_wayland_work_area_available(connection);
     features.toplevel_control = features.toplevel_focus

@@ -41,6 +41,7 @@ typedef struct ksd_wl_toplevel {
     char *identifier;
     uint32_t state;
     bool ready;
+    bool cosmic_state_received;
     bool closed;
     ksd_cosmic_geometry *cosmic_geometries;
     /* Joined from Hyprland IPC on each refresh, by identifier. The restore
@@ -51,8 +52,7 @@ typedef struct ksd_wl_toplevel {
     bool hypr_has_restore;
     int64_t hypr_restore_workspace;
     char hypr_restore_name[KSD_HYPR_WORKSPACE_CAPACITY];
-    /* Where explicit raises and lowers left this window; zero when none has. */
-    int64_t hypr_stack_stamp;
+    bool hypr_workspace_fullscreen;
     /* 0..255, or -1 when Hyprland did not report it. */
     int32_t hypr_opacity;
     struct ksd_wl_toplevel *next;
@@ -132,9 +132,6 @@ struct ksd_wayland {
      * instance could not be identified; handles are then random. */
     uint8_t handle_salt[32];
     bool handle_salt_ready;
-    /* Orders explicit restacking on Hyprland, whose IPC reports no stack. */
-    int64_t hypr_stack_sequence;
-    char hypr_last_active[KSD_HYPR_ID_CAPACITY];
     /* Whether the toplevels' opacity was read since the last refresh; read
      * lazily because only window listings need it. */
     bool hypr_opacity_fresh;

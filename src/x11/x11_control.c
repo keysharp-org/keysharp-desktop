@@ -120,7 +120,14 @@ void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
                           ksd_operation_result *result)
 {
     const x11_atoms *atoms = &connection->atoms;
-    CONTROL_PROLOGUE(connection, window, result)
+    xcb_connection_t *c = connection->connection;
+    /* The required tree reply also establishes that the target still exists. */
+    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c,
+        xcb_query_tree(c, window), NULL);
+    if (tree == NULL) {
+        missing(result);
+        return;
+    }
     /* Reparenting managers may ignore a direct restack of the client or its
      * frame. BELOW is the manager-owned equivalent; remove it when raising so
      * a prior lower does not pin the window beneath later restacks. */
@@ -131,19 +138,15 @@ void ksd_x11_window_raise(ksd_x11 *connection, uint32_t window, bool raise,
      * it directly is what makes raise and lower work with no window manager
      * running. A reparenting manager will have made the frame the child of the
      * root, so the request is issued against the frame when there is one. */
-    xcb_query_tree_reply_t *tree = xcb_query_tree_reply(c,
-        xcb_query_tree(c, window), NULL);
     xcb_window_t target = window;
     uint32_t values[] = {
         raise ? (uint32_t)XCB_STACK_MODE_ABOVE : (uint32_t)XCB_STACK_MODE_BELOW,
     };
 
-    if (tree != NULL) {
-        if (tree->parent != XCB_WINDOW_NONE
-            && tree->parent != connection->screen->root)
-            target = tree->parent;
-        free(tree);
-    }
+    if (tree->parent != XCB_WINDOW_NONE
+        && tree->parent != connection->screen->root)
+        target = tree->parent;
+    free(tree);
     xcb_configure_window(c, target, XCB_CONFIG_WINDOW_STACK_MODE, values);
     xcb_flush(c);
     applied(result);
@@ -181,11 +184,17 @@ void ksd_x11_window_move_resize(ksd_x11 *connection, uint32_t window,
                                 ksd_operation_result *result)
 {
     const x11_atoms *atoms = &connection->atoms;
-    CONTROL_PROLOGUE(connection, window, result)
+    xcb_connection_t *c = connection->connection;
     uint32_t extents[4] = { 0u };
-    xcb_get_property_reply_t *frame = ksd_x11_property(c, window,
-        atoms->frame_extents, XCB_ATOM_CARDINAL, 4u);
-    if (frame != NULL && frame->format == 32
+    /* An absent property has a valid empty reply; no reply means the target is gone. */
+    xcb_get_property_reply_t *frame = xcb_get_property_reply(c,
+        xcb_get_property(c, 0, window, atoms->frame_extents,
+            XCB_ATOM_CARDINAL, 0u, 4u), NULL);
+    if (frame == NULL) {
+        missing(result);
+        return;
+    }
+    if (frame->format == 32
         && xcb_get_property_value_length(frame) >= (int)sizeof(extents))
         memcpy(extents, xcb_get_property_value(frame), sizeof(extents));
     free(frame);
@@ -247,6 +256,8 @@ void ksd_x11_window_set_state(ksd_x11 *connection, uint32_t window,
             send_to_root(c, connection->screen, window, atoms->change_state,
                          data);
         } else if (state == 2u) {
+            /* Restore an iconic window even when the manager declines activation. */
+            xcb_map_window(c, window);
             change_state(c, connection->screen, atoms, window,
                          KSD_NET_WM_STATE_ADD, atoms->state_max_vert,
                          atoms->state_max_horz);

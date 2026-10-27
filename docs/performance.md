@@ -1,4 +1,6 @@
-# Native X11 measurements
+# Window operation performance
+
+## Native X11 measurements
 
 The isolated Xvfb benchmark uses one persistent native X connection and a private
 1279×1024 display. It measures the native backend directly, including X server
@@ -34,3 +36,51 @@ Window subscriptions use property and structure notifications on a dedicated
 worker connection. Idle subscriptions make no X queries. Isolated tests cover
 create, close, active, title, minimize, restore and geometry notifications, plus
 worker transition and disconnect behavior.
+
+## Completion and scheduling
+
+Window mutations do not add a fixed settling sleep. When a caller subscribes to
+window state, the authority waits for the requested effect to appear in that
+state before returning its observation sequence. The two-second bound is a
+failure timeout, not a delay applied to successful operations. KWin does not
+provide window subscriptions, so its script reply carries no observation fence.
+
+GNOME and Cinnamon report geometry and property changes directly, including
+opacity, keep-above and maximize changes that need not resize a window. Unchanged
+geometry and already-satisfied state requests avoid repeating native setters.
+Native decoration changes unsupported by a shell return `UNSUPPORTED` immediately
+instead of reporting success and waiting for a change that cannot occur.
+
+Hyprland does not report every geometry change. A successful mutation can wake
+the existing window watcher immediately rather than wait for its 250 ms idle
+sample. While the effect remains unobserved, retries share a 30 ms minimum
+interval per authorization lease, including concurrent requests and unrelated
+state notifications. These window samples do not query keyboard or display state
+or postpone their ordinary updates. The worker advertises whether its windows
+need sampling; wlroots and COSMIC retain their native event-driven watches.
+
+COSMIC advertises window subscriptions when its selected window list has stable
+identifiers. Clients can maintain their window mirror from native geometry,
+title, focus and state notifications; the watcher takes no periodic snapshots
+while idle. Initial snapshots wait for COSMIC's first property batch to complete;
+a Wayland sync reply can arrive before those properties. The wait shares the
+existing refresh deadline and finishes immediately once the batch is ready.
+
+wlroots and COSMIC first synchronize to obtain current window state. An
+already-satisfied state request then skips both the mutation and its final
+synchronization. Mutations retain their acknowledgments; COSMIC also waits for
+the requested state event because a sync reply can precede the configure event.
+Maximize unminimizes the window first. COSMIC reports maximization independently
+of fullscreen, so restoring its normal state can be observed without ending fullscreen.
+Focus requests continue to reach the compositor even when a window was active.
+
+X11 control operations reuse required tree or property replies to validate a
+window, avoiding a separate attributes query. Window enumeration continues to
+issue its property requests in batches rather than wait for each property.
+
+The shared KWin/display relay uses monotonic condition deadlines instead of
+periodic response polling. Waiting for another writer and writing to the peer
+both respect each request's deadline. Work that has not been sent can return
+`BUSY`; an attempted transfer with an unknown outcome returns `TIMEOUT` and is
+not automatically retried. KWin's parked script polls wake when work arrives;
+their idle keepalive timers add no delay to queued window operations.

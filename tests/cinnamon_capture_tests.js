@@ -57,6 +57,7 @@ const sandbox = vm.createContext({
     },
 });
 vm.runInContext(source, sandbox);
+assert.equal(vm.runInContext('env.setDecorated({decorated: true}, false)', sandbox), null);
 const provider = {
     _validCaptureGeometry: (width, height) => width > 0 && height > 0
         && width <= 16384 && height <= 16384 && width * height <= 16777216,

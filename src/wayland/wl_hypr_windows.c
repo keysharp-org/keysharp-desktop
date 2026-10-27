@@ -50,7 +50,7 @@ static uint32_t state(const ksd_wl_toplevel *item)
         value |= KSD_WL_TOPLEVEL_STATE_MINIMIZED;
     if (item->hypr.fullscreen != 0)
         value |= KSD_WL_TOPLEVEL_STATE_MAXIMIZED;
-    if (item->hypr.focus_history == 0 && shown(item))
+    if (item->hypr.active && shown(item))
         value |= KSD_WL_TOPLEVEL_STATE_ACTIVATED;
     return value;
 }
@@ -197,22 +197,25 @@ const ksd_wayland_window_view *ksd_wayland_hypr_window_view(void)
     return &view;
 }
 
-/* Hyprland reports no stacking order. Its rule is that an open special
- * workspace sits above the regular one, floating and full screen windows sit
- * above tiled ones, and among equals the most recently focused is on top,
- * which focus history captures. An explicit raise or lower is not visible in
- * focus history, so its stamp orders the window until focus moves again.
- *
- * The list runs bottom to top, the order X11 stacking lists use, so a
- * negative result puts a below b. */
+/* Hyprland renders separate passes that z-order dispatchers cannot cross.
+ * Within a pass the clients array gives the native bottom-to-top order. */
+static unsigned stack_layer(const ksd_wl_toplevel *item)
+{
+    if (item->hypr.pinned && item->hypr.floating)
+        return 16u;
+    unsigned layer = strncmp(item->hypr.workspace_name, "special:", 8u) == 0 ? 8u : 0u;
+    if (item->hypr.fullscreen != 0)
+        return layer + 4u;
+    if (item->hypr.floating)
+        return layer + (item->hypr_workspace_fullscreen && item->hypr.over_fullscreen ? 6u : 2u);
+    /* The focused tiled window is rendered after the other tiled windows. */
+    return layer + (item->hypr.active ? 1u : 0u);
+}
+
 static int stack_compare(const ksd_wl_toplevel *a, const ksd_wl_toplevel *b)
 {
     bool a_shown;
     bool b_shown;
-    bool a_special;
-    bool b_special;
-    bool a_raised;
-    bool b_raised;
 
     if (a->hypr_known != b->hypr_known)
         return a->hypr_known ? 1 : -1;
@@ -222,18 +225,11 @@ static int stack_compare(const ksd_wl_toplevel *a, const ksd_wl_toplevel *b)
     b_shown = shown(b);
     if (a_shown != b_shown)
         return a_shown ? 1 : -1;
-    a_special = strncmp(a->hypr.workspace_name, "special:", 8u) == 0;
-    b_special = strncmp(b->hypr.workspace_name, "special:", 8u) == 0;
-    if (a_special != b_special)
-        return a_special ? 1 : -1;
-    a_raised = a->hypr.floating || a->hypr.fullscreen != 0;
-    b_raised = b->hypr.floating || b->hypr.fullscreen != 0;
-    if (a_raised != b_raised)
-        return a_raised ? 1 : -1;
-    if (a->hypr_stack_stamp != b->hypr_stack_stamp)
-        return a->hypr_stack_stamp > b->hypr_stack_stamp ? 1 : -1;
-    return (a->hypr.focus_history < b->hypr.focus_history)
-        - (a->hypr.focus_history > b->hypr.focus_history);
+    unsigned a_layer = stack_layer(a), b_layer = stack_layer(b);
+    if (a_layer != b_layer)
+        return a_layer > b_layer ? 1 : -1;
+    return (a->hypr.stacking_order > b->hypr.stacking_order)
+        - (a->hypr.stacking_order < b->hypr.stacking_order);
 }
 
 static void sort_by_stack(ksd_wayland *connection)
@@ -255,60 +251,37 @@ static void sort_by_stack(ksd_wayland *connection)
     connection->toplevels = sorted;
 }
 
-/* Focusing a window raises it above every earlier stamp. Stamps exist only
- * once something has been restacked explicitly; until then focus history
- * alone orders the list. Every window focused since the last refresh was
- * raised in turn, so each is stamped, oldest first. */
-static void note_focus_change(ksd_wayland *connection)
+bool ksd_wayland_hypr_can_restack(const ksd_wayland *connection,
+                                  const ksd_wl_toplevel *window, bool top)
 {
-    ksd_wl_toplevel *active = NULL;
-    int32_t since = 1;
-
-    for (ksd_wl_toplevel *item = connection->toplevels; item != NULL;
-         item = item->next) {
-        if (!item->hypr_known)
-            continue;
-        if (active == NULL && item->hypr.focus_history == 0 && shown(item))
-            active = item;
-        if (strcmp(item->hypr.stable_id, connection->hypr_last_active) == 0
-            && item->hypr.focus_history > 0)
-            since = item->hypr.focus_history;
-    }
-    if (active == NULL
-        || strcmp(active->hypr.stable_id, connection->hypr_last_active) == 0)
-        return;
-    memcpy(connection->hypr_last_active, active->hypr.stable_id,
-           sizeof(connection->hypr_last_active));
-    if (connection->hypr_stack_sequence == 0)
-        return;
-    for (int32_t history = since - 1; history >= 0; history--)
-        for (ksd_wl_toplevel *item = connection->toplevels; item != NULL;
-             item = item->next)
-            if (item->hypr_known && item->hypr.focus_history == history)
-                item->hypr_stack_stamp = ++connection->hypr_stack_sequence;
+    if (!usable(window) || !shown(window) || window->hypr.floating
+        || window->hypr.fullscreen != 0)
+        return true;
+    for (const ksd_wl_toplevel *other = connection->toplevels; other != NULL; other = other->next)
+        if (other != window && usable(other) && shown(other) && !other->hypr.floating
+            && other->hypr.fullscreen == 0 && other->hypr.workspace_id == window->hypr.workspace_id
+            && (top ? other->hypr.active : window->hypr.active))
+            return false;
+    return true;
 }
 
-bool ksd_wayland_hypr_windows_refresh(ksd_wayland *connection,
-                                      ksd_operation_result *result)
+void ksd_wayland_hypr_windows_update(ksd_wayland *connection,
+                                     const ksd_hypr_client *clients, size_t count)
 {
-    ksd_hypr_client *clients = NULL;
-    size_t count = 0u;
-
-    if (!ksd_wayland_hypr_clients(connection->session_pid, &clients,
-                                  &count)) {
-        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
-                         "Hyprland did not answer the window query");
-        return false;
-    }
     for (ksd_wl_toplevel *item = connection->toplevels; item != NULL;
          item = item->next) {
         item->hypr_known = false;
+        item->hypr_workspace_fullscreen = false;
         if (item->handle == NULL || item->identifier == NULL)
             continue;
         for (size_t index = 0u; index < count; index++) {
             if (strcmp(clients[index].stable_id, item->identifier) == 0) {
                 item->hypr = clients[index];
                 item->hypr_known = true;
+                for (size_t other = 0u; other < count; other++)
+                    if (clients[other].workspace_id == item->hypr.workspace_id
+                        && clients[other].mapped && !clients[other].hidden && clients[other].fullscreen != 0)
+                        item->hypr_workspace_fullscreen = true;
                 break;
             }
         }
@@ -317,9 +290,22 @@ bool ksd_wayland_hypr_windows_refresh(ksd_wayland *connection,
             item->hypr_has_restore = false;
     }
     connection->hypr_opacity_fresh = false;
-    free(clients);
-    note_focus_change(connection);
     sort_by_stack(connection);
+}
+
+bool ksd_wayland_hypr_windows_refresh(ksd_wayland *connection,
+                                      ksd_operation_result *result)
+{
+    ksd_hypr_client *clients = NULL;
+    size_t count = 0u;
+
+    if (!ksd_wayland_hypr_clients(connection->session_pid, &clients, &count)) {
+        ksd_result_error(result, KSD_STATUS_UNAVAILABLE, 0u,
+                         "Hyprland did not answer the window query");
+        return false;
+    }
+    ksd_wayland_hypr_windows_update(connection, clients, count);
+    free(clients);
     return true;
 }
 
@@ -476,7 +462,6 @@ static bool restack(ksd_wayland *connection, ksd_wl_toplevel *window,
     char lua[KSD_HYPR_COMMAND_CAPACITY];
     char legacy[KSD_HYPR_COMMAND_CAPACITY];
     const char *mode = top ? "top" : "bottom";
-    int64_t stamp;
 
     if (!format_command(lua,
             "hl.dsp.window.alter_zorder({ mode = '%s', window = 'address:%s' })",
@@ -485,8 +470,6 @@ static bool restack(ksd_wayland *connection, ksd_wl_toplevel *window,
                            window->hypr.address)
         || !dispatch(connection, lua, legacy))
         return false;
-    stamp = ++connection->hypr_stack_sequence;
-    window->hypr_stack_stamp = top ? stamp : -stamp;
     return true;
 }
 
@@ -624,6 +607,14 @@ void ksd_wayland_hypr_window_action(ksd_wayland *connection, uint16_t opcode,
 
     if (window == NULL)
         return;
+    if ((opcode == KSD_OP_WINDOW_RAISE || opcode == KSD_OP_WINDOW_LOWER)
+        && !ksd_wayland_hypr_can_restack(connection, window, opcode == KSD_OP_WINDOW_RAISE)) {
+        ksd_result_error(result, KSD_STATUS_UNSUPPORTED, 0u,
+                         opcode == KSD_OP_WINDOW_RAISE
+                         ? "Hyprland cannot raise a tiled window above the focused tile without changing focus"
+                         : "Hyprland cannot lower a focused tiled window beneath another tiled window without changing focus");
+        return;
+    }
     switch (opcode) {
         case KSD_OP_WINDOW_FOCUS:
             /* Activating a minimized window restores it first. */

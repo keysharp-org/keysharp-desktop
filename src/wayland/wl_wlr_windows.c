@@ -223,6 +223,7 @@ void ksd_wayland_wlr_window_action(ksd_wayland *connection, uint16_t opcode,
                                    ksd_operation_result *result)
 {
     ksd_wl_toplevel *window;
+    bool changed = true;
 
     window = ksd_wayland_window_for_action(
         connection, handle, ksd_wayland_wlr_window_view(), result);
@@ -239,22 +240,37 @@ void ksd_wayland_wlr_window_action(ksd_wayland *connection, uint16_t opcode,
     } else if (opcode == KSD_OP_WINDOW_CLOSE) {
         zwlr_foreign_toplevel_handle_v1_close(window->wlr_handle);
     } else if (opcode == KSD_OP_WINDOW_SET_STATE) {
+        changed = false;
         if (value == 1u) {
-            zwlr_foreign_toplevel_handle_v1_set_minimized(window->wlr_handle);
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) == 0u) {
+                zwlr_foreign_toplevel_handle_v1_set_minimized(window->wlr_handle);
+                changed = true;
+            }
         } else if (value == 2u) {
-            zwlr_foreign_toplevel_handle_v1_set_maximized(window->wlr_handle);
-        } else {
-            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u) {
                 zwlr_foreign_toplevel_handle_v1_unset_minimized(window->wlr_handle);
-            if (value == 0u && (window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
+                changed = true;
+            }
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) == 0u) {
+                zwlr_foreign_toplevel_handle_v1_set_maximized(window->wlr_handle);
+                changed = true;
+            }
+        } else {
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u) {
+                zwlr_foreign_toplevel_handle_v1_unset_minimized(window->wlr_handle);
+                changed = true;
+            }
+            if (value == 0u && (window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u) {
                 zwlr_foreign_toplevel_handle_v1_unset_maximized(window->wlr_handle);
+                changed = true;
+            }
         }
     } else {
         ksd_result_error(result, KSD_STATUS_INVALID_REQUEST, 0u,
                          "invalid Wayland window operation");
         return;
     }
-    if (!ksd_wayland_roundtrip(connection, KSD_WLR_WINDOW_TIMEOUT_MS)) {
+    if (changed && !ksd_wayland_roundtrip(connection, KSD_WLR_WINDOW_TIMEOUT_MS)) {
         ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
                          "the compositor did not acknowledge the request");
         return;

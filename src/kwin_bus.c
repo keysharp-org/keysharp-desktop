@@ -11,6 +11,8 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 
 #define KSD_KWIN_BUS_NAME "io.github.keysharp.KWinProvider1"
 #define KSD_KWIN_BUS_PATH "/io/github/keysharp/KWinProvider"
@@ -19,6 +21,9 @@
 #define KSD_KWIN_SCRIPTING_INTERFACE "org.kde.kwin.Scripting"
 #define KSD_KWIN_SCRIPT_ID "io.github.keysharp.desktop.kwin"
 #define KSD_KWIN_COMPOSITOR_RECHECK_SECONDS 2u
+#ifndef KSD_KWIN_RELAY_TRANSFER_MS
+#define KSD_KWIN_RELAY_TRANSFER_MS KSD_KWIN_OP_DEADLINE_MS
+#endif
 #ifndef KSD_KWIN_SCRIPT_PATH
 #define KSD_KWIN_SCRIPT_PATH \
     "/usr/share/kwin/scripts/io.github.keysharp.desktop.kwin/contents/code/main.js"
@@ -71,6 +76,7 @@ struct ksd_kwin_bus {
     GDBusMethodInvocation *parked[KSD_KWIN_LANES];
     guint idle_source[KSD_KWIN_LANES];
     int authority;
+    guint authority_source;
     /* The socket the authority relays requests over, and the requests still
      * waiting on the script. Answered out of order, because the whole point of
      * the queue is that a cheap verb need not wait behind an enumeration. */
@@ -84,6 +90,12 @@ struct ksd_kwin_bus {
         char sequence[KSD_KWIN_SEQ_HEX + 1u];
     } inflight[KSD_KWIN_MAX_JOBS];
 };
+
+static void relay_failed(ksd_kwin_bus *bus)
+{
+    (void)shutdown(bus->relay, SHUT_RDWR);
+    if (bus->loop != NULL) g_main_loop_quit(bus->loop);
+}
 
 static bool compositor_owner(char peer[64])
 {
@@ -155,8 +167,10 @@ static void relay_answer(ksd_kwin_bus *bus, uint64_t request_id,
     frame.payload = payload.data;
     frame.payload_length = (uint32_t)payload.length;
     ksd_buffer_init(&packed, KSD_FRAME_HEADER_SIZE + payload.length + 16u);
-    if (ksd_frame_pack(&frame, &packed))
-        (void)ksd_write_all(bus->relay, packed.data, packed.length);
+    if (!ksd_frame_pack(&frame, &packed)
+        || ksd_transfer_until(bus->relay, packed.data, packed.length, true,
+            ksd_monotonic_milliseconds() + KSD_KWIN_RELAY_TRANSFER_MS) != (ssize_t)packed.length)
+        relay_failed(bus);
     ksd_buffer_clear(&packed);
     ksd_buffer_clear(&payload);
     ksd_buffer_clear(&translated);
@@ -644,13 +658,16 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
     char text_body[160];
     uint32_t text_length = 0u;
     size_t slot = KSD_KWIN_MAX_JOBS;
+    uint64_t deadline = ksd_monotonic_milliseconds() + KSD_KWIN_RELAY_TRANSFER_MS;
 
     (void)descriptor;
     if ((condition & (G_IO_HUP | G_IO_ERR)) != 0) {
+        relay_failed(bus);
         bus->relay_source = 0u;
         return G_SOURCE_REMOVE;
     }
-    if (!ksd_read_all(bus->relay, header, sizeof(header))) {
+    if (ksd_transfer_until(bus->relay, header, sizeof(header), false, deadline) != (ssize_t)sizeof(header)) {
+        relay_failed(bus);
         bus->relay_source = 0u;
         return G_SOURCE_REMOVE;
     }
@@ -658,13 +675,15 @@ static gboolean relay_readable(gint descriptor, GIOCondition condition,
     opcode = ksd_decode_u16(header + KSD_FRAME_OPCODE_OFFSET);
     request_id = ksd_decode_u64(header + KSD_FRAME_REQUEST_ID_OFFSET);
     if (payload_length > KSD_MAX_TEXT_BYTES) {
+        relay_failed(bus);
         bus->relay_source = 0u;
         return G_SOURCE_REMOVE;
     }
     if (payload_length != 0u) {
         body = g_malloc(payload_length);
-        if (!ksd_read_all(bus->relay, body, payload_length)) {
+        if (ksd_transfer_until(bus->relay, body, payload_length, false, deadline) != (ssize_t)payload_length) {
             g_free(body);
+            relay_failed(bus);
             bus->relay_source = 0u;
             return G_SOURCE_REMOVE;
         }
@@ -717,6 +736,7 @@ static gboolean authority_readable(gint descriptor, GIOCondition condition,
      * daemon's whole reason to be running. */
     if (bus->loop != NULL)
         g_main_loop_quit(bus->loop);
+    bus->authority_source = 0u;
     return G_SOURCE_REMOVE;
 }
 
@@ -746,7 +766,7 @@ int ksd_kwin_bus_run(ksd_kwin_bus *bus, int descriptor)
     if (bus->relay >= 0)
         bus->relay_source = g_unix_fd_add(bus->relay,
             G_IO_IN | G_IO_HUP | G_IO_ERR, relay_readable, bus);
-    g_unix_fd_add(descriptor, G_IO_IN | G_IO_HUP | G_IO_ERR,
+    bus->authority_source = g_unix_fd_add(descriptor, G_IO_IN | G_IO_HUP | G_IO_ERR,
                   authority_readable, bus);
     g_main_loop_run(bus->loop);
     return 0;
@@ -756,6 +776,10 @@ void ksd_kwin_bus_stop(ksd_kwin_bus *bus)
 {
     if (bus == NULL)
         return;
+    if (bus->relay_source != 0u)
+        g_source_remove(bus->relay_source);
+    if (bus->authority_source != 0u)
+        g_source_remove(bus->authority_source);
     if (bus->compositor_source != 0u)
         g_source_remove(bus->compositor_source);
     for (size_t slot = 0u; slot < KSD_KWIN_LANES; slot++) {
@@ -778,3 +802,69 @@ void ksd_kwin_bus_stop(ksd_kwin_bus *bus)
         g_dbus_node_info_unref(bus->node);
     g_free(bus);
 }
+
+#ifdef KSD_KWIN_BUS_TESTING
+typedef struct relay_failure_test {
+    ksd_kwin_bus *bus;
+    bool expired;
+} relay_failure_test;
+
+static gboolean relay_test_expired(gpointer data)
+{
+    relay_failure_test *test = data;
+    test->expired = true;
+    g_main_loop_quit(test->bus->loop);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean relay_test_answer(gpointer data)
+{
+    uint8_t body[64u * 1024u]; memset(body, 'a', sizeof(body));
+    relay_answer(data, 1u, KSD_OP_WINDOW_LIST, KSD_STATUS_OK, body, sizeof(body));
+    return G_SOURCE_REMOVE;
+}
+
+bool ksd_kwin_bus_test_transfer_failure(unsigned scenario)
+{
+    int pair[2];
+    if (scenario > 2u || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+        return false;
+    int capacity = 1024;
+    struct timeval fallback = { .tv_sec = 1 };
+    (void)setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity));
+    (void)setsockopt(pair[0], SOL_SOCKET, SO_SNDTIMEO, &fallback, sizeof(fallback));
+    (void)setsockopt(pair[0], SOL_SOCKET, SO_RCVTIMEO, &fallback, sizeof(fallback));
+    ksd_kwin_bus *bus = g_new0(ksd_kwin_bus, 1u);
+    bus->relay = pair[0]; bus->loop = g_main_loop_new(NULL, FALSE);
+    relay_failure_test test = { .bus = bus };
+    guint guard = g_timeout_add(500u, relay_test_expired, &test);
+    if (scenario == 2u) {
+        bus->relay_source = g_unix_fd_add(bus->relay,
+            G_IO_IN | G_IO_HUP | G_IO_ERR, relay_readable, bus);
+        bus->authority_source = g_unix_fd_add(bus->relay,
+            G_IO_IN | G_IO_HUP | G_IO_ERR, authority_readable, bus);
+        g_idle_add(relay_test_answer, bus);
+    }
+    else {
+        uint8_t bytes[KSD_FRAME_HEADER_SIZE + 1u] = { 'K' };
+        ksd_encode_u32(bytes + KSD_FRAME_PAYLOAD_LENGTH_OFFSET, 8u);
+        size_t length = scenario == 0u ? 1u : sizeof(bytes);
+        (void)ksd_write_all(pair[1], bytes, length);
+        bus->relay_source = g_unix_fd_add(bus->relay,
+            G_IO_IN | G_IO_HUP | G_IO_ERR, relay_readable, bus);
+    }
+    uint64_t started = ksd_monotonic_milliseconds();
+    g_main_loop_run(bus->loop);
+    uint64_t elapsed = ksd_monotonic_milliseconds() - started;
+    if (!test.expired) g_source_remove(guard);
+    uint8_t byte = 0u;
+    bool ok = !test.expired && elapsed < 750u
+        && send(pair[1], &byte, 1u, MSG_DONTWAIT | MSG_NOSIGNAL) < 0;
+    guint relay_source = bus->relay_source, authority_source = bus->authority_source;
+    ksd_kwin_bus_stop(bus);
+    ok = ok && (relay_source == 0u || g_main_context_find_source_by_id(NULL, relay_source) == NULL)
+        && (authority_source == 0u || g_main_context_find_source_by_id(NULL, authority_source) == NULL);
+    close(pair[0]); close(pair[1]);
+    return ok;
+}
+#endif

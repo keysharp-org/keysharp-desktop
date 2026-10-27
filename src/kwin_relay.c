@@ -39,10 +39,8 @@ struct ksd_kwin_relay {
     int descriptor;
     pthread_mutex_t mutex;
     pthread_cond_t changed;
-    /* Serialises writes only. A write is short and never waits on the far end,
-     * so holding this across one is not the bottleneck holding a lock across
-     * the whole exchange would be. */
-    pthread_mutex_t write_mutex;
+    /* Only one frame may be written at a time; waiting writers keep their own deadlines. */
+    bool writing;
     bool reading;
     bool broken;
     /* One for the registration, one for each caller currently inside a call. */
@@ -65,9 +63,18 @@ ksd_kwin_relay *ksd_kwin_relay_create(int descriptor)
     relay->refs = 1u;
     for (size_t index = 0u; index < KSD_KWIN_RELAY_PENDING; index++)
         relay->pending[index].payload_fd = -1;
-    if (pthread_mutex_init(&relay->mutex, NULL) != 0
-        || pthread_mutex_init(&relay->write_mutex, NULL) != 0
-        || pthread_cond_init(&relay->changed, NULL) != 0) {
+    if (pthread_mutex_init(&relay->mutex, NULL) != 0) {
+        free(relay);
+        return NULL;
+    }
+    pthread_condattr_t attributes;
+    bool attributes_ready = pthread_condattr_init(&attributes) == 0;
+    bool condition_ready = attributes_ready
+        && pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
+        && pthread_cond_init(&relay->changed, &attributes) == 0;
+    if (attributes_ready) pthread_condattr_destroy(&attributes);
+    if (!condition_ready) {
+        pthread_mutex_destroy(&relay->mutex);
         free(relay);
         return NULL;
     }
@@ -104,7 +111,6 @@ void ksd_kwin_relay_release(ksd_kwin_relay *relay)
     if (relay->descriptor >= 0)
         close(relay->descriptor);
     pthread_mutex_destroy(&relay->mutex);
-    pthread_mutex_destroy(&relay->write_mutex);
     pthread_cond_destroy(&relay->changed);
     free(relay);
 }
@@ -250,6 +256,15 @@ bool ksd_kwin_relay_is_broken(ksd_kwin_relay *relay)
     return broken;
 }
 
+static int wait_changed(ksd_kwin_relay *relay, uint64_t deadline_ms)
+{
+    if (deadline_ms == UINT64_MAX)
+        return pthread_cond_wait(&relay->changed, &relay->mutex);
+    struct timespec until = { .tv_sec = (time_t)(deadline_ms / 1000u),
+        .tv_nsec = (long)(deadline_ms % 1000u) * 1000000L };
+    return pthread_cond_timedwait(&relay->changed, &relay->mutex, &until);
+}
+
 bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
                          uint64_t deadline_ms, ksd_operation_result *result)
 {
@@ -301,22 +316,32 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
                     + request->payload_length + 16u);
     sent = ksd_frame_pack(&outgoing, &packed);
     if (sent) {
-        pthread_mutex_lock(&relay->write_mutex);
-        attempted = true;
-        sent = ksd_write_all(relay->descriptor, packed.data, packed.length);
-        pthread_mutex_unlock(&relay->write_mutex);
+        pthread_mutex_lock(&relay->mutex);
+        while (relay->writing && !relay->broken) {
+            if (wait_changed(relay, deadline_ms) != 0) break;
+        }
+        uint64_t now = ksd_monotonic_milliseconds();
+        sent = !relay->writing && !relay->broken && now != 0u && now < deadline_ms;
+        if (sent) relay->writing = attempted = true;
+        pthread_mutex_unlock(&relay->mutex);
+        if (attempted) {
+            sent = ksd_transfer_until(relay->descriptor, packed.data, packed.length,
+                true, deadline_ms) == (ssize_t)packed.length;
+            pthread_mutex_lock(&relay->mutex);
+            relay->writing = false;
+            if (!sent) {
+                relay->broken = true;
+                (void)shutdown(relay->descriptor, SHUT_RDWR);
+            }
+            pthread_cond_broadcast(&relay->changed);
+            pthread_mutex_unlock(&relay->mutex);
+        }
     }
     ksd_buffer_clear(&packed);
 
     pthread_mutex_lock(&relay->mutex);
-    if (attempted && !sent) {
-        relay->broken = true;
-        (void)shutdown(relay->descriptor, SHUT_RDWR);
-        pthread_cond_broadcast(&relay->changed);
-    }
     while (sent && !slot->done && !relay->broken) {
         uint64_t now = ksd_monotonic_milliseconds();
-        struct timespec until;
 
         if (now == 0u || now >= deadline_ms)
             break;
@@ -340,13 +365,7 @@ bool ksd_kwin_relay_call(ksd_kwin_relay *relay, const ksd_frame *request,
         /* Someone else is reading; wait to be woken, but not past the
          * deadline, because the reader may be waiting on a daemon that has
          * stopped answering. */
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += 20 * 1000000L;
-        if (until.tv_nsec >= 1000000000L) {
-            until.tv_sec += 1;
-            until.tv_nsec -= 1000000000L;
-        }
-        pthread_cond_timedwait(&relay->changed, &relay->mutex, &until);
+        if (wait_changed(relay, deadline_ms) != 0) break;
     }
     if (slot->done) {
         if (slot->status == KSD_STATUS_OK && slot->payload_fd >= 0) {

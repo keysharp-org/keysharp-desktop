@@ -20,6 +20,10 @@ KWin window control includes raising and lowering through its scripting API.
 KWin exposes window captions and input eligibility only as read-only state, and
 its ordinary scripting API cannot request a client redraw.
 
+GNOME can change decorations on X11 windows through `xprop`; native Wayland
+windows return `UNSUPPORTED`. Cinnamon exposes decoration state as read-only
+and does not advertise decoration control.
+
 X11 window events subscribe to XCB property and structure notifications on a
 dedicated worker connection. Idle subscriptions issue no window queries. Changes
 query the affected window; client-list changes update the subscription set.
@@ -62,7 +66,9 @@ the protocols the live compositor actually advertises:
 - wlroots foreign-toplevel management adds state, active-window lookup, focus,
   close, minimize, maximize and restore.
 - COSMIC's toplevel protocols add the same window operations plus global
-  geometry.
+  geometry and native window events. Subscriptions are advertised when the
+  selected COSMIC window list has stable identifiers shared by query and watch
+  connections.
 - xdg-output supplies the display list in logical coordinates.
 - A window handle is derived from the toplevel's identifier and the
   compositor instance, so every connection to that instance names a window
@@ -96,10 +102,16 @@ the protocols the live compositor actually advertises:
   layout origin minus Hyprland's reserved edges, and the display list carries
   each output's work area. Keyboard state reports the group of the keyboard
   Hyprland marks main when the keymap has more than one layout; Hyprland keeps
-  a layout per keyboard device. The list runs bottom to top by Hyprland's rules:
-  an open special workspace above the regular one, floating and full screen
-  windows above tiled ones, then focus order, adjusted by explicit raises and
-  lowers. Minimizing parks a window on the
+  a layout per keyboard device. The list uses Hyprland's native client-array
+  order within its render passes, including restacks by other applications.
+  Floating, fullscreen, special-workspace and pinned windows occupy separate
+  passes; the focused tiled window is drawn after other tiled windows.
+  Native raises and lowers reorder windows within the compositor-enforced passes.
+  Lowering a focused tiled window beneath a visible tiled peer, or raising a
+  tiled window above its focused tiled peer on the same workspace, returns
+  `UNSUPPORTED`: Hyprland keeps the focused tile above its tiled peers
+  regardless of native order, and this service preserves focus.
+  Minimizing parks a window on the
   `special:minimized` workspace, and restoring returns it to the workspace it
   left. Moving or resizing a tiled window floats it first. Hyprland has no
   keep-above state, so keeping a window above floats and raises it, clearing
@@ -111,8 +123,8 @@ the protocols the live compositor actually advertises:
 operations. Portable enumeration alone has no geometry, pid, state or active
 window, and those facts are omitted rather than reported as zeros. Outside
 Hyprland, none of the supported protocols can move/resize, restack, change
-opacity, keep a window above, identify a process to kill or push window events,
-and no compositor path changes decoration.
+opacity, keep a window above or identify a process to kill, and no compositor
+path changes decoration.
 
 Hyprland positions are whole logical pixels, so a window placed at a
 fractional position, such as one centred at a scale of 2, can be reported up

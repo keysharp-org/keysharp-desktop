@@ -70,6 +70,7 @@
 #define KSD_MAX_ASSEMBLIES_PER_UID 4u
 #define KSD_MAX_REQUEST_ASSEMBLY_SECONDS 10u
 #define KSD_GENERATION_POLL_MS 250
+#define KSD_OPERATION_REFRESH_MS 30u
 #ifndef KSD_PKCHECK_PATH
 #define KSD_PKCHECK_PATH "/usr/bin/pkcheck"
 #endif
@@ -104,6 +105,8 @@ typedef struct authority_lease {
     state_window *snapshot_windows;
     bool snapshot_pending;
     int client_fd;
+    int window_refresh_fd;
+    uint64_t window_refresh_at;
     pthread_mutex_t output_mutex;
 } authority_lease;
 
@@ -1238,6 +1241,7 @@ static authority_lease *lease_create(authority_session *session)
     lease->active = true; lease->references = 1u; lease->identity = session->identity;
     lease->requested_scopes = session->requested_scopes; lease->granted_scopes = session->granted_scopes;
     lease->generation = session->generation; lease->client_fd = session->client_fd;
+    lease->window_refresh_fd = -1;
     pthread_mutex_lock(&session->state->mutex);
     lease->next = session->state->leases; session->state->leases = lease;
     pthread_mutex_unlock(&session->state->mutex);
@@ -1868,6 +1872,9 @@ static bool start_display_watch(authority_session *session,
         && reply.flags == 0u && reply.opcode == 0u
         && reply.request_id == request->request_id && reply.payload_length == 8u;
     uint32_t status = ready ? ksd_decode_u32(reply.payload) : KSD_STATUS_UNAVAILABLE;
+    bool refresh_windows = ready && request->opcode == KSD_OP_WINDOW_WATCH
+        && context->snapshot->backend == KSD_BACKEND_GENERIC
+        && (ksd_decode_u32(reply.payload + 4u) & KSD_WATCH_SAMPLED_WINDOWS) != 0u;
     ksd_frame_clear(&reply);
     if (status != KSD_STATUS_OK) {
         close(worker_fd);
@@ -1876,6 +1883,13 @@ static bool start_display_watch(authority_session *session,
     }
     bool ok = !watch_cancelled(context)
         && forward_response(session, request, KSD_STATUS_OK, 0u, NULL, NULL, 0u, false);
+    if (ok && refresh_windows) {
+        pthread_mutex_lock(&session->lease->mutex);
+        session->lease->window_refresh_fd = worker_fd;
+        session->lease->window_refresh_at = 0u;
+        pthread_cond_broadcast(&session->lease->changed);
+        pthread_mutex_unlock(&session->lease->mutex);
+    }
     while (ok && !watch_cancelled(context)) {
         struct pollfd descriptors[2] = {
             { .fd = worker_fd, .events = POLLIN | POLLHUP | POLLERR },
@@ -1899,6 +1913,12 @@ static bool start_display_watch(authority_session *session,
                 && ksd_utf8_valid(event.payload + 8u, event.payload_length - 8u, false)))
             && watch_emit(event.opcode, event.payload, event.payload_length, context);
         ksd_frame_clear(&event);
+    }
+    if (refresh_windows) {
+        pthread_mutex_lock(&session->lease->mutex);
+        if (session->lease->window_refresh_fd == worker_fd)
+            session->lease->window_refresh_fd = -1;
+        pthread_mutex_unlock(&session->lease->mutex);
     }
     close(worker_fd);
     return false;
@@ -2225,14 +2245,20 @@ static bool operation_observed(authority_lease *lease, const ksd_frame *request,
         case KSD_OP_WINDOW_FOCUS:
             return (window->valid_fields & KSD_FIELD_ACTIVE) != 0u && (window->flags & KSD_WINDOW_ACTIVE) != 0u;
         case KSD_OP_WINDOW_MOVE_RESIZE:
-        case KSD_OP_WINDOW_MOVE_RESIZE_XID:
+        case KSD_OP_WINDOW_MOVE_RESIZE_XID: {
             if (request->payload_length < 24u || (window->valid_fields & KSD_FIELD_FRAME) == 0u) return false;
-            return (before != NULL && (before->valid_fields & KSD_FIELD_FRAME) != 0u
-                    && memcmp(&before->frame_x, &window->frame_x, 16u) != 0)
-                || (((int32_t)ksd_decode_u32(request->payload + 8u) == INT32_MIN || window->frame_x == (int32_t)ksd_decode_u32(request->payload + 8u))
-                    && ((int32_t)ksd_decode_u32(request->payload + 12u) == INT32_MIN || window->frame_y == (int32_t)ksd_decode_u32(request->payload + 12u))
-                    && (ksd_decode_u32(request->payload + 16u) == 0u || window->frame_width == ksd_decode_u32(request->payload + 16u))
-                    && (ksd_decode_u32(request->payload + 20u) == 0u || window->frame_height == ksd_decode_u32(request->payload + 20u)));
+            int32_t x = (int32_t)ksd_decode_u32(request->payload + 8u);
+            int32_t y = (int32_t)ksd_decode_u32(request->payload + 12u);
+            uint32_t width = ksd_decode_u32(request->payload + 16u);
+            uint32_t height = ksd_decode_u32(request->payload + 20u);
+            bool prior = before != NULL && (before->valid_fields & KSD_FIELD_FRAME) != 0u;
+            /* A compositor may constrain a requested component; a change to an untouched
+             * component does not establish that the requested move or resize was observed. */
+            return (x == INT32_MIN || window->frame_x == x || (prior && window->frame_x != before->frame_x))
+                && (y == INT32_MIN || window->frame_y == y || (prior && window->frame_y != before->frame_y))
+                && (width == 0u || window->frame_width == width || (prior && window->frame_width != before->frame_width))
+                && (height == 0u || window->frame_height == height || (prior && window->frame_height != before->frame_height));
+        }
         case KSD_OP_WINDOW_SET_TITLE: {
             if (request->payload_length < 12u || (window->valid_fields & KSD_FIELD_TITLE) == 0u) return false;
             uint32_t length = ksd_decode_u32(request->payload + 8u);
@@ -2255,11 +2281,11 @@ static bool operation_observed(authority_lease *lease, const ksd_frame *request,
             if (request->payload_length < 12u) return false;
             uint32_t state = ksd_decode_u32(request->payload + 8u);
             uint64_t fields = state == KSD_WINDOW_STATE_MINIMIZED || state == KSD_WINDOW_STATE_UNMINIMIZED
-                ? KSD_FIELD_MINIMIZED : state == KSD_WINDOW_STATE_MAXIMIZED ? KSD_FIELD_MAXIMIZED
-                : KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED;
+                ? KSD_FIELD_MINIMIZED : KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED;
             if ((window->valid_fields & fields) != fields) return false;
             return state == KSD_WINDOW_STATE_MINIMIZED ? (window->flags & KSD_WINDOW_MINIMIZED) != 0u
-                : state == KSD_WINDOW_STATE_MAXIMIZED ? (window->flags & KSD_WINDOW_MAXIMIZED) != 0u
+                : state == KSD_WINDOW_STATE_MAXIMIZED
+                    ? (window->flags & (KSD_WINDOW_MINIMIZED | KSD_WINDOW_MAXIMIZED)) == KSD_WINDOW_MAXIMIZED
                 : state == KSD_WINDOW_STATE_UNMINIMIZED ? (window->flags & KSD_WINDOW_MINIMIZED) == 0u
                 : (window->flags & (KSD_WINDOW_MINIMIZED | KSD_WINDOW_MAXIMIZED)) == 0u;
         }
@@ -2272,16 +2298,34 @@ static bool operation_sync(authority_session *session, const ksd_frame *request,
 {
     authority_lease *lease = session->lease;
     if (lease == NULL) return false;
-    struct timespec deadline; clock_gettime(CLOCK_MONOTONIC, &deadline); deadline.tv_sec += 2;
+    uint64_t deadline = ksd_monotonic_milliseconds() + 2000u;
     pthread_mutex_lock(&lease->mutex);
-    /* Hyprland exposes no explicit restacking state; sequence zero claims no observation fence. */
+    /* Generic restacking has no global-edge fence across compositor layers and monitors. */
     bool monitoring = (lease->domains & KSD_STATE_WINDOWS) != 0u
         && !(session->backend == KSD_BACKEND_GENERIC
             && (request->opcode == KSD_OP_WINDOW_RAISE || request->opcode == KSD_OP_WINDOW_LOWER));
     int result = 0;
     while (monitoring && lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
-        && !operation_observed(lease, request, before) && result == 0)
-        result = pthread_cond_timedwait(&lease->changed, &lease->mutex, &deadline);
+        && !operation_observed(lease, request, before) && result == 0) {
+        bool refresh = session->backend == KSD_BACKEND_GENERIC && lease->window_refresh_fd >= 0;
+        uint64_t wake = deadline;
+        if (refresh) {
+            /* Our own mutation need not wait for Hyprland's idle geometry sample. A client may
+             * commit its new size after the first refresh, so retry only while this RPC waits. */
+            uint64_t now = ksd_monotonic_milliseconds();
+            if (now >= lease->window_refresh_at) {
+                const uint8_t byte = KSD_WATCH_REFRESH_BYTE;
+                (void)send(lease->window_refresh_fd, &byte, sizeof(byte), MSG_DONTWAIT | MSG_NOSIGNAL);
+                lease->window_refresh_at = now + KSD_OPERATION_REFRESH_MS;
+            }
+            if (lease->window_refresh_at < wake) wake = lease->window_refresh_at;
+        }
+        struct timespec until = { .tv_sec = (time_t)(wake / 1000u),
+            .tv_nsec = (long)(wake % 1000u) * 1000000L };
+        result = pthread_cond_timedwait(&lease->changed, &lease->mutex, &until);
+        if (result == ETIMEDOUT && refresh && ksd_monotonic_milliseconds() < deadline)
+            result = 0;
+    }
     bool ok = lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
         && (!monitoring || operation_observed(lease, request, before));
     session->effective_sequence = monitoring && ok ? lease->sequences[0] : 0u;
@@ -3071,6 +3115,130 @@ static bool test_state_delivery(int descriptor, uint32_t kind, uint64_t sequence
     ksd_frame_clear(&frame); return ok;
 }
 
+typedef struct test_refresh_watch {
+    authority_lease *lease;
+    int descriptor;
+    unsigned defer;
+    unsigned refreshes;
+    uint64_t not_before;
+    bool early_refresh;
+    bool applied;
+} test_refresh_watch;
+
+static void *test_refresh_watch_run(void *data)
+{
+    test_refresh_watch *watch = data;
+    /* A prior operation's retry interval also applies to a new concurrent waiter. */
+    while (ksd_monotonic_milliseconds() < watch->not_before) {
+        pthread_mutex_lock(&watch->lease->mutex);
+        pthread_cond_broadcast(&watch->lease->changed);
+        pthread_mutex_unlock(&watch->lease->mutex);
+        struct pollfd item = { .fd = watch->descriptor, .events = POLLIN };
+        int ready = poll(&item, 1u, 1);
+        if (ready > 0) {
+            watch->early_refresh = ksd_monotonic_milliseconds() < watch->not_before;
+            break;
+        }
+        if (ready < 0 && errno != EINTR) return NULL;
+    }
+    for (unsigned i = 0u; i <= watch->defer; i++) {
+        struct pollfd item = { .fd = watch->descriptor, .events = POLLIN };
+        uint8_t byte;
+        if (poll(&item, 1u, 1000) != 1
+            || recv(watch->descriptor, &byte, sizeof(byte), MSG_DONTWAIT) != (ssize_t)sizeof(byte)
+            || byte != KSD_WATCH_REFRESH_BYTE)
+            return NULL;
+        watch->refreshes++;
+        if (i < watch->defer) {
+            ksd_state_event intermediate; ksd_state_event_init(&intermediate);
+            intermediate.domain = KSD_STATE_WINDOWS; intermediate.kind = KSD_STATE_CHANGED;
+            intermediate.window.handle = 42u;
+            intermediate.window.valid_fields = KSD_FIELD_ID | KSD_FIELD_FRAME;
+            intermediate.window.frame_x = 19;
+            intermediate.window.frame_width = i == 0u ? 100u : 120u;
+            intermediate.window.frame_height = 100u;
+            pthread_mutex_lock(&watch->lease->mutex);
+            bool applied = state_window_apply(watch->lease, &intermediate);
+            pthread_mutex_unlock(&watch->lease->mutex);
+            if (!applied) return NULL;
+        }
+    }
+    ksd_state_event event; ksd_state_event_init(&event);
+    event.domain = KSD_STATE_WINDOWS; event.kind = KSD_STATE_CHANGED;
+    event.window.handle = 42u;
+    event.window.valid_fields = KSD_FIELD_ID | KSD_FIELD_FRAME;
+    event.window.frame_width = 120u; event.window.frame_height = 110u;
+    pthread_mutex_lock(&watch->lease->mutex);
+    watch->applied = state_window_apply(watch->lease, &event);
+    pthread_mutex_unlock(&watch->lease->mutex);
+    return NULL;
+}
+
+bool ksd_authority_test_operation_refresh(void)
+{
+    for (unsigned defer = 0u; defer < 3u; defer++) {
+        int events[2], controls[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, events) != 0)
+            return false;
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, controls) != 0) {
+            close(events[0]); close(events[1]); return false;
+        }
+        authority_lease lease = { .active = true, .client_fd = events[0],
+            .window_refresh_fd = controls[0], .epoch = 99u, .sequences = { 1u },
+            .domains = KSD_STATE_WINDOWS, .granted_scopes = KSD_SCOPE_WINDOW_CONTROL };
+        lease.window_refresh_at = defer != 0u ? ksd_monotonic_milliseconds() + KSD_OPERATION_REFRESH_MS : 0u;
+        pthread_mutex_init(&lease.mutex, NULL); pthread_mutex_init(&lease.output_mutex, NULL);
+        if (!lease_condition_init(&lease.changed)) {
+            close(events[0]); close(events[1]); close(controls[0]); close(controls[1]);
+            return false;
+        }
+        lease.windows = calloc(1u, sizeof(*lease.windows));
+        bool ok = lease.windows != NULL;
+        if (ok) {
+            lease.windows->value.handle = 42u;
+            lease.windows->value.valid_fields = KSD_FIELD_ID | KSD_FIELD_FRAME;
+            lease.windows->value.frame_width = 100u; lease.windows->value.frame_height = 100u;
+            ksd_window_record prior = lease.windows->value;
+            test_refresh_watch watch = { .lease = &lease, .descriptor = controls[1], .defer = defer,
+                .not_before = lease.window_refresh_at };
+            pthread_t thread;
+            ok = pthread_create(&thread, NULL, test_refresh_watch_run, &watch) == 0;
+            if (ok) {
+                uint8_t payload[24] = { 0 }; ksd_encode_u64(payload, 42u);
+                ksd_encode_u32(payload + 8u, (uint32_t)INT32_MIN);
+                ksd_encode_u32(payload + 12u, (uint32_t)INT32_MIN);
+                ksd_encode_u32(payload + 16u, 120u); ksd_encode_u32(payload + 20u, 110u);
+                ksd_frame request = { .opcode = KSD_OP_WINDOW_MOVE_RESIZE, .payload = payload, .payload_length = sizeof(payload) };
+                authority_session session = { .lease = &lease, .backend = KSD_BACKEND_GENERIC };
+                ok = operation_sync(&session, &request, &prior);
+                pthread_join(thread, NULL);
+                ok = ok && watch.applied && !watch.early_refresh && watch.refreshes == defer + 1u
+                    && session.effective_sequence == defer + 2u && lease.windows->value.frame_width == 120u
+                    && lease.windows->value.frame_height == 110u;
+                for (unsigned i = 0u; ok && i <= defer; i++)
+                    ok = test_state_delivery(events[1], KSD_STATE_GEOMETRY, i + 2u);
+                /* Both requested dimensions changed, even if the compositor constrained their targets. */
+                ksd_encode_u32(payload + 16u, 125u); ksd_encode_u32(payload + 20u, 115u);
+                ok = ok && operation_observed(&lease, &request, &prior)
+                    && !operation_observed(&lease, &request, NULL);
+                ksd_encode_u32(payload + 16u, 120u); ksd_encode_u32(payload + 20u, 110u);
+                /* A no-op is already observed and must not wake an idle watcher. */
+                uint8_t pending;
+                while (recv(controls[1], &pending, sizeof(pending), MSG_DONTWAIT) > 0) { }
+                ok = ok && operation_sync(&session, &request, NULL);
+                struct pollfd item = { .fd = controls[1], .events = POLLIN };
+                ok = ok && poll(&item, 1u, 0) == 0;
+            }
+            ksd_window_record_clear(&lease.windows->value); free(lease.windows);
+        }
+        pthread_mutex_destroy(&lease.mutex); pthread_mutex_destroy(&lease.output_mutex);
+        pthread_cond_destroy(&lease.changed);
+        close(events[0]); close(events[1]); close(controls[0]); close(controls[1]);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool ksd_authority_test_state_model(void)
 {
     int sockets[2];
@@ -3097,6 +3265,15 @@ bool ksd_authority_test_state_model(void)
         ok = !operation_observed(&lease, &restore, NULL);
         lease.windows->value.valid_fields |= KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED;
         ok = ok && operation_observed(&lease, &restore, NULL);
+        ksd_encode_u32(payload + 8u, KSD_WINDOW_STATE_MAXIMIZED);
+        lease.windows->value.flags |= KSD_WINDOW_MAXIMIZED | KSD_WINDOW_MINIMIZED;
+        ok = ok && !operation_observed(&lease, &restore, NULL);
+        lease.windows->value.flags &= ~KSD_WINDOW_MINIMIZED;
+        ok = ok && operation_observed(&lease, &restore, NULL);
+        lease.windows->value.valid_fields &= ~KSD_FIELD_MINIMIZED;
+        ok = ok && !operation_observed(&lease, &restore, NULL);
+        lease.windows->value.flags &= ~KSD_WINDOW_MAXIMIZED;
+        ksd_encode_u32(payload + 8u, KSD_WINDOW_STATE_NORMAL);
         lease.windows->value.valid_fields &= ~(KSD_FIELD_MINIMIZED | KSD_FIELD_MAXIMIZED);
     }
     event.kind = KSD_STATE_SNAPSHOT_BEGIN;

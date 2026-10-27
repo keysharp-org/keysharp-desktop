@@ -15,17 +15,23 @@
 #include "wl_capture.h"
 #include "wl_pointer.h"
 #include "wl_connect.h"
+#include "wl_internal.h"
 #include "wl_windows.h"
 #include "wl_worker.h"
 #include "wl_keyboard.h"
+#include "wl_watch.h"
+#include "state_wire.h"
 
 #include <assert.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <wayland-server.h>
@@ -43,6 +49,7 @@
 #define CSV_MIME "text/csv"
 
 extern int ksd_wayland_clipboard_timeout_ms;
+static int observed_requests_fd = -1;
 
 /* ---------------------------------------------------------------- server -- */
 
@@ -308,6 +315,8 @@ static void bind_list(struct wl_client *client, void *data, uint32_t version,
     wl_resource_set_implementation(resource, &list_impl, NULL, NULL);
     /* Every existing window is reported as soon as the global is bound, which
      * is why the client attaches its listener before the first round trip. */
+    if (strcmp(server_mode(), "cosmic-empty") == 0)
+        return;
     send_toplevel(client, resource, "first \"quoted\" window", "org.test.One",
                   "id-one");
     send_toplevel(client, resource, "second", "org.test.Two", "id-two");
@@ -388,6 +397,21 @@ static int cosmic_delayed_state(void *data)
     return 0;
 }
 
+static int cosmic_delayed_initial(void *data)
+{
+    test_cosmic_toplevel *window = data;
+    uintptr_t index = (uintptr_t)wl_resource_get_user_data(window->foreign);
+    if (strcmp(server_mode(), "cosmic-bootstrap-closed") == 0 && index == 2u) {
+        ext_foreign_toplevel_handle_v1_send_closed(window->foreign);
+        wl_event_source_remove(window->state_timer);
+        window->state_timer = NULL;
+        return 0;
+    }
+    zcosmic_toplevel_handle_v1_send_geometry(
+        window->handle, cosmic_output_resource, (int32_t)index, 0, 2, 1);
+    return cosmic_delayed_state(data);
+}
+
 static void cosmic_action_state(struct wl_resource *handle, uint32_t state,
                                 bool enabled)
 {
@@ -433,6 +457,18 @@ static void cosmic_info_get_toplevel(struct wl_client *client,
     state->handle = handle;
     wl_resource_set_implementation(handle, &cosmic_handle_impl, state,
                                    destroy_test_cosmic_toplevel);
+    if (strncmp(server_mode(), "cosmic-bootstrap", 16u) == 0) {
+        /* A previous batch may finish before this handle's initial state exists. */
+        zcosmic_toplevel_info_v1_send_done(info);
+        if (strcmp(server_mode(), "cosmic-bootstrap-stalled") == 0)
+            return;
+        state->states = index == 1u ? UINT32_C(1) << ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED : 0u;
+        state->state_timer = wl_event_loop_add_timer(
+            wl_display_get_event_loop(wl_client_get_display(client)), cosmic_delayed_initial, state);
+        assert(state->state_timer != NULL);
+        assert(wl_event_source_timer_update(state->state_timer, (int)index * 50) == 0);
+        return;
+    }
     cosmic_send_state(handle, index == 1u
         ? ZCOSMIC_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED
         : strcmp(server_mode(), "cosmic-delayed") == 0
@@ -605,9 +641,11 @@ static void bind_cosmic_manager(struct wl_client *client, void *data,
     wl_resource_set_implementation(resource, &cosmic_manager_impl, NULL,
                                    NULL);
     wl_array_init(&capabilities);
-    void *slots = wl_array_add(&capabilities, sizeof(values));
-    assert(slots != NULL);
-    memcpy(slots, values, sizeof(values));
+    if (strcmp(server_mode(), "cosmic-readonly") != 0) {
+        void *slots = wl_array_add(&capabilities, sizeof(values));
+        assert(slots != NULL);
+        memcpy(slots, values, sizeof(values));
+    }
     zcosmic_toplevel_manager_v1_send_capabilities(resource, &capabilities);
     wl_array_release(&capabilities);
 }
@@ -624,7 +662,7 @@ static void bind_seat(struct wl_client *client, void *data, uint32_t version,
     wl_resource_set_implementation(resource, &seat_impl, NULL, NULL);
     const char *mode = getenv("KSD_TEST_WL_MODE");
     wl_seat_send_capabilities(resource,
-        mode != NULL && strncmp(mode, "keyboard", 8u) == 0
+        observed_requests_fd >= 0 || (mode != NULL && strncmp(mode, "keyboard", 8u) == 0)
             ? WL_SEAT_CAPABILITY_KEYBOARD : 0u);
 }
 
@@ -1396,6 +1434,28 @@ static void bind_pointer_manager(struct wl_client *client, void *data,
                                    NULL);
 }
 
+static void observe_window_requests(void *data, enum wl_protocol_logger_type direction,
+                                     const struct wl_protocol_logger_message *message)
+{
+    (void)data;
+    if (direction != WL_PROTOCOL_LOGGER_REQUEST) return;
+    const char *type = wl_resource_get_class(message->resource);
+    const char *name = message->message->name;
+    char marker = 0;
+    if (strcmp(type, "wl_display") == 0 && strcmp(name, "sync") == 0)
+        marker = 's';
+    else if (strcmp(type, "zwlr_foreign_toplevel_handle_v1") == 0
+        || strcmp(type, "zcosmic_toplevel_manager_v1") == 0) {
+        if (strcmp(name, "activate") == 0) marker = 'a';
+        else if (strcmp(name, "set_fullscreen") == 0 || strcmp(name, "unset_fullscreen") == 0)
+            marker = 'f';
+        else if (strcmp(name, "set_minimized") == 0 || strcmp(name, "unset_minimized") == 0
+            || strcmp(name, "set_maximized") == 0 || strcmp(name, "unset_maximized") == 0)
+            marker = 'm';
+    }
+    if (marker != 0) assert(write(observed_requests_fd, &marker, 1u) == 1);
+}
+
 /* Runs the compositor. Never returns. */
 static void run_server(const char *socket_name, int ready)
 {
@@ -1410,6 +1470,8 @@ static void run_server(const char *socket_name, int ready)
         _exit(0);
     if (display == NULL)
         _exit(1);
+    if (observed_requests_fd >= 0)
+        assert(wl_display_add_protocol_logger(display, observe_window_requests, NULL) != NULL);
     if (wl_display_add_socket(display, socket_name) != 0)
         _exit(1);
     if (wl_global_create(display, &ext_data_control_manager_v1_interface, 1,
@@ -1418,8 +1480,7 @@ static void run_server(const char *socket_name, int ready)
     if (wl_global_create(display, &wl_seat_interface, 1, NULL, bind_seat)
         == NULL)
         _exit(1);
-    if (mode != NULL && (strcmp(mode, "cosmic") == 0
-                        || strcmp(mode, "cosmic-delayed") == 0)) {
+    if (mode != NULL && strncmp(mode, "cosmic", 6u) == 0) {
         if (wl_global_create(display, &wl_output_interface, 4, NULL,
                              bind_output) == NULL
             || wl_global_create(display,
@@ -1434,6 +1495,11 @@ static void run_server(const char *socket_name, int ready)
             || wl_global_create(display,
                     &zcosmic_toplevel_manager_v1_interface, 1, NULL,
                     bind_cosmic_manager) == NULL)
+            _exit(1);
+        if (strcmp(mode, "cosmic-wlr") == 0
+            && wl_global_create(display,
+                    &zwlr_foreign_toplevel_manager_v1_interface, 3, NULL,
+                    bind_wlr_manager) == NULL)
             _exit(1);
     } else if (mode != NULL && strcmp(mode, "capture") == 0) {
         if (wl_display_init_shm(display) != 0
@@ -1522,6 +1588,148 @@ static void stop_server(pid_t child)
 {
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
+}
+
+static ksd_frame read_watch_frame(int descriptor)
+{
+    static const uint8_t magic[4] = {
+        KSD_FRAME_MAGIC_0, KSD_FRAME_MAGIC_1, KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
+    };
+    ksd_frame frame = { 0 };
+    struct pollfd item = { .fd = descriptor, .events = POLLIN };
+    assert(poll(&item, 1u, 1000) == 1);
+    assert(ksd_frame_read(descriptor, magic, KSD_PROTOCOL_MAJOR, KSD_PROTOCOL_MINOR,
+                          KSD_MAX_TEXT_BYTES + 256u, true, &frame) > 0);
+    return frame;
+}
+
+static void check_window_watch(const char *socket_name, const char *mode)
+{
+    bool stalled = strcmp(mode, "cosmic-bootstrap-stalled") == 0;
+    unsigned expected = strcmp(mode, "cosmic-empty") == 0 ? 0u
+        : strcmp(mode, "cosmic-bootstrap-closed") == 0 ? 1u : 2u;
+    int syncs[2];
+    assert(pipe2(syncs, O_CLOEXEC | O_NONBLOCK) == 0);
+    observed_requests_fd = syncs[1];
+    pid_t server = start_server(socket_name, mode);
+    observed_requests_fd = -1;
+    close(syncs[1]);
+
+    for (unsigned invalid = 0u; invalid < (stalled ? 1u : 2u); invalid++) {
+        int stream[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stream) == 0);
+        pid_t watcher = fork();
+        assert(watcher >= 0);
+        if (watcher == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
+            if (getppid() == 1) _exit(1);
+            close(stream[0]); close(syncs[0]);
+            ksd_wayland *connection = NULL;
+            assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+            assert(ksd_wayland_supported(connection).toplevel_events
+                   == (strncmp(mode, "cosmic", 6u) == 0));
+            bool ok = ksd_wayland_watch_run(connection, stream[1], 123u);
+            ksd_wayland_close(connection); close(stream[1]);
+            _exit(ok ? 0 : 1);
+        }
+        close(stream[1]);
+        if (stalled) {
+            struct pollfd answer = { .fd = stream[0], .events = POLLIN };
+            assert(poll(&answer, 1u, 3000) == 1);
+        }
+        ksd_frame frame = read_watch_frame(stream[0]);
+        assert(frame.opcode == 0u && frame.flags == 0u && frame.request_id == 123u);
+        assert(frame.payload_length == 8u && ksd_decode_u32(frame.payload)
+               == (stalled ? KSD_STATUS_UNAVAILABLE : KSD_STATUS_OK));
+        /* Native protocol events do not need the authority's sampled-window retries. */
+        assert(ksd_decode_u32(frame.payload + 4u) == 0u);
+        ksd_frame_clear(&frame);
+        if (stalled) {
+            /* Failed bootstrap cannot publish an authoritative empty snapshot. */
+            struct pollfd ended = { .fd = stream[0], .events = POLLIN };
+            char byte;
+            assert(poll(&ended, 1u, 1000) == 1);
+            assert(recv(stream[0], &byte, 1u, 0) == 0);
+            int status;
+            assert(waitpid(watcher, &status, 0) == watcher && WIFEXITED(status));
+            assert(WEXITSTATUS(status) == 1);
+            close(stream[0]);
+            continue;
+        }
+        bool windows = false, keyboard = false, displays = strncmp(mode, "cosmic", 6u) != 0;
+        unsigned count = 0u;
+        unsigned capture_ids = 0u;
+        while (!windows || !keyboard || !displays) {
+            frame = read_watch_frame(stream[0]);
+            ksd_state_event event; ksd_state_event_init(&event);
+            assert(frame.opcode == KSD_OP_STATE_EVENT && frame.flags == KSD_FLAG_EVENT);
+            assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
+            if (event.domain == KSD_STATE_WINDOWS) {
+                if (event.kind == KSD_STATE_SNAPSHOT_ITEM) {
+                    count++;
+                    if (strncmp(mode, "cosmic", 6u) == 0) {
+                        const ksd_window_record *window = &event.window;
+                        assert((window->valid_fields & KSD_FIELD_CAPTURE_ID) != 0u);
+                        assert(window->capture_id.length == 6u
+                               && (memcmp(window->capture_id.data, "id-one", 6u) == 0
+                                   || memcmp(window->capture_id.data, "id-two", 6u) == 0));
+                        unsigned bit = memcmp(window->capture_id.data, "id-one", 6u) == 0 ? 1u : 2u;
+                        assert((capture_ids & bit) == 0u);
+                        capture_ids |= bit;
+                        assert((window->valid_fields & KSD_FIELD_FRAME) != 0u
+                               && window->frame_width == 2u && window->frame_height == 1u);
+                    }
+                }
+                if (event.kind == KSD_STATE_SNAPSHOT_END) {
+                    assert(count == expected);
+                    if (strncmp(mode, "cosmic", 6u) == 0)
+                        assert(capture_ids == (expected == 2u ? 3u : expected));
+                    windows = true;
+                }
+            }
+            if (event.domain == KSD_STATE_DISPLAYS && event.kind == KSD_STATE_SNAPSHOT_END)
+                displays = true;
+            if (event.domain == KSD_STATE_KEYBOARD && event.kind == KSD_STATE_SNAPSHOT_END)
+                keyboard = true;
+            ksd_state_event_clear(&event); ksd_frame_clear(&frame);
+        }
+        assert(count == expected);
+        struct pollfd marker = { .fd = syncs[0], .events = POLLIN };
+        char bytes[128];
+        /* Snapshot ends establish that the initial auxiliary round trips have completed. */
+        unsigned initial_syncs = 0u;
+        while (poll(&marker, 1u, 0) == 1) {
+            assert(++initial_syncs < 16u);
+            assert(read(syncs[0], bytes, sizeof(bytes)) > 0);
+        }
+        /* A native event source stays idle beyond the sampled-window retry interval. */
+        assert(poll(&marker, 1u, 350) == 0);
+        for (unsigned batch = 1u; batch <= 3u; batch += 2u) {
+            const uint8_t refreshes[3] = {
+                KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE,
+            };
+            assert(send(stream[0], refreshes, batch, MSG_NOSIGNAL) == (ssize_t)batch);
+            assert(poll(&marker, 1u, 1000) == 1);
+            /* One snapshot round trip proves processing; auxiliary state stays asleep. */
+            assert(read(syncs[0], bytes, sizeof(bytes)) == 1);
+            assert(poll(&marker, 1u, 50) == 0);
+        }
+        if (invalid) {
+            const uint8_t byte = 0xffu;
+            assert(send(stream[0], &byte, 1u, MSG_NOSIGNAL) == 1);
+        } else {
+            assert(shutdown(stream[0], SHUT_WR) == 0);
+        }
+        struct pollfd ended = { .fd = stream[0], .events = POLLIN };
+        assert(poll(&ended, 1u, 1000) == 1);
+        assert(recv(stream[0], bytes, sizeof(bytes), 0) == 0);
+        int status;
+        assert(waitpid(watcher, &status, 0) == watcher && WIFEXITED(status));
+        if (!invalid) assert(WEXITSTATUS(status) == 0);
+        close(stream[0]);
+    }
+    close(syncs[0]);
+    stop_server(server);
 }
 
 static uint32_t framed_length(const ksd_operation_result *result)
@@ -1665,12 +1873,153 @@ static uint64_t window_handle_at(const ksd_operation_result *result,
     return handle;
 }
 
+static void check_window_state(ksd_wayland *connection, uint64_t handle,
+                                bool minimized, bool maximized)
+{
+    ksd_operation_result result; ksd_result_init(&result);
+    ksd_wayland_window_query(connection, handle, &result);
+    assert(result.status == KSD_STATUS_OK);
+    const char *body = (const char *)result.tail + 4u;
+    uint32_t length = framed_length(&result);
+    const char *minimized_field = minimized ? "\"minimized\":true" : "\"minimized\":false";
+    const char *maximized_field = maximized ? "\"maximized\":true" : "\"maximized\":false";
+    assert(memmem(body, length, minimized_field, strlen(minimized_field)) != NULL);
+    assert(memmem(body, length, maximized_field, strlen(maximized_field)) != NULL);
+    ksd_result_clear(&result);
+}
+
+static void expect_window_requests(int descriptor, const char *expected)
+{
+    char actual[64];
+    ssize_t count = read(descriptor, actual, sizeof(actual));
+    if (count != (ssize_t)strlen(expected)
+        || memcmp(actual, expected, strlen(expected)) != 0) {
+        fprintf(stderr, "expected Wayland requests %s, got %.*s\n", expected,
+                count > 0 ? (int)count : 0, actual);
+        assert(false);
+    }
+}
+
+static void check_state_noops(const char *socket_name, const char *mode)
+{
+    int requests[2];
+    assert(pipe2(requests, O_CLOEXEC | O_NONBLOCK) == 0);
+    observed_requests_fd = requests[1];
+    pid_t server = start_server(socket_name, mode);
+    observed_requests_fd = -1;
+    close(requests[1]);
+    ksd_wayland *connection = NULL;
+    assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+    ksd_operation_result result; ksd_result_init(&result);
+    ksd_wayland_window_list(connection, true, &result);
+    assert(result.status == KSD_STATUS_OK);
+    uint64_t first = window_handle_at(&result, 0u);
+    uint64_t second = window_handle_at(&result, 1u);
+    ksd_result_clear(&result);
+    char pending[128];
+    while (read(requests[0], pending, sizeof(pending)) > 0) { }
+
+    if (strcmp(mode, "cosmic-readonly") == 0) {
+        ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE, first, 0u, &result);
+        assert(result.status == KSD_STATUS_UNSUPPORTED);
+        ksd_result_clear(&result);
+        expect_window_requests(requests[0], "s");
+    } else {
+        const struct { uint32_t state; const char *requests; } transitions[] = {
+            { 0u, "s" }, { 3u, "s" },
+            { 1u, "sms" }, { 1u, "s" },
+            { 2u, "smms" }, { 2u, "s" },
+            { 3u, "s" },
+            { 1u, "sms" }, { 1u, "s" },
+            { 2u, "sms" }, { 2u, "s" },
+            { 1u, "sms" },
+            { 0u, "smms" }, { 0u, "s" },
+            { 2u, "sms" }, { 1u, "sms" },
+            { 3u, "sms" }, { 3u, "s" }, { 0u, "sms" },
+        };
+        for (size_t i = 0u; i < sizeof(transitions) / sizeof(transitions[0]); i++) {
+            ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
+                                      first, transitions[i].state, &result);
+            assert(result.status == KSD_STATUS_OK);
+            ksd_result_clear(&result);
+            /* A fresh-state sync remains; only a real mutation needs a final sync. */
+            expect_window_requests(requests[0], transitions[i].requests);
+            if (transitions[i].state == 2u) {
+                check_window_state(connection, first, false, true);
+                expect_window_requests(requests[0], "s");
+            }
+        }
+        for (unsigned i = 0u; i < 2u; i++) {
+            ksd_wayland_window_action(connection, KSD_OP_WINDOW_FOCUS, first, 0u, &result);
+            assert(result.status == KSD_STATUS_OK);
+            ksd_result_clear(&result);
+            expect_window_requests(requests[0], "sas");
+        }
+        if (strcmp(mode, "cosmic-delayed") == 0) {
+            /* Fullscreen is independent of maximization; no fullscreen request is allowed. */
+            check_window_state(connection, second, false, false);
+            expect_window_requests(requests[0], "s");
+            const struct { uint32_t state; const char *requests; } fullscreen[] = {
+                { 0u, "s" }, { 2u, "sms" }, { 2u, "s" },
+                { 1u, "sms" }, { 2u, "sms" },
+                { 0u, "sms" }, { 0u, "s" },
+            };
+            for (size_t i = 0u; i < sizeof(fullscreen) / sizeof(fullscreen[0]); i++) {
+                ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
+                                          second, fullscreen[i].state, &result);
+                assert(result.status == KSD_STATUS_OK);
+                ksd_result_clear(&result);
+                expect_window_requests(requests[0], fullscreen[i].requests);
+                check_window_state(connection, second, fullscreen[i].state == 1u,
+                                    fullscreen[i].state != 0u);
+                expect_window_requests(requests[0], "s");
+            }
+        }
+    }
+    ksd_wayland_close(connection);
+    close(requests[0]);
+    stop_server(server);
+}
+
 static void check_window_query(const char *socket_name, const char *mode)
 {
     ksd_wayland *connection = NULL;
     ksd_operation_result result;
     pid_t child = start_server(socket_name, mode);
     assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+    bool wlr = strcmp(mode, "wlr") == 0 || strcmp(mode, "cosmic-wlr") == 0;
+    bool cosmic = strncmp(mode, "cosmic", 6u) == 0 && !wlr;
+    assert(ksd_wayland_supported(connection).toplevel_events == cosmic);
+    if (strcmp(mode, "cosmic-readonly") == 0) {
+        ksd_wayland_features features = ksd_wayland_supported(connection);
+        assert(!features.toplevel_focus && !features.toplevel_close && !features.toplevel_state);
+    }
+    assert(connection->handle_salt_ready);
+    if (cosmic)
+        assert(ksd_wayland_current_window_view(connection) == ksd_wayland_cosmic_window_view());
+    if (wlr)
+        assert(ksd_wayland_current_window_view(connection) == ksd_wayland_wlr_window_view());
+    ksd_wayland probe = *connection;
+    probe.handle_salt_ready = false;
+    assert(!ksd_wayland_supported(&probe).toplevel_events);
+    if (cosmic) {
+        probe = *connection;
+        probe.cosmic_toplevel_manager = NULL;
+        probe.seat = NULL;
+        assert(ksd_wayland_supported(&probe).toplevel_events);
+        probe = *connection;
+        probe.cosmic_toplevel_info = NULL;
+        assert(!ksd_wayland_supported(&probe).toplevel_events);
+        probe = *connection;
+        probe.toplevel_list = NULL;
+        assert(!ksd_wayland_supported(&probe).toplevel_events);
+    }
+    /* Hyprland's joined ext list remains preferred even alongside wlroots. */
+    probe = *connection;
+    probe.hypr = true;
+    assert(ksd_wayland_supported(&probe).toplevel_events == (probe.toplevel_list != NULL));
+    probe.handle_salt_ready = false;
+    assert(!ksd_wayland_supported(&probe).toplevel_events);
     ksd_result_init(&result);
     ksd_wayland_window_list(connection, true, &result);
     assert(result.status == KSD_STATUS_OK);
@@ -1694,7 +2043,7 @@ static void check_window_query(const char *socket_name, const char *mode)
      * identifier, so its handles stay private to the connection. */
     assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
     ksd_wayland_window_query(connection, second, &result);
-    if (strcmp(mode, "wlr") == 0)
+    if (wlr)
         assert(result.status == KSD_STATUS_NOT_FOUND);
     else {
         assert(result.status == KSD_STATUS_OK);
@@ -1819,6 +2168,7 @@ static void check_cosmic_windows(const char *socket_name)
     assert(ksd_wayland_supported(connection).toplevel_focus);
     assert(ksd_wayland_supported(connection).toplevel_close);
     assert(ksd_wayland_supported(connection).toplevel_state);
+    assert(ksd_wayland_supported(connection).toplevel_events);
 
     ksd_result_init(&result);
     ksd_wayland_window_list(connection, true, &result);
@@ -1905,6 +2255,8 @@ static void check_cosmic_delayed_states(const char *socket_name)
     } transitions[] = {
         { 2u, false, true },
         { 1u, true, true },
+        { 2u, false, true },
+        { 1u, true, true },
         { 3u, false, true },
         { 0u, false, false },
         { 3u, false, false },
@@ -1920,27 +2272,19 @@ static void check_cosmic_delayed_states(const char *socket_name)
     ksd_result_clear(&result);
 
     /* Restoring leaves fullscreen alone, so it must not wait for it to end. */
+    check_window_state(connection, fullscreen, false, false);
     ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
                               fullscreen, 0u, &result);
     assert(result.status == KSD_STATUS_OK);
     ksd_result_clear(&result);
+    check_window_state(connection, fullscreen, false, false);
 
     for (size_t i = 0u; i < sizeof(transitions) / sizeof(transitions[0]); i++) {
         ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
                                   first, transitions[i].requested, &result);
         assert(result.status == KSD_STATUS_OK);
         ksd_result_clear(&result);
-        ksd_wayland_window_query(connection, first, &result);
-        assert(result.status == KSD_STATUS_OK);
-        const char *body = (const char *)result.tail + 4u;
-        uint32_t length = framed_length(&result);
-        const char *minimized = transitions[i].minimized
-            ? "\"minimized\":true" : "\"minimized\":false";
-        const char *maximized = transitions[i].maximized
-            ? "\"maximized\":true" : "\"maximized\":false";
-        assert(memmem(body, length, minimized, strlen(minimized)) != NULL);
-        assert(memmem(body, length, maximized, strlen(maximized)) != NULL);
-        ksd_result_clear(&result);
+        check_window_state(connection, first, transitions[i].minimized, transitions[i].maximized);
     }
 
     ksd_wayland_close(connection);
@@ -2228,9 +2572,24 @@ int main(void)
     check_window_query(socket_name, "normal");
     check_window_query(socket_name, "wlr");
     check_window_query(socket_name, "cosmic");
+    check_window_query(socket_name, "cosmic-readonly");
+    check_window_query(socket_name, "cosmic-wlr");
+    check_window_query(socket_name, "cosmic-bootstrap");
     check_wlr_windows(socket_name);
     check_cosmic_windows(socket_name);
     check_cosmic_delayed_states(socket_name);
+    check_state_noops(socket_name, "wlr");
+    check_state_noops(socket_name, "cosmic");
+    check_state_noops(socket_name, "cosmic-delayed");
+    check_state_noops(socket_name, "cosmic-readonly");
+    check_window_watch(socket_name, "normal");
+    check_window_watch(socket_name, "wlr");
+    check_window_watch(socket_name, "cosmic");
+    check_window_watch(socket_name, "cosmic-readonly");
+    check_window_watch(socket_name, "cosmic-bootstrap");
+    check_window_watch(socket_name, "cosmic-bootstrap-closed");
+    check_window_watch(socket_name, "cosmic-empty");
+    check_window_watch(socket_name, "cosmic-bootstrap-stalled");
     check_screencopy(socket_name);
     check_image_copy(socket_name, false);
     check_image_copy(socket_name, true);

@@ -1216,6 +1216,14 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     ksd_x11_window_focus(connection, 0x7ffffffdu, &result);
     assert(result.status == KSD_STATUS_NOT_FOUND);
     ksd_result_clear(&result);
+    ksd_result_init(&result);
+    ksd_x11_window_raise(connection, 0x7ffffffdu, true, &result);
+    assert(result.status == KSD_STATUS_NOT_FOUND);
+    ksd_x11_window_raise(connection, 0x7ffffffdu, false, &result);
+    assert(result.status == KSD_STATUS_NOT_FOUND);
+    ksd_x11_window_move_resize(connection, 0x7ffffffdu, 11, 22, 33u, 44u, &result);
+    assert(result.status == KSD_STATUS_NOT_FOUND);
+    ksd_result_clear(&result);
 
     ksd_result_init(&result);
     ksd_x11_window_focus(connection, window, &result);
@@ -1263,9 +1271,33 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     assert(next_client_message(wm, change_state, data));
     assert(data[0] == 3u);
 
+    /* A manager may deny activation; maximizing must still request that an iconic window be mapped. */
+    xcb_unmap_window(wm, window);
+    xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(wm,
+        xcb_get_window_attributes(wm, window), NULL);
+    assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_UNMAPPED);
+    free(attributes);
     ksd_result_init(&result);
     ksd_x11_window_set_state(connection, window, 2u, &result);
+    assert(result.status == KSD_STATUS_OK);
     ksd_result_clear(&result);
+    settle(connection);
+    bool map_requested = false;
+    xcb_generic_event_t *event;
+    while ((event = xcb_poll_for_event(wm)) != NULL) {
+        bool requested = (event->response_type & 0x7fu) == XCB_MAP_REQUEST
+            && ((xcb_map_request_event_t *)event)->window == window;
+        free(event);
+        if (requested) {
+            map_requested = true;
+            xcb_map_window(wm, window);
+            break;
+        }
+    }
+    assert(map_requested);
+    attributes = xcb_get_window_attributes_reply(wm, xcb_get_window_attributes(wm, window), NULL);
+    assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_VIEWABLE);
+    free(attributes);
     assert(next_client_message(wm, wm_state, data));
     assert(data[0] == 1u);
     /* Both maximize atoms, because a window maximized in one direction only is

@@ -608,12 +608,15 @@ function executeJob(job) {
         var requestedY = parseInt(fields[2], 10);
         var requestedWidth = parseInt(fields[3], 10);
         var requestedHeight = parseInt(fields[4], 10);
-        window.frameGeometry = {
+        var targetGeometry = {
             x: requestedX === -2147483648 ? geometry.x : requestedX,
             y: requestedY === -2147483648 ? geometry.y : requestedY,
             width: requestedWidth === 0 ? geometry.width : requestedWidth,
             height: requestedHeight === 0 ? geometry.height : requestedHeight
         };
+        if (targetGeometry.x !== geometry.x || targetGeometry.y !== geometry.y
+                || targetGeometry.width !== geometry.width || targetGeometry.height !== geometry.height)
+            window.frameGeometry = targetGeometry;
         return { sequence: job.sequence, status: STATUS_OK, body: "" };
 
     case OP_WINDOW_SET_STATE:

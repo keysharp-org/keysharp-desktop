@@ -9,7 +9,7 @@
 #define KSD_HYPR_ID_CAPACITY 32u
 #define KSD_HYPR_WORKSPACE_CAPACITY 64u
 
-/* The facts Hyprland's j/clients reply gives about one window. stable_id is
+/* Window facts from Hyprland's batched j/clients and j/activewindow replies. stable_id is
  * the string the compositor also sends as the ext-foreign-toplevel
  * identifier, which is what joins a toplevel handle to these facts. */
 typedef struct ksd_hypr_client {
@@ -18,16 +18,19 @@ typedef struct ksd_hypr_client {
     char workspace_name[KSD_HYPR_WORKSPACE_CAPACITY];
     int64_t workspace_id;
     int64_t pid;
+    uint32_t stacking_order;
     int32_t x;
     int32_t y;
     int32_t width;
     int32_t height;
     int32_t fullscreen;
-    int32_t focus_history;
     bool mapped;
     bool hidden;
     bool visible;
     bool floating;
+    bool pinned;
+    bool over_fullscreen;
+    bool active;
 } ksd_hypr_client;
 
 /* The pid of the Hyprland instance the session's environment names, or -1
@@ -51,6 +54,9 @@ bool ksd_wayland_hypr_active_workspace(pid_t session_pid, int64_t *id);
 /* Parses a j/clients reply; exposed for tests. */
 bool ksd_wayland_hypr_parse_clients(const char *json, size_t length,
                                     ksd_hypr_client **clients, size_t *count);
+/* Parses the clients/activewindow batch, whose focus fact is independent of focus history. */
+bool ksd_wayland_hypr_parse_snapshot(const char *reply, size_t length,
+                                     ksd_hypr_client **clients, size_t *count);
 
 /* Window opacity as 0..255, the scale the window JSON and the set request
  * use. The text form is what a set_prop value takes and getprop returns. */

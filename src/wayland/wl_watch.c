@@ -246,6 +246,21 @@ static int until(uint64_t deadline, uint64_t now)
         : (int)(deadline - now);
 }
 
+static bool receive_refresh(int descriptor)
+{
+    uint8_t bytes[128];
+    bool received = false;
+    for (;;) {
+        ssize_t count = recv(descriptor, bytes, sizeof(bytes), MSG_DONTWAIT);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return received;
+        if (count <= 0) return false;
+        for (ssize_t index = 0; index < count; index++)
+            if (bytes[index] != KSD_WATCH_REFRESH_BYTE) return false;
+        received = true;
+    }
+}
+
 bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
                            uint64_t request_id)
 {
@@ -276,6 +291,7 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
         events_fd = ksd_wayland_hypr_events_open(connection->session_pid);
     ok = (!hypr || events_fd >= 0) && (watch.view == NULL || refresh(&watch, false));
     ksd_encode_u32(answer, ok ? KSD_STATUS_OK : KSD_STATUS_UNAVAILABLE);
+    ksd_encode_u32(answer + 4u, hypr ? KSD_WATCH_SAMPLED_WINDOWS : 0u);
     ok = write_frame(stream_fd, 0u, 0u, request_id, answer, sizeof(answer))
         && ok;
     if (ok) ok = initial_windows(&watch) && auxiliary_state(&watch, KSD_STATE_KEYBOARD, true)
@@ -302,9 +318,12 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
             ok = false;
             break;
         }
-        /* Anything from the authority, including its hangup, ends the watch. */
-        if (descriptors[0].revents != 0)
-            break;
+        bool requested = descriptors[0].revents != 0;
+        if (requested) {
+            if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0
+                || !receive_refresh(stream_fd))
+                break;
+        }
         if (descriptors[1].revents != 0) {
             if ((descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
                 || !ksd_wayland_dispatch_ready(connection)) {
@@ -319,17 +338,22 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
             break;
         }
         now = ksd_monotonic_milliseconds();
-        if (hypr && now < next_tick
-            && !(watch.dirty && now >= last_refresh + KSD_WATCH_COALESCE_MS))
+        bool scheduled = (hypr && now >= next_tick)
+            || (watch.dirty && (!hypr || now >= last_refresh + KSD_WATCH_COALESCE_MS));
+        if (!requested && !scheduled)
             continue;
-        watch.dirty = false;
         if ((watch.view == NULL || refresh(&watch, true))
-            && auxiliary_state(&watch, KSD_STATE_KEYBOARD, false) && auxiliary_state(&watch, KSD_STATE_DISPLAYS, false))
+            && (!scheduled || (auxiliary_state(&watch, KSD_STATE_KEYBOARD, false)
+                && auxiliary_state(&watch, KSD_STATE_DISPLAYS, false))))
             failures = 0u;
         else if (++failures >= KSD_WATCH_REFRESH_FAILURES)
             ok = false;
-        last_refresh = ksd_monotonic_milliseconds();
-        next_tick = last_refresh + KSD_WATCH_TICK_MS;
+        /* Window-only samples must not postpone keyboard and display updates. */
+        if (scheduled) {
+            watch.dirty = false;
+            last_refresh = ksd_monotonic_milliseconds();
+            next_tick = last_refresh + KSD_WATCH_TICK_MS;
+        }
     }
     if (events_fd >= 0)
         close(events_fd);

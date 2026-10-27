@@ -13,7 +13,6 @@
 
 #define KSD_COSMIC_WINDOW_TIMEOUT_MS 2000
 #define KSD_COSMIC_CAPABILITY(value) (UINT32_C(1) << (value))
-#define KSD_COSMIC_STATE_FULLSCREEN (UINT32_C(1) << 3)
 
 static void free_geometries(ksd_cosmic_geometry *geometry)
 {
@@ -36,7 +35,7 @@ static void handle_done(void *data,
                         struct zcosmic_toplevel_handle_v1 *handle)
 {
     (void)handle;
-    if (data != NULL)
+    if (data != NULL && ((ksd_wl_toplevel *)data)->cosmic_state_received)
         ((ksd_wl_toplevel *)data)->ready = true;
 }
 
@@ -128,6 +127,7 @@ static void handle_state(void *data,
             state |= UINT32_C(1) << *item;
     }
     toplevel->state = state;
+    toplevel->cosmic_state_received = true;
 }
 
 static void handle_geometry(void *data,
@@ -197,7 +197,7 @@ static void info_done(void *data, struct zcosmic_toplevel_info_v1 *info)
         return;
     for (ksd_wl_toplevel *item = connection->toplevels;
          item != NULL; item = item->next)
-        if (item->cosmic_handle != NULL)
+        if (item->cosmic_handle != NULL && item->cosmic_state_received)
             item->ready = true;
 }
 
@@ -293,6 +293,7 @@ void ksd_wayland_cosmic_detach_toplevel(ksd_wl_toplevel *toplevel)
     free_geometries(toplevel->cosmic_geometries);
     toplevel->cosmic_geometries = NULL;
     toplevel->ready = false;
+    toplevel->cosmic_state_received = false;
 }
 
 void ksd_wayland_cosmic_output_removed(ksd_wayland *connection,
@@ -409,8 +410,7 @@ static bool append_window(ksd_buffer *out, ksd_wayland *connection,
         & KSD_WL_TOPLEVEL_STATE_ACTIVATED) != 0u;
     bool minimized = (item->state
         & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u;
-    bool maximized = (item->state
-        & (KSD_WL_TOPLEVEL_STATE_MAXIMIZED | KSD_COSMIC_STATE_FULLSCREEN)) != 0u;
+    bool maximized = (item->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u;
     int32_t x;
     int32_t y;
     int32_t width;
@@ -469,11 +469,7 @@ static bool usable(const ksd_wl_toplevel *item)
 
 static uint32_t state(const ksd_wl_toplevel *item)
 {
-    uint32_t value = item->state;
-
-    if ((value & KSD_COSMIC_STATE_FULLSCREEN) != 0u)
-        value |= KSD_WL_TOPLEVEL_STATE_MAXIMIZED;
-    return value;
+    return item->state;
 }
 
 typedef struct cosmic_state_wait {
@@ -491,10 +487,10 @@ static bool requested_state_observed(void *data)
     if (wait->requested == 1u)
         return (flags & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u;
     if (wait->requested == 2u)
-        return (flags & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u;
+        return (flags & (KSD_WL_TOPLEVEL_STATE_MINIMIZED | KSD_WL_TOPLEVEL_STATE_MAXIMIZED))
+            == KSD_WL_TOPLEVEL_STATE_MAXIMIZED;
     if (wait->requested == 3u)
         return (flags & KSD_WL_TOPLEVEL_STATE_MINIMIZED) == 0u;
-    /* Restoring does not leave fullscreen, which state() reports as maximized. */
     return (wait->window->state & (KSD_WL_TOPLEVEL_STATE_MINIMIZED
                                    | KSD_WL_TOPLEVEL_STATE_MAXIMIZED)) == 0u;
 }
@@ -532,19 +528,30 @@ void ksd_wayland_cosmic_window_action(ksd_wayland *connection,
             connection->cosmic_toplevel_manager, window->cosmic_handle);
     } else if (opcode == KSD_OP_WINDOW_SET_STATE
                && ksd_wayland_cosmic_can_set_state(connection)) {
+        cosmic_state_wait wait = { .window = window, .requested = value };
+        if (requested_state_observed(&wait)) {
+            (void)ksd_result_copy(result, NULL, 0u);
+            return;
+        }
         if (value == 1u) {
             zcosmic_toplevel_manager_v1_set_minimized(
                 connection->cosmic_toplevel_manager,
                 window->cosmic_handle);
         } else if (value == 2u) {
-            zcosmic_toplevel_manager_v1_set_maximized(
-                connection->cosmic_toplevel_manager,
-                window->cosmic_handle);
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
+                zcosmic_toplevel_manager_v1_unset_minimized(
+                    connection->cosmic_toplevel_manager,
+                    window->cosmic_handle);
+            if ((state(window) & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) == 0u)
+                zcosmic_toplevel_manager_v1_set_maximized(
+                    connection->cosmic_toplevel_manager,
+                    window->cosmic_handle);
         } else {
-            zcosmic_toplevel_manager_v1_unset_minimized(
-                connection->cosmic_toplevel_manager,
-                window->cosmic_handle);
-            if (value == 0u)
+            if ((window->state & KSD_WL_TOPLEVEL_STATE_MINIMIZED) != 0u)
+                zcosmic_toplevel_manager_v1_unset_minimized(
+                    connection->cosmic_toplevel_manager,
+                    window->cosmic_handle);
+            if (value == 0u && (window->state & KSD_WL_TOPLEVEL_STATE_MAXIMIZED) != 0u)
                 zcosmic_toplevel_manager_v1_unset_maximized(
                     connection->cosmic_toplevel_manager,
                     window->cosmic_handle);

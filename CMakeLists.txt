@@ -711,7 +711,9 @@ if(BUILD_TESTING)
     target_link_libraries(kwin-host-tests PRIVATE keysharp-desktop-common)
     add_test(NAME kwin-host-tests COMMAND kwin-host-tests)
 
-    add_executable(kwin-relay-tests tests/kwin_relay_tests.c)
+    add_executable(kwin-relay-tests tests/kwin_relay_tests.c src/kwin_bus.c)
+    target_compile_definitions(kwin-relay-tests PRIVATE
+        KSD_KWIN_BUS_TESTING KSD_KWIN_RELAY_TRANSFER_MS=100u)
     target_link_libraries(kwin-relay-tests PRIVATE
         keysharp-desktop-common Threads::Threads)
     add_test(NAME kwin-relay-tests COMMAND kwin-relay-tests)

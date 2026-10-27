@@ -610,10 +610,8 @@ const env = {
     makeImageContent: makeImageContent,
     captureArea: captureArea,
     captureWindow: captureWindow,
-    setDecorated: (win, decorated) => {
-        win.decorated = decorated;
-        return true;
-    },
+    // Muffin exposes decorated as read-only; assigning it cannot change a native window's frame.
+    setDecorated: () => null,
     workArea: workArea,
     maximizeFlags: CinnamonMeta.MaximizeFlags.BOTH,
     windowExtras: windowExtras,

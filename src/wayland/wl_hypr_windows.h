@@ -3,6 +3,7 @@
 
 #include "operation_result.h"
 #include "wl_connect.h"
+#include "wl_hypr.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,6 +14,12 @@
 bool ksd_wayland_hypr_windows_available(const ksd_wayland *connection);
 bool ksd_wayland_hypr_windows_refresh(ksd_wayland *connection,
                                       ksd_operation_result *result);
+/* Applies the same compositor snapshot to query and watch connections. */
+void ksd_wayland_hypr_windows_update(ksd_wayland *connection,
+                                     const ksd_hypr_client *clients, size_t count);
+struct ksd_wl_toplevel;
+bool ksd_wayland_hypr_can_restack(const ksd_wayland *connection,
+                                  const struct ksd_wl_toplevel *window, bool top);
 void ksd_wayland_hypr_window_action(ksd_wayland *connection, uint16_t opcode,
                                     uint64_t handle, uint32_t value,
                                     ksd_operation_result *result);

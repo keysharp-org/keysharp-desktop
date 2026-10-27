@@ -371,11 +371,11 @@ function setDecorated(win, decorated) {
         ? win.get_client_type() === GnomeMeta.WindowClientType.X11
         : typeof win.get_xwindow === 'function' && win.get_xwindow() !== 0;
     if (!isX11 || typeof win.get_xwindow !== 'function')
-        return true;
+        return null;
 
     const xid = win.get_xwindow();
     if (!xid)
-        return true;
+        return null;
 
     const value = decorated ? 1 : 0;
     GnomeGLib.spawn_command_line_async(`xprop -id ${xid} -f _MOTIF_WM_HINTS 32c `

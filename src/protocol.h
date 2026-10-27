@@ -16,6 +16,10 @@
 #define KSD_WINDOW_EVENT_HIDE 10u
 #define KSD_WINDOW_EVENT_CHANGED 11u
 
+/* Private wakeup on an established display-watch socket, outside client frames. */
+#define KSD_WATCH_REFRESH_BYTE 1u
+/* The second word of the worker's watch reply describes its sampling needs. */
+#define KSD_WATCH_SAMPLED_WINDOWS 1u
 
 #define KSD_PRODUCT_NAME "keysharp-desktop"
 #define KSD_PRODUCT_VERSION "1.0.3"

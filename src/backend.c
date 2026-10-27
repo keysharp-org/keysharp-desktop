@@ -468,9 +468,9 @@ bool ksd_backend_registration_mask(ksd_backend backend, uint16_t version,
  * what is actually advertised and narrows this at registration, which is
  * exactly what the withhold-only registration mask exists for.
  *
- * Geometry, restacking, hit-testing, opacity, keeping a window above, the
- * owning process, the work area and window events come only from a compositor
- * channel outside the shared protocols, which today means Hyprland IPC.
+ * Arbitrary move/resize, authoritative stacking, opacity, keeping a window
+ * above, process identity and reserved work areas require a compositor channel,
+ * currently Hyprland IPC. COSMIC protocols supply geometry reads and events.
  * Decoration and taskbar state remain out of reach from outside a Wayland
  * compositor. */
 #define KSD_GENERIC_OPERATIONS \
@@ -548,6 +548,9 @@ uint64_t ksd_backend_operations(ksd_backend backend)
         | KSD_OPERATION_CURSOR_POSITION
         | KSD_OPERATION_WORK_AREA;
     operations |= KSD_OPERATION_CAPTURE_WINDOW | KSD_OPERATION_CAPTURE_AREA;
+    /* Muffin exposes decoration state but provides no setter for it. */
+    if (backend == KSD_BACKEND_CINNAMON)
+        operations &= ~KSD_OPERATION_WINDOW_SET_DECORATED;
     return operations;
 }
 

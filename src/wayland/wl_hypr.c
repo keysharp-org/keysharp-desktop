@@ -522,7 +522,6 @@ static bool json_client(json_cursor *cursor, ksd_hypr_client *client)
     memset(client, 0, sizeof(*client));
     client->mapped = true;
     client->visible = true;
-    client->focus_history = INT32_MAX;
     if (!json_take(cursor, '{'))
         return false;
     if (json_take(cursor, '}'))
@@ -549,6 +548,10 @@ static bool json_client(json_cursor *cursor, ksd_hypr_client *client)
             ok = json_boolean(cursor, &client->visible);
         else if (strcmp(key, "floating") == 0)
             ok = json_boolean(cursor, &client->floating);
+        else if (strcmp(key, "pinned") == 0)
+            ok = json_boolean(cursor, &client->pinned);
+        else if (strcmp(key, "overFullscreen") == 0)
+            ok = json_boolean(cursor, &client->over_fullscreen);
         else if (strcmp(key, "at") == 0)
             ok = json_pair(cursor, &client->x, &client->y);
         else if (strcmp(key, "size") == 0)
@@ -566,13 +569,8 @@ static bool json_client(json_cursor *cursor, ksd_hypr_client *client)
                 client->fullscreen = flag ? 1 : 0;
             } else {
                 ok = json_integer(cursor, &number);
-                client->fullscreen = number > 0 ? 1 : 0;
+                if (ok) client->fullscreen = number > 0 ? 1 : 0;
             }
-        } else if (strcmp(key, "focusHistoryID") == 0) {
-            ok = json_integer(cursor, &number);
-            if (ok)
-                client->focus_history = number < 0 || number > INT32_MAX
-                    ? INT32_MAX : (int32_t)number;
         } else
             ok = json_skip(cursor, 1);
         if (!ok)
@@ -584,28 +582,26 @@ static bool json_client(json_cursor *cursor, ksd_hypr_client *client)
         && address_valid(client->address);
 }
 
-bool ksd_wayland_hypr_parse_clients(const char *json, size_t length,
-                                    ksd_hypr_client **clients, size_t *count)
+static bool json_clients(json_cursor *cursor, ksd_hypr_client **clients, size_t *count)
 {
-    json_cursor cursor = { .at = json, .end = json + length };
     ksd_hypr_client *items = NULL;
     size_t used = 0u;
     size_t capacity = 0u;
 
     *clients = NULL;
     *count = 0u;
-    if (json == NULL || !json_take(&cursor, '['))
+    if (!json_take(cursor, '['))
         return false;
-    if (!json_take(&cursor, ']')) {
+    if (!json_take(cursor, ']')) {
         do {
             ksd_hypr_client client;
-            json_cursor start = cursor;
+            json_cursor start = *cursor;
 
-            if (!json_client(&cursor, &client)) {
+            if (!json_client(cursor, &client)) {
                 /* An element without the fields needed to address a
                  * client is skipped; only malformed JSON ends the parse. */
-                cursor = start;
-                if (!json_skip(&cursor, 1))
+                *cursor = start;
+                if (!json_skip(cursor, 1))
                     goto fail;
                 continue;
             }
@@ -621,9 +617,11 @@ bool ksd_wayland_hypr_parse_clients(const char *json, size_t length,
                 items = grown;
                 capacity = grown_capacity;
             }
+            /* Hyprland's client array follows the vector altered by its z-order dispatcher. */
+            client.stacking_order = (uint32_t)used;
             items[used++] = client;
-        } while (json_take(&cursor, ','));
-        if (!json_take(&cursor, ']'))
+        } while (json_take(cursor, ','));
+        if (!json_take(cursor, ']'))
             goto fail;
     }
     *clients = items;
@@ -632,6 +630,47 @@ bool ksd_wayland_hypr_parse_clients(const char *json, size_t length,
 
 fail:
     free(items);
+    return false;
+}
+
+bool ksd_wayland_hypr_parse_clients(const char *json, size_t length,
+                                    ksd_hypr_client **clients, size_t *count)
+{
+    *clients = NULL; *count = 0u;
+    if (json == NULL) return false;
+    json_cursor cursor = { .at = json, .end = json + length };
+    if (!json_clients(&cursor, clients, count)) return false;
+    json_space(&cursor);
+    if (cursor.at == cursor.end) return true;
+    free(*clients); *clients = NULL; *count = 0u;
+    return false;
+}
+
+bool ksd_wayland_hypr_parse_snapshot(const char *reply, size_t length,
+                                     ksd_hypr_client **clients, size_t *count)
+{
+    *clients = NULL; *count = 0u;
+    if (reply == NULL) return false;
+    json_cursor cursor = { .at = reply, .end = reply + length };
+    if (!json_clients(&cursor, clients, count)) return false;
+    /* Hyprland executes both queries together and separates their replies with three newlines. */
+    if (cursor.end - cursor.at < 3 || memcmp(cursor.at, "\n\n\n", 3u) != 0)
+        goto fail;
+    cursor.at += 3u;
+    ksd_hypr_client active = { 0 };
+    json_cursor empty = cursor;
+    if (json_take(&empty, '{') && json_take(&empty, '}'))
+        cursor = empty;
+    else if (!json_client(&cursor, &active))
+        goto fail;
+    json_space(&cursor);
+    if (cursor.at != cursor.end) goto fail;
+    for (size_t index = 0u; index < *count; index++)
+        (*clients)[index].active = strcmp((*clients)[index].stable_id, active.stable_id) == 0
+            && strcmp((*clients)[index].address, active.address) == 0;
+    return true;
+fail:
+    free(*clients); *clients = NULL; *count = 0u;
     return false;
 }
 
@@ -644,10 +683,10 @@ bool ksd_wayland_hypr_clients(pid_t session_pid, ksd_hypr_client **clients,
 
     *clients = NULL;
     *count = 0u;
-    if (!hypr_request_alloc(session_pid, "j/clients", KSD_HYPR_CLIENTS_LIMIT,
+    if (!hypr_request_alloc(session_pid, "[[BATCH]]j/clients;j/activewindow", KSD_HYPR_CLIENTS_LIMIT,
                             &reply, &length))
         return false;
-    parsed = ksd_wayland_hypr_parse_clients(reply, length, clients, count);
+    parsed = ksd_wayland_hypr_parse_snapshot(reply, length, clients, count);
     free(reply);
     return parsed;
 }

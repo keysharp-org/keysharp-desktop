@@ -314,6 +314,10 @@ static void check_registration_mask(void)
     assert(ksd_backend_registration_mask(KSD_BACKEND_GNOME, version, 0u,
                                          ~UINT64_C(0), &mask));
     assert(mask == ksd_backend_operations(KSD_BACKEND_GNOME));
+    assert((mask & KSD_OPERATION_WINDOW_SET_DECORATED) != 0u);
+    assert(ksd_backend_registration_mask(KSD_BACKEND_CINNAMON, version, 0u,
+                                         ~UINT64_C(0), &mask));
+    assert((mask & KSD_OPERATION_WINDOW_SET_DECORATED) == 0u);
 
     /* Asking for less yields less: this is the whole point of carrying it. */
     assert(ksd_backend_registration_mask(KSD_BACKEND_GNOME, version, 0u,

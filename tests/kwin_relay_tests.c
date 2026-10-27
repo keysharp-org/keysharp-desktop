@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* The relay is the one part of the KWin channel where several threads share a
@@ -27,6 +28,8 @@
  * relay that assumed otherwise would work in testing and fail on a desktop. */
 
 #define WORKERS 8u
+
+bool ksd_kwin_bus_test_transfer_failure(unsigned scenario);
 
 static void check_request_translation(void)
 {
@@ -298,6 +301,92 @@ static void check_deadline_reports_timeout(void)
     close(pair[1]);
 }
 
+typedef struct deadline_caller {
+    ksd_kwin_relay *relay;
+    ksd_frame request;
+    uint32_t timeout_ms;
+    uint32_t status;
+    uint64_t elapsed_ms;
+} deadline_caller;
+
+static void *deadline_caller_thread(void *data)
+{
+    deadline_caller *caller = data;
+    uint64_t started = ksd_monotonic_milliseconds();
+    ksd_operation_result result; ksd_result_init(&result);
+    assert(ksd_kwin_relay_call(caller->relay, &caller->request,
+        started + caller->timeout_ms, &result));
+    caller->status = result.status;
+    caller->elapsed_ms = ksd_monotonic_milliseconds() - started;
+    ksd_result_clear(&result);
+    return NULL;
+}
+
+/* A stopped reader must not trap the writer or later callers behind it. */
+static void check_write_deadlines(void)
+{
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+    int capacity = 1024;
+    assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)) == 0);
+    /* Bound a broken implementation too, so this regression fails rather than hangs. */
+    struct timeval fallback = { .tv_sec = 2 };
+    assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDTIMEO, &fallback, sizeof(fallback)) == 0);
+    ksd_kwin_relay *relay = ksd_kwin_relay_create(pair[0]);
+    assert(relay != NULL);
+    const uint32_t payload_length = 64u * 1024u;
+    uint8_t *payload = calloc(payload_length, 1u);
+    assert(payload != NULL);
+    deadline_caller writer = { .relay = relay, .timeout_ms = 600u,
+        .request = { .magic = { 'K', 'S', 'D', 'P' }, .major = KSD_PROTOCOL_MAJOR,
+            .minor = KSD_PROTOCOL_MINOR, .opcode = KSD_OP_WINDOW_SET_TITLE,
+            .payload = payload, .payload_length = payload_length } };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, deadline_caller_thread, &writer) == 0);
+    uint8_t byte;
+    assert(ksd_transfer_until(pair[1], &byte, 1u, false,
+        ksd_monotonic_milliseconds() + 1000u) == 1);
+    deadline_caller waiting = { .relay = relay, .timeout_ms = 100u,
+        .request = { .magic = { 'K', 'S', 'D', 'P' }, .major = KSD_PROTOCOL_MAJOR,
+            .minor = KSD_PROTOCOL_MINOR, .opcode = KSD_OP_WINDOW_FOCUS } };
+    deadline_caller_thread(&waiting);
+    assert(waiting.status == KSD_STATUS_BUSY && waiting.elapsed_ms < 350u);
+    assert(!ksd_kwin_relay_is_broken(relay));
+    assert(pthread_join(thread, NULL) == 0);
+    assert(writer.status == KSD_STATUS_TIMEOUT && writer.elapsed_ms < 1500u);
+    assert(ksd_kwin_relay_is_broken(relay));
+    free(payload);
+    ksd_kwin_relay_retire(relay);
+    close(pair[1]);
+}
+
+/* Each response waiter owns a deadline even while another caller reads. */
+static void check_response_waiter_deadline(void)
+{
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+    ksd_kwin_relay *relay = ksd_kwin_relay_create(pair[0]);
+    assert(relay != NULL);
+    deadline_caller reader = { .relay = relay, .timeout_ms = 1000u,
+        .request = { .magic = { 'K', 'S', 'D', 'P' }, .major = KSD_PROTOCOL_MAJOR,
+            .minor = KSD_PROTOCOL_MINOR, .opcode = KSD_OP_WINDOW_FOCUS } };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, deadline_caller_thread, &reader) == 0);
+    uint8_t header[KSD_FRAME_HEADER_SIZE];
+    assert(ksd_transfer_until(pair[1], header, sizeof(header), false,
+        ksd_monotonic_milliseconds() + 1000u) == (ssize_t)sizeof(header));
+    deadline_caller waiting = reader; waiting.timeout_ms = 100u;
+    deadline_caller_thread(&waiting);
+    assert(waiting.status == KSD_STATUS_TIMEOUT && waiting.elapsed_ms < 350u);
+    assert(!ksd_kwin_relay_is_broken(relay));
+    ksd_kwin_relay_acquire(relay);
+    ksd_kwin_relay_retire(relay);
+    assert(pthread_join(thread, NULL) == 0);
+    assert(reader.status == KSD_STATUS_TIMEOUT && reader.elapsed_ms < 500u);
+    ksd_kwin_relay_release(relay);
+    close(pair[1]);
+}
+
 /* A channel that has gone is UNAVAILABLE rather than a hang or a crash. */
 static void check_closed_channel(void)
 {
@@ -517,6 +606,10 @@ int main(void)
     check_response_translation();
     check_out_of_order_demux();
     check_deadline_reports_timeout();
+    check_write_deadlines();
+    check_response_waiter_deadline();
+    for (unsigned scenario = 0u; scenario < 3u; scenario++)
+        assert(ksd_kwin_bus_test_transfer_failure(scenario));
     check_closed_channel();
     check_unavailable_operation_keeps_transport();
     check_partial_write_does_not_wedge();

@@ -412,6 +412,8 @@ static uint32_t status_for_error(const GError *error)
         return KSD_STATUS_NOT_FOUND;
     if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED))
         return KSD_STATUS_DENIED;
+    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED))
+        return KSD_STATUS_UNSUPPORTED;
     return KSD_STATUS_UNAVAILABLE;
 }
 
@@ -1175,6 +1177,16 @@ static void execute_pointer(uid_t uid, pid_t provider_pid,
 }
 
 #ifdef KSD_AUTHORITY_TESTING
+bool ksd_provider_test_unsupported_error(void)
+{
+    GError *local = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "unsupported operation");
+    char *name = g_dbus_error_encode_gerror(local);
+    GError *remote = g_dbus_error_new_for_dbus_error(name, local->message);
+    bool ok = status_for_error(remote) == KSD_STATUS_UNSUPPORTED;
+    g_error_free(remote); g_free(name); g_error_free(local);
+    return ok;
+}
+
 int ksd_provider_test_capture_memfd(uint32_t width, uint32_t height,
                                     const uint8_t *data, size_t length)
 {

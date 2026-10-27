@@ -1,6 +1,7 @@
 #include "wl_windows.h"
 
 #include "protocol_io.h"
+#include "transport.h"
 #include "wl_internal.h"
 #include "wl_cosmic_windows.h"
 #include "wl_hypr_windows.h"
@@ -278,6 +279,15 @@ const ksd_wayland_window_view *ksd_wayland_current_window_view(ksd_wayland *conn
     return window_view(connection);
 }
 
+static bool cosmic_ready(void *data)
+{
+    const ksd_wayland *connection = data;
+    for (const ksd_wl_toplevel *item = connection->toplevels; item != NULL; item = item->next)
+        if (!item->closed && item->cosmic_handle != NULL && !item->ready)
+            return false;
+    return true;
+}
+
 bool ksd_wayland_windows_refresh(ksd_wayland *connection,
                                  const ksd_wayland_window_view *view,
                                  ksd_operation_result *result)
@@ -287,10 +297,22 @@ bool ksd_wayland_windows_refresh(ksd_wayland *connection,
                          "this compositor does not list its windows");
         return false;
     }
+    uint64_t deadline = ksd_monotonic_milliseconds() + KSD_WL_WINDOW_TIMEOUT_MS;
     if (!ksd_wayland_roundtrip(connection, KSD_WL_WINDOW_TIMEOUT_MS)) {
         ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
                          "the compositor did not answer");
         return false;
+    }
+    /* COSMIC publishes extension metadata after sync; only its done event
+     * commits a newly attached window's mandatory initial state. */
+    if (view == ksd_wayland_cosmic_window_view() && !cosmic_ready(connection)) {
+        uint64_t now = ksd_monotonic_milliseconds();
+        int remaining = deadline > now ? (int)(deadline - now) : 0;
+        if (!ksd_wayland_dispatch_until(connection, cosmic_ready, connection, remaining)) {
+            ksd_result_error(result, KSD_STATUS_TIMEOUT, 0u,
+                             "the compositor did not finish its window state");
+            return false;
+        }
     }
     sweep_closed(connection);
     if (view == ksd_wayland_hypr_window_view()

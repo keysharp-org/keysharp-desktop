@@ -611,10 +611,8 @@ const env = {
     makeImageContent: makeImageContent,
     captureArea: captureArea,
     captureWindow: captureWindow,
-    setDecorated: (win, decorated) => {
-        win.decorated = decorated;
-        return true;
-    },
+    // Muffin exposes decorated as read-only; assigning it cannot change a native window's frame.
+    setDecorated: () => null,
     workArea: workArea,
     maximizeFlags: CinnamonMeta.MaximizeFlags.BOTH,
     windowExtras: windowExtras,
@@ -1173,8 +1171,10 @@ class KeysharpExtensionCore {
             if (win && this._isLiveWindow(win) && this._isTrackedWindow(win))
                 this._emitWindowEvent('active', win);
         });
-        this._restackedId = global.display.connect('restacked', () =>
-            this._emitWindowEventRaw('snapshot', this._getWindowList(true)));
+        this._restackedId = global.display.connect('restacked', () => {
+            if (this._providerConnections.size > 0)
+                this._emitWindowEventRaw('snapshot', this._getWindowList(true));
+        });
 
         // The moment a reserved window can be placed WITHOUT a visible jump: 'map' fires as the actor is
         // about to be presented, before its first frame reaches the screen, so a move here is never seen.
@@ -1474,9 +1474,15 @@ class KeysharpExtensionCore {
         if (!this._requireProviderPeer(invocation))
             return;
 
-        let ok = false;
-        try { ok = Boolean(this[method](...params)); } catch (_e) {}
-        invocation.return_value(new GLib.Variant('(b)', [ok]));
+        // Internal setters return null when the compositor cannot perform this operation.
+        let result = false;
+        try { result = this[method](...params); } catch (_e) {}
+        if (result === null) {
+            invocation.return_error_literal(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_SUPPORTED,
+                'This compositor cannot apply the requested operation.');
+            return;
+        }
+        invocation.return_value(new GLib.Variant('(b)', [Boolean(result)]));
     }
 
     GetWindowListAsync(params, invocation) {
@@ -1797,6 +1803,8 @@ class KeysharpExtensionCore {
         const ny = (y !== INT32_MIN) ? y : frame.y;
         const nw = (width  > 0) ? width  : frame.width;
         const nh = (height > 0) ? height : frame.height;
+        if (nx === frame.x && ny === frame.y && nw === frame.width && nh === frame.height)
+            return true;
 
         // move_resize_frame is the single Mutter call for both move and resize;
         // win.resize() does not exist as a standalone public API in Mutter/GJS.
@@ -2082,11 +2090,13 @@ class KeysharpExtensionCore {
 
         try {
             if (state === STATE_MINIMIZED) {
-                win.minimize();
+                if (!win.minimized)
+                    win.minimize();
             } else if (state === STATE_MAXIMIZED) {
                 if (win.minimized)
                     win.unminimize();
-                win.maximize(env.maximizeFlags);
+                if (!win.maximized_horizontally || !win.maximized_vertically)
+                    win.maximize(env.maximizeFlags);
             } else if (state === STATE_UNMINIMIZED) {
                 if (win.minimized)
                     win.unminimize();
@@ -3014,6 +3024,7 @@ class KeysharpExtensionCore {
     }
     _emitWindowEvent(type, win) {
         if (!win) return false;
+        if (this._providerConnections.size === 0) return true;
         try {
             this._emitWindowEventRaw(type, JSON.stringify(this._windowInfo(win)));
             return true;
@@ -3023,6 +3034,8 @@ class KeysharpExtensionCore {
     }
 
     _refreshMappedWindow(win) {
+        if (this._providerConnections.size === 0)
+            return;
         const previous = this._mapRefreshSources.get(win);
         if (previous)
             GLib.source_remove(previous);
@@ -3082,6 +3095,9 @@ class KeysharpExtensionCore {
             () => this._emitWindowEvent(win.minimized ? 'minimize' : 'restore', win)));
         ids.push(win.connect('position-changed', () => this._emitWindowEvent('move', win)));
         ids.push(win.connect('size-changed',     () => this._emitWindowEvent('move', win)));
+        // These changes need not move, resize or restack the window, so geometry signals cannot fence them.
+        for (const property of ['above', 'decorated', 'maximized-horizontally', 'maximized-vertically'])
+            ids.push(win.connect('notify::' + property, () => this._emitWindowEvent('changed', win)));
         ids.push(win.connect('unmanaged', () => {
             try {
                 this._emitWindowEventRaw('close',
@@ -3100,8 +3116,11 @@ class KeysharpExtensionCore {
         if (!actor)
             return;
         win._keysharpVisibleActor = actor;
-        win._keysharpVisibleId = actor.connect('notify::visible', () =>
-            this._emitWindowEvent(actor.visible ? 'show' : 'hide', win));
+        win._keysharpActorSignalIds = [
+            actor.connect('notify::visible', () =>
+                this._emitWindowEvent(actor.visible ? 'show' : 'hide', win)),
+            actor.connect('notify::opacity', () => this._emitWindowEvent('changed', win)),
+        ];
     }
 
     _unhookWindow(win) {
@@ -3118,9 +3137,11 @@ class KeysharpExtensionCore {
             try { win.disconnect(id); } catch (_e) {}
         }
         if (win._keysharpVisibleActor) {
-            try { win._keysharpVisibleActor.disconnect(win._keysharpVisibleId); } catch (_e) {}
+            for (const id of win._keysharpActorSignalIds || []) {
+                try { win._keysharpVisibleActor.disconnect(id); } catch (_e) {}
+            }
             win._keysharpVisibleActor = null;
-            win._keysharpVisibleId = 0;
+            win._keysharpActorSignalIds = [];
         }
         win._keysharpHandlerIds = null;
         win._keysharpHooked = false;
