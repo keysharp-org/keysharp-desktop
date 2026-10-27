@@ -185,21 +185,14 @@ static void emit_event(void *context, uint16_t kind, uint64_t id)
 
 /* A refresh that fails is not diffed: its empty list would read as every
  * window closing. */
-static bool refresh(window_watch *watch, bool emit)
+static bool update_windows(window_watch *watch, bool emit)
 {
-    ksd_operation_result result;
     ksd_window_record *windows;
     size_t count;
-    bool refreshed;
 
-    ksd_result_init(&result);
-    alarm(10u);
-    refreshed = ksd_wayland_windows_refresh(watch->connection, watch->view,
-                                            &result)
-        && snapshot(watch, &windows, &count);
-    alarm(0u);
-    ksd_result_clear(&result);
-    if (!refreshed)
+    if (watch->view == NULL)
+        return true;
+    if (!snapshot(watch, &windows, &count))
         return false;
     ksd_window_record *previous = watch->windows;
     size_t previous_count = watch->count;
@@ -209,6 +202,24 @@ static bool refresh(window_watch *watch, bool emit)
         ksd_wayland_watch_diff(previous, previous_count, windows, count, emit_event, watch);
     clear_windows(previous, previous_count);
     return true;
+}
+
+static bool refresh(window_watch *watch, bool emit, bool auxiliary)
+{
+    ksd_operation_result result;
+    ksd_result_init(&result);
+    alarm(10u);
+    bool refreshed = watch->view == NULL
+        || ksd_wayland_windows_refresh(watch->connection, watch->view, &result);
+    alarm(0u);
+    ksd_result_clear(&result);
+    if (!refreshed || (auxiliary
+        && (!auxiliary_state(watch, KSD_STATE_KEYBOARD, false)
+            || !auxiliary_state(watch, KSD_STATE_DISPLAYS, false))))
+        return false;
+    /* Auxiliary round trips dispatch window events too; capture their changes
+     * before returning to an idle native watch. */
+    return update_windows(watch, emit);
 }
 
 static void on_event_line(void *context, const char *name)
@@ -289,21 +300,32 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
     ok = true;
     if (hypr)
         events_fd = ksd_wayland_hypr_events_open(connection->session_pid);
-    ok = (!hypr || events_fd >= 0) && (watch.view == NULL || refresh(&watch, false));
+    ok = (!hypr || events_fd >= 0) && refresh(&watch, false, false);
     ksd_encode_u32(answer, ok ? KSD_STATUS_OK : KSD_STATUS_UNAVAILABLE);
     ksd_encode_u32(answer + 4u, hypr ? KSD_WATCH_SAMPLED_WINDOWS : 0u);
     ok = write_frame(stream_fd, 0u, 0u, request_id, answer, sizeof(answer))
         && ok;
-    if (ok) ok = initial_windows(&watch) && auxiliary_state(&watch, KSD_STATE_KEYBOARD, true)
-        && auxiliary_state(&watch, KSD_STATE_DISPLAYS, true);
+    if (ok) ok = auxiliary_state(&watch, KSD_STATE_KEYBOARD, true)
+        && auxiliary_state(&watch, KSD_STATE_DISPLAYS, true)
+        && update_windows(&watch, false) && initial_windows(&watch);
     alarm(0u);
     last_refresh = ksd_monotonic_milliseconds();
     next_tick = last_refresh + KSD_WATCH_TICK_MS;
     while (ok && !watch.failed) {
+        short display_events = POLLIN;
+        /* A toplevel announced during a round trip may have queued its COSMIC
+         * metadata request after that round trip was flushed. */
+        if (wl_display_flush(connection->display) < 0) {
+            if (errno != EAGAIN) {
+                ok = false;
+                break;
+            }
+            display_events |= POLLOUT;
+        }
         struct pollfd descriptors[3] = {
             { .fd = stream_fd, .events = POLLIN | POLLHUP | POLLERR },
             { .fd = wl_display_get_fd(connection->display),
-              .events = POLLIN },
+              .events = display_events },
             { .fd = events_fd, .events = POLLIN },
         };
         uint64_t now = ksd_monotonic_milliseconds();
@@ -326,11 +348,13 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
         }
         if (descriptors[1].revents != 0) {
             if ((descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
-                || !ksd_wayland_dispatch_ready(connection)) {
+                || ((descriptors[1].revents & POLLIN) != 0
+                    && !ksd_wayland_dispatch_ready(connection))) {
                 ok = false;
                 break;
             }
-            watch.dirty = true;
+            if ((descriptors[1].revents & POLLIN) != 0)
+                watch.dirty = true;
         }
         if (descriptors[2].revents != 0
             && !read_events(&watch, events_fd, &reader)) {
@@ -342,9 +366,7 @@ bool ksd_wayland_watch_run(ksd_wayland *connection, int stream_fd,
             || (watch.dirty && (!hypr || now >= last_refresh + KSD_WATCH_COALESCE_MS));
         if (!requested && !scheduled)
             continue;
-        if ((watch.view == NULL || refresh(&watch, true))
-            && (!scheduled || (auxiliary_state(&watch, KSD_STATE_KEYBOARD, false)
-                && auxiliary_state(&watch, KSD_STATE_DISPLAYS, false))))
+        if (refresh(&watch, true, scheduled))
             failures = 0u;
         else if (++failures >= KSD_WATCH_REFRESH_FAILURES)
             ok = false;

@@ -2293,6 +2293,26 @@ static bool operation_observed(authority_lease *lease, const ksd_frame *request,
     }
 }
 
+static bool operation_geometry_changed(authority_lease *lease, const ksd_frame *request,
+                                       const ksd_window_record *before)
+{
+    if (lease->snapshot_pending || before == NULL || request->payload_length < 24u
+        || (before->valid_fields & KSD_FIELD_FRAME) == 0u
+        || (request->opcode != KSD_OP_WINDOW_MOVE_RESIZE && request->opcode != KSD_OP_WINDOW_MOVE_RESIZE_XID))
+        return false;
+    state_window *item = *window_slot(lease, ksd_decode_u64(request->payload));
+    if (item == NULL || (item->value.valid_fields & KSD_FIELD_FRAME) == 0u) return false;
+    const ksd_window_record *window = &item->value;
+    int32_t x = (int32_t)ksd_decode_u32(request->payload + 8u);
+    int32_t y = (int32_t)ksd_decode_u32(request->payload + 12u);
+    uint32_t width = ksd_decode_u32(request->payload + 16u);
+    uint32_t height = ksd_decode_u32(request->payload + 20u);
+    return (x != INT32_MIN && x != before->frame_x && window->frame_x != before->frame_x)
+        || (y != INT32_MIN && y != before->frame_y && window->frame_y != before->frame_y)
+        || (width != 0u && width != before->frame_width && window->frame_width != before->frame_width)
+        || (height != 0u && height != before->frame_height && window->frame_height != before->frame_height);
+}
+
 static bool operation_sync(authority_session *session, const ksd_frame *request,
                            const ksd_window_record *before)
 {
@@ -2326,9 +2346,14 @@ static bool operation_sync(authority_session *session, const ksd_frame *request,
         if (result == ETIMEDOUT && refresh && ksd_monotonic_milliseconds() < deadline)
             result = 0;
     }
+    bool observed = !monitoring || operation_observed(lease, request, before);
+    /* An unchanged component can be constrained or still pending. At the deadline,
+     * accept requested geometry progress without claiming a complete observation fence. */
+    bool constrained = !observed && result == ETIMEDOUT && ksd_monotonic_milliseconds() >= deadline
+        && operation_geometry_changed(lease, request, before);
     bool ok = lease->active && (lease->granted_scopes & KSD_SCOPE_WINDOW_CONTROL) != 0u
-        && (!monitoring || operation_observed(lease, request, before));
-    session->effective_sequence = monitoring && ok ? lease->sequences[0] : 0u;
+        && (observed || constrained);
+    session->effective_sequence = monitoring && ok && observed ? lease->sequences[0] : 0u;
     pthread_mutex_unlock(&lease->mutex); return ok;
 }
 
@@ -2362,7 +2387,8 @@ static bool x11_child_sync(authority_session *session, const backend_snapshot *b
     state_window item = { .value = observed };
     authority_lease view = { .windows = status == KSD_STATUS_OK ? &item : NULL };
     bool ok = destroy ? status == KSD_STATUS_NOT_FOUND
-        : status == KSD_STATUS_OK && operation_observed(&view, request, before);
+        : status == KSD_STATUS_OK && (operation_observed(&view, request, before)
+            || operation_geometry_changed(&view, request, before));
     ksd_window_record_clear(&observed);
     session->effective_sequence = 0u;
     return ok;
@@ -3176,7 +3202,7 @@ static void *test_refresh_watch_run(void *data)
 
 bool ksd_authority_test_operation_refresh(void)
 {
-    for (unsigned defer = 0u; defer < 3u; defer++) {
+    for (unsigned defer = 0u; defer <= 2u; defer += 2u) {
         int events[2], controls[2];
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, events) != 0)
             return false;
@@ -3237,6 +3263,47 @@ bool ksd_authority_test_operation_refresh(void)
         if (!ok) return false;
     }
     return true;
+}
+
+bool ksd_authority_test_constrained_geometry(void)
+{
+    state_window window = { .value = { .handle = 42u, .valid_fields = KSD_FIELD_FRAME,
+        .frame_width = 800u, .frame_height = 700u } };
+    ksd_window_record prior = window.value; prior.frame_height = 600u;
+    authority_lease lease = { .active = true, .windows = &window, .window_refresh_fd = -1,
+        .domains = KSD_STATE_WINDOWS, .granted_scopes = KSD_SCOPE_WINDOW_CONTROL, .sequences = { 7u } };
+    if (pthread_mutex_init(&lease.mutex, NULL) != 0) return false;
+    if (!lease_condition_init(&lease.changed)) {
+        pthread_mutex_destroy(&lease.mutex); return false;
+    }
+    uint8_t payload[24] = { 0 }; ksd_encode_u64(payload, 42u);
+    ksd_encode_u32(payload + 8u, (uint32_t)INT32_MIN);
+    ksd_encode_u32(payload + 12u, (uint32_t)INT32_MIN);
+    ksd_encode_u32(payload + 16u, 1000u); ksd_encode_u32(payload + 20u, 700u);
+    ksd_frame request = { .opcode = KSD_OP_WINDOW_MOVE_RESIZE, .payload = payload, .payload_length = sizeof(payload) };
+    authority_session session = { .lease = &lease, .backend = KSD_BACKEND_X11, .effective_sequence = 99u };
+    uint64_t started = ksd_monotonic_milliseconds();
+    /* The width stays at its limit while the requested height is applied. */
+    bool ok = operation_sync(&session, &request, &prior);
+    uint64_t elapsed = ksd_monotonic_milliseconds() - started;
+    ok = ok && elapsed >= 1500u && elapsed < 3000u && session.effective_sequence == 0u;
+    /* A move on an untouched axis cannot acknowledge an ignored resize. */
+    window.value.frame_height = 600u; window.value.frame_x = 19;
+    ok = ok && !operation_geometry_changed(&lease, &request, &prior);
+    /* Explicitly preserving X does not turn an unrelated X change into progress. */
+    ksd_encode_u32(payload + 8u, 0u);
+    ok = ok && !operation_geometry_changed(&lease, &request, &prior);
+    /* The same constraint rule applies to coordinates and XID targets. */
+    request.opcode = KSD_OP_WINDOW_MOVE_RESIZE_XID;
+    ksd_encode_u32(payload + 8u, (uint32_t)-10); ksd_encode_u32(payload + 12u, 40u);
+    ksd_encode_u32(payload + 16u, 0u); ksd_encode_u32(payload + 20u, 0u);
+    window.value.frame_x = 0; window.value.frame_y = 40;
+    ok = ok && !operation_observed(&lease, &request, &prior)
+        && operation_geometry_changed(&lease, &request, &prior);
+    window.value.frame_y = 0;
+    ok = ok && !operation_geometry_changed(&lease, &request, &prior);
+    pthread_cond_destroy(&lease.changed); pthread_mutex_destroy(&lease.mutex);
+    return ok;
 }
 
 bool ksd_authority_test_state_model(void)

@@ -41,8 +41,12 @@ worker transition and disconnect behavior.
 
 Window mutations do not add a fixed settling sleep. When a caller subscribes to
 window state, the authority waits for the requested effect to appear in that
-state before returning its observation sequence. The two-second bound is a
-failure timeout, not a delay applied to successful operations. KWin does not
+state before returning its observation sequence. Fully observed operations
+return immediately. If a move or resize changes a requested component but leaves
+another unchanged, constraints cannot be distinguished from a pending update.
+The authority waits up to two seconds, then returns success with sequence zero
+if that geometry progress remains visible. This claims no complete observation
+fence. An entirely unchanged or unrelated result still times out. KWin does not
 provide window subscriptions, so its script reply carries no observation fence.
 
 GNOME and Cinnamon report geometry and property changes directly, including

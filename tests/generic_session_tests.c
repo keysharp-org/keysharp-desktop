@@ -36,6 +36,7 @@ bool ksd_authority_test_display_lanes(void);
 bool ksd_authority_test_state_model(void);
 bool ksd_authority_test_state_watch_request(void);
 bool ksd_authority_test_operation_refresh(void);
+bool ksd_authority_test_constrained_geometry(void);
 bool ksd_provider_test_unsupported_error(void);
 
 /* GENERIC is exempt from the session cross-check because it means "no
@@ -462,6 +463,7 @@ int main(void)
     assert(ksd_authority_test_state_model());
     assert(ksd_authority_test_state_watch_request());
     assert(ksd_authority_test_operation_refresh());
+    assert(ksd_authority_test_constrained_geometry());
     assert(ksd_provider_test_unsupported_error());
 
     struct timeval receive_timeout = { .tv_sec = 30, .tv_usec = 0 };

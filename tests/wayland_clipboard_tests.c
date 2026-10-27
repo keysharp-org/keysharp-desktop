@@ -23,6 +23,7 @@
 #include "state_wire.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -50,6 +51,8 @@
 
 extern int ksd_wayland_clipboard_timeout_ms;
 static int observed_requests_fd = -1;
+static struct wl_client *watch_update_client;
+static unsigned watch_update_serial;
 
 /* ---------------------------------------------------------------- server -- */
 
@@ -583,6 +586,7 @@ static void cosmic_manager_set_fullscreen(struct wl_client *client,
     (void)resource;
     (void)toplevel;
     (void)output;
+    assert(false);
 }
 
 static void cosmic_manager_unset_fullscreen(struct wl_client *client,
@@ -592,6 +596,7 @@ static void cosmic_manager_unset_fullscreen(struct wl_client *client,
     (void)client;
     (void)resource;
     (void)toplevel;
+    assert(false);
 }
 
 static void cosmic_manager_set_rectangle(
@@ -1434,6 +1439,24 @@ static void bind_pointer_manager(struct wl_client *client, void *data,
                                    NULL);
 }
 
+static enum wl_iterator_result update_watch_title(struct wl_resource *resource, void *data)
+{
+    if (strcmp(wl_resource_get_class(resource), "ext_foreign_toplevel_handle_v1") == 0
+        && (uintptr_t)wl_resource_get_user_data(resource) == 1u) {
+        ext_foreign_toplevel_handle_v1_send_title(resource, data);
+        ext_foreign_toplevel_handle_v1_send_done(resource);
+    }
+    return WL_ITERATOR_CONTINUE;
+}
+
+static int trigger_watch_update(int number, void *data)
+{
+    (void)number; (void)data;
+    assert(watch_update_client != NULL);
+    wl_client_for_each_resource(watch_update_client, update_watch_title, "native-trigger");
+    return 0;
+}
+
 static void observe_window_requests(void *data, enum wl_protocol_logger_type direction,
                                      const struct wl_protocol_logger_message *message)
 {
@@ -1452,6 +1475,13 @@ static void observe_window_requests(void *data, enum wl_protocol_logger_type dir
         else if (strcmp(name, "set_minimized") == 0 || strcmp(name, "unset_minimized") == 0
             || strcmp(name, "set_maximized") == 0 || strcmp(name, "unset_maximized") == 0)
             marker = 'm';
+    }
+    if (marker == 's' && strcmp(server_mode(), "cosmic-watch-updates") == 0) {
+        char title[32];
+        snprintf(title, sizeof(title), "watch-%u", ++watch_update_serial);
+        watch_update_client = wl_resource_get_client(message->resource);
+        /* Every round trip changes a window, including keyboard/display queries. */
+        wl_client_for_each_resource(watch_update_client, update_watch_title, title);
     }
     if (marker != 0) assert(write(observed_requests_fd, &marker, 1u) == 1);
 }
@@ -1472,6 +1502,9 @@ static void run_server(const char *socket_name, int ready)
         _exit(1);
     if (observed_requests_fd >= 0)
         assert(wl_display_add_protocol_logger(display, observe_window_requests, NULL) != NULL);
+    if (strcmp(server_mode(), "cosmic-watch-updates") == 0)
+        assert(wl_event_loop_add_signal(wl_display_get_event_loop(display), SIGUSR1,
+                                        trigger_watch_update, NULL) != NULL);
     if (wl_display_add_socket(display, socket_name) != 0)
         _exit(1);
     if (wl_global_create(display, &ext_data_control_manager_v1_interface, 1,
@@ -1603,9 +1636,48 @@ static ksd_frame read_watch_frame(int descriptor)
     return frame;
 }
 
+static unsigned read_watch_syncs(int descriptor)
+{
+    char bytes[128];
+    unsigned syncs = 0u;
+    for (;;) {
+        ssize_t count = read(descriptor, bytes, sizeof(bytes));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return syncs;
+        assert(count > 0);
+        for (ssize_t index = 0; index < count; index++) assert(bytes[index] == 's');
+        syncs += (unsigned)count;
+    }
+}
+
+static unsigned watch_title_revision(const ksd_window_record *window)
+{
+    char title[32];
+    unsigned revision;
+    assert(window->title.length < sizeof(title));
+    memcpy(title, window->title.data, window->title.length);
+    title[window->title.length] = '\0';
+    assert(sscanf(title, "watch-%u", &revision) == 1);
+    return revision;
+}
+
+static unsigned read_watch_update(int descriptor)
+{
+    for (;;) {
+        ksd_frame frame = read_watch_frame(descriptor);
+        ksd_state_event event; ksd_state_event_init(&event);
+        assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
+        bool window = event.domain == KSD_STATE_WINDOWS;
+        unsigned revision = window ? watch_title_revision(&event.window) : 0u;
+        ksd_state_event_clear(&event); ksd_frame_clear(&frame);
+        if (window) return revision;
+    }
+}
+
 static void check_window_watch(const char *socket_name, const char *mode)
 {
     bool stalled = strcmp(mode, "cosmic-bootstrap-stalled") == 0;
+    bool updates = strcmp(mode, "cosmic-watch-updates") == 0;
     unsigned expected = strcmp(mode, "cosmic-empty") == 0 ? 0u
         : strcmp(mode, "cosmic-bootstrap-closed") == 0 ? 1u : 2u;
     int syncs[2];
@@ -1615,119 +1687,124 @@ static void check_window_watch(const char *socket_name, const char *mode)
     observed_requests_fd = -1;
     close(syncs[1]);
 
-    for (unsigned invalid = 0u; invalid < (stalled ? 1u : 2u); invalid++) {
-        int stream[2];
-        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stream) == 0);
-        pid_t watcher = fork();
-        assert(watcher >= 0);
-        if (watcher == 0) {
-            prctl(PR_SET_PDEATHSIG, SIGKILL);
-            if (getppid() == 1) _exit(1);
-            close(stream[0]); close(syncs[0]);
-            ksd_wayland *connection = NULL;
-            assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
-            assert(ksd_wayland_supported(connection).toplevel_events
-                   == (strncmp(mode, "cosmic", 6u) == 0));
-            bool ok = ksd_wayland_watch_run(connection, stream[1], 123u);
-            ksd_wayland_close(connection); close(stream[1]);
-            _exit(ok ? 0 : 1);
-        }
-        close(stream[1]);
-        if (stalled) {
-            struct pollfd answer = { .fd = stream[0], .events = POLLIN };
-            assert(poll(&answer, 1u, 3000) == 1);
-        }
-        ksd_frame frame = read_watch_frame(stream[0]);
-        assert(frame.opcode == 0u && frame.flags == 0u && frame.request_id == 123u);
-        assert(frame.payload_length == 8u && ksd_decode_u32(frame.payload)
-               == (stalled ? KSD_STATUS_UNAVAILABLE : KSD_STATUS_OK));
-        /* Native protocol events do not need the authority's sampled-window retries. */
-        assert(ksd_decode_u32(frame.payload + 4u) == 0u);
-        ksd_frame_clear(&frame);
-        if (stalled) {
-            /* Failed bootstrap cannot publish an authoritative empty snapshot. */
-            struct pollfd ended = { .fd = stream[0], .events = POLLIN };
-            char byte;
-            assert(poll(&ended, 1u, 1000) == 1);
-            assert(recv(stream[0], &byte, 1u, 0) == 0);
-            int status;
-            assert(waitpid(watcher, &status, 0) == watcher && WIFEXITED(status));
-            assert(WEXITSTATUS(status) == 1);
-            close(stream[0]);
-            continue;
-        }
-        bool windows = false, keyboard = false, displays = strncmp(mode, "cosmic", 6u) != 0;
-        unsigned count = 0u;
-        unsigned capture_ids = 0u;
-        while (!windows || !keyboard || !displays) {
-            frame = read_watch_frame(stream[0]);
-            ksd_state_event event; ksd_state_event_init(&event);
-            assert(frame.opcode == KSD_OP_STATE_EVENT && frame.flags == KSD_FLAG_EVENT);
-            assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
-            if (event.domain == KSD_STATE_WINDOWS) {
-                if (event.kind == KSD_STATE_SNAPSHOT_ITEM) {
-                    count++;
-                    if (strncmp(mode, "cosmic", 6u) == 0) {
-                        const ksd_window_record *window = &event.window;
-                        assert((window->valid_fields & KSD_FIELD_CAPTURE_ID) != 0u);
-                        assert(window->capture_id.length == 6u
-                               && (memcmp(window->capture_id.data, "id-one", 6u) == 0
-                                   || memcmp(window->capture_id.data, "id-two", 6u) == 0));
-                        unsigned bit = memcmp(window->capture_id.data, "id-one", 6u) == 0 ? 1u : 2u;
-                        assert((capture_ids & bit) == 0u);
-                        capture_ids |= bit;
-                        assert((window->valid_fields & KSD_FIELD_FRAME) != 0u
-                               && window->frame_width == 2u && window->frame_height == 1u);
-                    }
-                }
-                if (event.kind == KSD_STATE_SNAPSHOT_END) {
-                    assert(count == expected);
-                    if (strncmp(mode, "cosmic", 6u) == 0)
-                        assert(capture_ids == (expected == 2u ? 3u : expected));
-                    windows = true;
-                }
-            }
-            if (event.domain == KSD_STATE_DISPLAYS && event.kind == KSD_STATE_SNAPSHOT_END)
-                displays = true;
-            if (event.domain == KSD_STATE_KEYBOARD && event.kind == KSD_STATE_SNAPSHOT_END)
-                keyboard = true;
-            ksd_state_event_clear(&event); ksd_frame_clear(&frame);
-        }
-        assert(count == expected);
-        struct pollfd marker = { .fd = syncs[0], .events = POLLIN };
-        char bytes[128];
-        /* Snapshot ends establish that the initial auxiliary round trips have completed. */
-        unsigned initial_syncs = 0u;
-        while (poll(&marker, 1u, 0) == 1) {
-            assert(++initial_syncs < 16u);
-            assert(read(syncs[0], bytes, sizeof(bytes)) > 0);
-        }
-        /* A native event source stays idle beyond the sampled-window retry interval. */
-        assert(poll(&marker, 1u, 350) == 0);
-        for (unsigned batch = 1u; batch <= 3u; batch += 2u) {
-            const uint8_t refreshes[3] = {
-                KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE,
-            };
-            assert(send(stream[0], refreshes, batch, MSG_NOSIGNAL) == (ssize_t)batch);
-            assert(poll(&marker, 1u, 1000) == 1);
-            /* One snapshot round trip proves processing; auxiliary state stays asleep. */
-            assert(read(syncs[0], bytes, sizeof(bytes)) == 1);
-            assert(poll(&marker, 1u, 50) == 0);
-        }
-        if (invalid) {
-            const uint8_t byte = 0xffu;
-            assert(send(stream[0], &byte, 1u, MSG_NOSIGNAL) == 1);
-        } else {
-            assert(shutdown(stream[0], SHUT_WR) == 0);
-        }
+    int stream[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stream) == 0);
+    pid_t watcher = fork();
+    assert(watcher >= 0);
+    if (watcher == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() == 1) _exit(1);
+        close(stream[0]); close(syncs[0]);
+        ksd_wayland *connection = NULL;
+        assert(ksd_wayland_open(socket_name, &connection) == KSD_STATUS_OK);
+        assert(ksd_wayland_supported(connection).toplevel_events);
+        bool ok = ksd_wayland_watch_run(connection, stream[1], 123u);
+        ksd_wayland_close(connection); close(stream[1]);
+        _exit(ok ? 0 : 1);
+    }
+    close(stream[1]);
+    if (stalled) {
+        struct pollfd answer = { .fd = stream[0], .events = POLLIN };
+        assert(poll(&answer, 1u, 3000) == 1);
+    }
+    ksd_frame frame = read_watch_frame(stream[0]);
+    assert(frame.opcode == 0u && frame.flags == 0u && frame.request_id == 123u);
+    assert(frame.payload_length == 8u && ksd_decode_u32(frame.payload)
+           == (stalled ? KSD_STATUS_UNAVAILABLE : KSD_STATUS_OK));
+    /* Native protocol events do not need the authority's sampled-window retries. */
+    assert(ksd_decode_u32(frame.payload + 4u) == 0u);
+    ksd_frame_clear(&frame);
+    if (stalled) {
+        /* Failed bootstrap cannot publish an authoritative empty snapshot. */
         struct pollfd ended = { .fd = stream[0], .events = POLLIN };
+        char byte;
         assert(poll(&ended, 1u, 1000) == 1);
-        assert(recv(stream[0], bytes, sizeof(bytes), 0) == 0);
+        assert(recv(stream[0], &byte, 1u, 0) == 0);
         int status;
         assert(waitpid(watcher, &status, 0) == watcher && WIFEXITED(status));
-        if (!invalid) assert(WEXITSTATUS(status) == 0);
+        assert(WEXITSTATUS(status) == 1);
         close(stream[0]);
+        close(syncs[0]);
+        stop_server(server);
+        return;
     }
+    bool windows = false, keyboard = false, displays = false;
+    unsigned count = 0u;
+    unsigned capture_ids = 0u;
+    unsigned title_revision = 0u;
+    while (!windows || !keyboard || !displays) {
+        frame = read_watch_frame(stream[0]);
+        ksd_state_event event; ksd_state_event_init(&event);
+        assert(frame.opcode == KSD_OP_STATE_EVENT && frame.flags == KSD_FLAG_EVENT);
+        assert(ksd_state_event_decode(frame.payload, frame.payload_length, &event));
+        if (event.domain == KSD_STATE_WINDOWS) {
+            if (event.kind == KSD_STATE_SNAPSHOT_ITEM) {
+                count++;
+                if (strncmp(mode, "cosmic", 6u) == 0) {
+                    const ksd_window_record *window = &event.window;
+                    assert((window->valid_fields & KSD_FIELD_CAPTURE_ID) != 0u);
+                    assert(window->capture_id.length == 6u
+                           && (memcmp(window->capture_id.data, "id-one", 6u) == 0
+                               || memcmp(window->capture_id.data, "id-two", 6u) == 0));
+                    unsigned bit = memcmp(window->capture_id.data, "id-one", 6u) == 0 ? 1u : 2u;
+                    if (updates && bit == 1u)
+                        title_revision = watch_title_revision(window);
+                    assert((capture_ids & bit) == 0u);
+                    capture_ids |= bit;
+                    assert((window->valid_fields & KSD_FIELD_FRAME) != 0u
+                           && window->frame_width == 2u && window->frame_height == 1u);
+                }
+            }
+            if (event.kind == KSD_STATE_SNAPSHOT_END) {
+                assert(count == expected);
+                if (strncmp(mode, "cosmic", 6u) == 0)
+                    assert(capture_ids == (expected == 2u ? 3u : expected));
+                windows = true;
+            }
+        }
+        if (event.domain == KSD_STATE_DISPLAYS && event.kind == KSD_STATE_SNAPSHOT_END)
+            displays = true;
+        if (event.domain == KSD_STATE_KEYBOARD && event.kind == KSD_STATE_SNAPSHOT_END)
+            keyboard = true;
+        ksd_state_event_clear(&event); ksd_frame_clear(&frame);
+    }
+    struct pollfd marker = { .fd = syncs[0], .events = POLLIN };
+    char bytes[128];
+    if (updates) {
+        /* Snapshot ends establish that the initial auxiliary round trips have completed. */
+        unsigned total_syncs = read_watch_syncs(syncs[0]);
+        assert(title_revision == total_syncs);
+        /* A native event source stays idle beyond the sampled-window retry interval. */
+        assert(poll(&marker, 1u, 350) == 0);
+        assert(kill(server, SIGUSR1) == 0);
+        title_revision = read_watch_update(stream[0]);
+        total_syncs += read_watch_syncs(syncs[0]);
+        /* The final title includes changes dispatched by both auxiliary queries. */
+        assert(title_revision == total_syncs);
+        assert(poll(&marker, 1u, 350) == 0);
+        const uint8_t refreshes[3] = {
+            KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE, KSD_WATCH_REFRESH_BYTE,
+        };
+        assert(send(stream[0], refreshes, sizeof(refreshes), MSG_NOSIGNAL) == sizeof(refreshes));
+        assert(poll(&marker, 1u, 1000) == 1);
+        /* Coalesced window-only samples leave auxiliary state asleep. */
+        assert(read(syncs[0], bytes, sizeof(bytes)) == 1);
+        assert(read_watch_update(stream[0]) == ++total_syncs);
+        assert(poll(&marker, 1u, 50) == 0);
+    }
+    if (updates) {
+        const uint8_t byte = 0xffu;
+        assert(send(stream[0], &byte, 1u, MSG_NOSIGNAL) == 1);
+    } else {
+        assert(shutdown(stream[0], SHUT_WR) == 0);
+    }
+    struct pollfd ended = { .fd = stream[0], .events = POLLIN };
+    assert(poll(&ended, 1u, 1000) == 1);
+    assert(recv(stream[0], bytes, sizeof(bytes), 0) == 0);
+    int status;
+    assert(waitpid(watcher, &status, 0) == watcher && WIFEXITED(status));
+    if (!updates) assert(WEXITSTATUS(status) == 0);
+    close(stream[0]);
     close(syncs[0]);
     stop_server(server);
 }
@@ -1914,7 +1991,6 @@ static void check_state_noops(const char *socket_name, const char *mode)
     ksd_wayland_window_list(connection, true, &result);
     assert(result.status == KSD_STATUS_OK);
     uint64_t first = window_handle_at(&result, 0u);
-    uint64_t second = window_handle_at(&result, 1u);
     ksd_result_clear(&result);
     char pending[128];
     while (read(requests[0], pending, sizeof(pending)) > 0) { }
@@ -1930,12 +2006,11 @@ static void check_state_noops(const char *socket_name, const char *mode)
             { 1u, "sms" }, { 1u, "s" },
             { 2u, "smms" }, { 2u, "s" },
             { 3u, "s" },
-            { 1u, "sms" }, { 1u, "s" },
-            { 2u, "sms" }, { 2u, "s" },
+            { 1u, "sms" }, { 2u, "sms" },
             { 1u, "sms" },
-            { 0u, "smms" }, { 0u, "s" },
+            { 0u, "smms" },
             { 2u, "sms" }, { 1u, "sms" },
-            { 3u, "sms" }, { 3u, "s" }, { 0u, "sms" },
+            { 3u, "sms" }, { 0u, "sms" },
         };
         for (size_t i = 0u; i < sizeof(transitions) / sizeof(transitions[0]); i++) {
             ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
@@ -1949,32 +2024,10 @@ static void check_state_noops(const char *socket_name, const char *mode)
                 expect_window_requests(requests[0], "s");
             }
         }
-        for (unsigned i = 0u; i < 2u; i++) {
-            ksd_wayland_window_action(connection, KSD_OP_WINDOW_FOCUS, first, 0u, &result);
-            assert(result.status == KSD_STATUS_OK);
-            ksd_result_clear(&result);
-            expect_window_requests(requests[0], "sas");
-        }
-        if (strcmp(mode, "cosmic-delayed") == 0) {
-            /* Fullscreen is independent of maximization; no fullscreen request is allowed. */
-            check_window_state(connection, second, false, false);
-            expect_window_requests(requests[0], "s");
-            const struct { uint32_t state; const char *requests; } fullscreen[] = {
-                { 0u, "s" }, { 2u, "sms" }, { 2u, "s" },
-                { 1u, "sms" }, { 2u, "sms" },
-                { 0u, "sms" }, { 0u, "s" },
-            };
-            for (size_t i = 0u; i < sizeof(fullscreen) / sizeof(fullscreen[0]); i++) {
-                ksd_wayland_window_action(connection, KSD_OP_WINDOW_SET_STATE,
-                                          second, fullscreen[i].state, &result);
-                assert(result.status == KSD_STATUS_OK);
-                ksd_result_clear(&result);
-                expect_window_requests(requests[0], fullscreen[i].requests);
-                check_window_state(connection, second, fullscreen[i].state == 1u,
-                                    fullscreen[i].state != 0u);
-                expect_window_requests(requests[0], "s");
-            }
-        }
+        ksd_wayland_window_action(connection, KSD_OP_WINDOW_FOCUS, first, 0u, &result);
+        assert(result.status == KSD_STATUS_OK);
+        ksd_result_clear(&result);
+        expect_window_requests(requests[0], "sas");
     }
     ksd_wayland_close(connection);
     close(requests[0]);
@@ -2258,8 +2311,6 @@ static void check_cosmic_delayed_states(const char *socket_name)
         { 2u, false, true },
         { 1u, true, true },
         { 3u, false, true },
-        { 0u, false, false },
-        { 3u, false, false },
         { 0u, false, false },
     };
 
@@ -2580,13 +2631,8 @@ int main(void)
     check_cosmic_delayed_states(socket_name);
     check_state_noops(socket_name, "wlr");
     check_state_noops(socket_name, "cosmic");
-    check_state_noops(socket_name, "cosmic-delayed");
     check_state_noops(socket_name, "cosmic-readonly");
-    check_window_watch(socket_name, "normal");
-    check_window_watch(socket_name, "wlr");
-    check_window_watch(socket_name, "cosmic");
-    check_window_watch(socket_name, "cosmic-readonly");
-    check_window_watch(socket_name, "cosmic-bootstrap");
+    check_window_watch(socket_name, "cosmic-watch-updates");
     check_window_watch(socket_name, "cosmic-bootstrap-closed");
     check_window_watch(socket_name, "cosmic-empty");
     check_window_watch(socket_name, "cosmic-bootstrap-stalled");

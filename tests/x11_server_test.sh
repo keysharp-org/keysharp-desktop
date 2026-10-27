@@ -9,7 +9,6 @@ set -eu
 # Readiness is decided by connecting, not by waiting for a socket file.
 
 binary=$1
-export KSD_TEST_STATE_ONLY=${2:-}
 server=""
 
 if ! command -v Xvfb >/dev/null 2>&1; then
@@ -30,15 +29,11 @@ for display in 190 191 192 193 194 195 196 197 198 199; do
     if KSD_TEST_DISPLAY=":${display}" KSD_TEST_PROBE=1 "$binary" 2>/dev/null; then
         continue
     fi
-    if [ -w /tmp/.X11-unix ]; then
-        Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>/dev/null &
-    else
-        if [ -z "$KSD_TEST_STATE_ONLY" ]; then
-            echo "private Unix X server unavailable; shared-memory tests require local transport: skipping"
-            exit 77
-        fi
-        Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten unix -nolisten local -listen tcp -pn >/dev/null 2>/dev/null &
+    if [ ! -w /tmp/.X11-unix ]; then
+        echo "private Unix X server unavailable; shared-memory tests require local transport: skipping"
+        exit 77
     fi
+    Xvfb ":${display}" -screen 0 1279x1024x24 -noreset -nolisten tcp >/dev/null 2>/dev/null &
     server=$!
     attempt=0
     while [ "$attempt" -lt 40 ] && kill -0 "$server" 2>/dev/null; do

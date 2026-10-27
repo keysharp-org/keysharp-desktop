@@ -73,11 +73,6 @@ jobs:
           ctest --test-dir build --output-on-failure
           sudo ./build/capture-pipe-security-tests
 
-      - name: Validate provider JavaScript
-        run: |
-          node --input-type=module --check < providers/gnome/extension.js
-          node --input-type=module --check < providers/cinnamon/extension.js
-
       - name: Check lifecycle scripts
         run: >-
           shellcheck install.sh uninstall.sh packaging/install-release.sh packaging/check-runtime.sh

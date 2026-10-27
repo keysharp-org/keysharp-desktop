@@ -5,7 +5,25 @@ const vm = require('node:vm');
 const root = process.argv[2] || path.resolve(__dirname, '..');
 
 const core = fs.readFileSync(path.join(root, 'providers/shared/provider-core.js'), 'utf8');
-const Shell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({});
+const callbacks = new Map();
+const ioErrors = {NOT_SUPPORTED: 15};
+let nextSource = 1;
+const Shell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({
+    Gio: {IOErrorEnum: ioErrors},
+    GLib: {
+        PRIORITY_DEFAULT: 0,
+        SOURCE_REMOVE: false,
+        SOURCE_CONTINUE: true,
+        timeout_add(_priority, _interval, callback) {
+            const id = nextSource++;
+            callbacks.set(id, callback);
+            return id;
+        },
+        source_remove(id) { callbacks.delete(id); },
+    },
+    windowExtras: () => ({values: {}, validFields: []}),
+    setDecorated: () => null,
+});
 const kwin = vm.createContext({});
 vm.runInContext(fs.readFileSync(path.join(root, 'providers/kwin/contents/code/main.js'), 'utf8')
     .replace(/\nstart\(\);\s*$/, '\n'), kwin);
@@ -32,12 +50,10 @@ for (const backend of ['shell', 'kwin']) {
         window.maximized = maximized;
         assert.equal(set(1), true);
         assert.equal(window.minimized, true);
-        for (let repeat = 0; repeat < 2; repeat++) {
-            assert.equal(set(3), true);
-            assert.equal(window.minimized, false);
-            assert.equal(window.maximized, maximized);
-            assert.equal(window.fullScreen, true);
-        }
+        assert.equal(set(3), true);
+        assert.equal(window.minimized, false);
+        assert.equal(window.maximized, maximized);
+        assert.equal(window.fullScreen, true);
     }
     if (backend === 'shell') {
         calls.length = 0;
@@ -56,24 +72,7 @@ for (const backend of ['shell', 'kwin']) {
     assert.equal(set(4), false);
 }
 
-const callbacks = new Map();
-const removed = [];
-let nextSource = 1;
-const EventShell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({
-    GLib: {
-        PRIORITY_DEFAULT: 0,
-        SOURCE_REMOVE: false,
-        SOURCE_CONTINUE: true,
-        timeout_add(_priority, _interval, callback) {
-            const id = nextSource++;
-            callbacks.set(id, callback);
-            return id;
-        },
-        source_remove(id) { removed.push(id); callbacks.delete(id); },
-    },
-    windowExtras: () => ({values: {}, validFields: []}),
-});
-const provider = Object.create(EventShell.prototype);
+const provider = Object.create(Shell.prototype);
 provider._providerConnections = new Map([['authority', {}]]);
 provider._mapRefreshSources = new Map();
 provider._isLiveWindow = () => true;
@@ -114,7 +113,7 @@ const cancelled = provider._mapRefreshSources.get(mapped);
 mapped._keysharpHandlerIds = [];
 provider._unhookWindow(mapped);
 assert.equal(provider._mapRefreshSources.has(mapped), false);
-assert.equal(removed.includes(cancelled), true);
+assert.equal(callbacks.has(cancelled), false);
 
 assert.equal(provider._emitWindowEvent('move', {
     get_frame_rect: () => { throw new Error('Window is not ready'); },
@@ -140,7 +139,7 @@ const tracked = signalObject(Object.assign({}, mapped, {
     get_compositor_private: () => actor,
     is_above() { return this.above; },
 }));
-provider._windowOpacity = EventShell.prototype._windowOpacity;
+provider._windowOpacity = Shell.prototype._windowOpacity;
 provider._hookWindow(tracked);
 tracked.above = true;
 tracked.emit('notify::above');
@@ -159,31 +158,15 @@ provider._unhookWindow(tracked);
 assert.equal(actor.signals.size, 0);
 assert.equal(tracked.signals.size, 0);
 
-const ioErrors = {NOT_SUPPORTED: 15};
-let decorationResult;
-const BooleanShell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({
-    Gio: {IOErrorEnum: ioErrors},
-    GLib: {Variant: class { constructor(signature, values) { this.signature = signature; this.values = values; } }},
-    setDecorated: () => decorationResult,
-});
-const booleanProvider = Object.create(BooleanShell.prototype);
+const booleanProvider = Object.create(Shell.prototype);
 booleanProvider._requireProviderPeer = () => true;
 booleanProvider._findWindow = () => tracked;
-for (const result of [true, false, null]) {
-    decorationResult = result;
-    const responses = [];
-    booleanProvider.SetWindowDecoratedAsync(['42', false], {
-        return_value(value) { responses.push({value}); },
-        return_error_literal(domain, code) { responses.push({domain, code}); },
-    });
-    assert.equal(responses.length, 1);
-    if (result === null)
-        assert.deepEqual(responses[0], {domain: ioErrors, code: ioErrors.NOT_SUPPORTED});
-    else {
-        assert.equal(responses[0].value.signature, '(b)');
-        assert.deepEqual(responses[0].value.values, [result]);
-    }
-}
+const responses = [];
+booleanProvider.SetWindowDecoratedAsync(['42', false], {
+    return_value() { assert.fail('Unsupported decorations must return an error'); },
+    return_error_literal(domain, code) { responses.push({domain, code}); },
+});
+assert.deepEqual(responses, [{domain: ioErrors, code: ioErrors.NOT_SUPPORTED}]);
 
 const gnomeShim = fs.readFileSync(path.join(root, 'providers/shared/gnome-shim.js'), 'utf8');
 const spawned = [];

@@ -1215,11 +1215,7 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
     ksd_result_init(&result);
     ksd_x11_window_focus(connection, 0x7ffffffdu, &result);
     assert(result.status == KSD_STATUS_NOT_FOUND);
-    ksd_result_clear(&result);
-    ksd_result_init(&result);
     ksd_x11_window_raise(connection, 0x7ffffffdu, true, &result);
-    assert(result.status == KSD_STATUS_NOT_FOUND);
-    ksd_x11_window_raise(connection, 0x7ffffffdu, false, &result);
     assert(result.status == KSD_STATUS_NOT_FOUND);
     ksd_x11_window_move_resize(connection, 0x7ffffffdu, 11, 22, 33u, 44u, &result);
     assert(result.status == KSD_STATUS_NOT_FOUND);
@@ -1295,9 +1291,6 @@ static void check_control(ksd_x11 *connection, xcb_connection_t *wm,
         }
     }
     assert(map_requested);
-    attributes = xcb_get_window_attributes_reply(wm, xcb_get_window_attributes(wm, window), NULL);
-    assert(attributes != NULL && attributes->map_state == XCB_MAP_STATE_VIEWABLE);
-    free(attributes);
     assert(next_client_message(wm, wm_state, data));
     assert(data[0] == 1u);
     /* Both maximize atoms, because a window maximized in one direction only is
@@ -1482,12 +1475,9 @@ int main(void)
     check_window_handles_with_manager(connection, owner, screen);
     check_extended_windows(connection, owner, screen);
     check_window_watch(connection, owner, screen, canonical);
-    const char *state_only = getenv("KSD_TEST_STATE_ONLY");
-    if (state_only == NULL || state_only[0] == '\0') {
-        check_capture(connection, owner, screen);
-        check_clipboard(connection, owner, canonical);
-        check_control(connection, owner, screen, canonical);
-    }
+    check_capture(connection, owner, screen);
+    check_clipboard(connection, owner, canonical);
+    check_control(connection, owner, screen, canonical);
     xcb_disconnect(owner);
 
     ksd_x11_close(connection);

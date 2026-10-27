@@ -1,19 +1,8 @@
 #!/bin/sh
 set -eu
 
-# Parses both provider extensions. gjs is preferred because it is SpiderMonkey, the engine
-# that actually runs them, so it accepts the GJS dialect exactly; node is the fallback and is
-# what CI uses. Reflect.parse is a SpiderMonkey extension that parses without executing, which
-# matters because these files touch global and imports.ui.main at load and cannot be run
-# outside a compositor. Neither engine present is a skip, not a failure: the build must not
-# require a JavaScript runtime.
-#
-# The two providers are not in the same dialect and must not be parsed as though they were.
-# The GNOME extension is a real ES module, because GNOME 45 moved extensions to ESM
-# ("import GLib from 'gi://GLib'"), while the Cinnamon one is a plain script using the older
-# "imports.gi" form. Parsing a script as a module hides nothing, but parsing a module as a
-# script fails outright, and parsing a script as a module accepts top-level await and
-# import.meta that the real engine would reject. The mode is therefore detected per file.
+# Parse without executing compositor-specific imports or globals. Prefer GJS's
+# SpiderMonkey parser; Node provides a fallback when GJS is unavailable.
 
 source_dir=$1
 
@@ -29,10 +18,6 @@ fi
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT HUP INT TERM
 
-# The KWin script lives at a different path because it is a KPackage, not an
-# extension: KWin loads contents/code/main.js named by X-Plasma-MainScript. It is
-# a plain script in the QJSEngine dialect, so it is parsed in script mode like
-# the Cinnamon one.
 status=0
 for provider in gnome cinnamon kwin; do
     if [ "$provider" = kwin ]; then
@@ -41,15 +26,14 @@ for provider in gnome cinnamon kwin; do
         file="$source_dir/providers/$provider/extension.js"
     fi
 
+    # Script mode must reject module-only constructs that Cinnamon and KWin
+    # cannot load; GNOME's extension uses ES modules.
     if grep -qE '^[[:space:]]*(import|export)[[:space:]]' "$file"; then
         mode=module
     else
         mode=script
     fi
 
-    # The engine status is read on its own. Piping it through a filter would report the
-    # filter's status instead, and grep answers 1 when it matches nothing, so a clean parse
-    # would be read as a failure.
     if [ "$engine" = gjs ]; then
         gjs -c '
 const GLib = imports.gi.GLib;

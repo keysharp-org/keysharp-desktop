@@ -631,10 +631,6 @@ if(BUILD_TESTING)
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
             $<TARGET_FILE:x11-server-tests>)
     set_tests_properties(x11-server-tests PROPERTIES SKIP_RETURN_CODE 77)
-    add_test(NAME x11-state-tests
-        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/x11_server_test.sh
-            $<TARGET_FILE:x11-server-tests> state)
-    set_tests_properties(x11-state-tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
 
     # The persistent worker's serving loop is a static function reached through
     # the same testing hook as the bootstrap parser, so this target compiles

@@ -17,15 +17,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/* The relay is the one part of the KWin channel where several threads share a
- * socket, so it is the one part where an ordering mistake shows up as a caller
- * receiving somebody else's answer. That cannot be argued -- it has to be run.
- *
- * These stand a fake daemon on the far end of a socketpair and drive the relay
- * from real threads. The fake daemon answers OUT OF ORDER on purpose: in
- * production the whole point of the queue is that a cheap verb need not wait
- * behind an enumeration, so answers genuinely do come back reordered, and a
- * relay that assumed otherwise would work in testing and fail on a desktop. */
+/* Concurrent calls share one socket. A fake daemon reverses replies to verify
+ * that each caller receives its own response. */
 
 #define WORKERS 8u
 
@@ -116,16 +109,10 @@ static void check_response_translation(void)
     ksd_buffer_clear(&payload);
 }
 
-typedef struct fake_daemon {
-    int descriptor;
-    unsigned answered;
-    bool reorder;
-} fake_daemon;
-
 /* Reads every request, then answers them all in reverse. */
 static void *daemon_thread(void *data)
 {
-    fake_daemon *daemon = data;
+    int descriptor = *(int *)data;
     uint64_t ids[WORKERS];
     uint16_t opcodes[WORKERS];
     unsigned count = 0u;
@@ -134,7 +121,7 @@ static void *daemon_thread(void *data)
         uint8_t header[KSD_FRAME_HEADER_SIZE];
         uint32_t payload_length;
 
-        if (!ksd_read_all(daemon->descriptor, header, sizeof(header)))
+        if (!ksd_read_all(descriptor, header, sizeof(header)))
             return NULL;
         payload_length =
             ksd_decode_u32(header + KSD_FRAME_PAYLOAD_LENGTH_OFFSET);
@@ -142,7 +129,7 @@ static void *daemon_thread(void *data)
             uint8_t *body = malloc(payload_length);
 
             if (body == NULL
-                || !ksd_read_all(daemon->descriptor, body, payload_length)) {
+                || !ksd_read_all(descriptor, body, payload_length)) {
                 free(body);
                 return NULL;
             }
@@ -153,7 +140,7 @@ static void *daemon_thread(void *data)
         count++;
     }
     for (unsigned index = 0u; index < count; index++) {
-        unsigned pick = daemon->reorder ? count - 1u - index : index;
+        unsigned pick = count - 1u - index;
         ksd_frame frame;
         ksd_buffer payload;
         ksd_buffer packed;
@@ -180,10 +167,9 @@ static void *daemon_thread(void *data)
         frame.payload_length = (uint32_t)payload.length;
         ksd_buffer_init(&packed, 128u);
         assert(ksd_frame_pack(&frame, &packed));
-        (void)ksd_write_all(daemon->descriptor, packed.data, packed.length);
+        (void)ksd_write_all(descriptor, packed.data, packed.length);
         ksd_buffer_clear(&packed);
         ksd_buffer_clear(&payload);
-        daemon->answered++;
     }
     return NULL;
 }
@@ -221,25 +207,19 @@ static void *caller_thread(void *data)
     return NULL;
 }
 
-/* Eight callers at once, answered in reverse. Each must receive the answer to
- * its OWN request, which is the whole reason responses carry a request id
- * rather than being matched by arrival order. */
+/* Distinct opcodes expose replies delivered to the wrong caller. */
 static void check_out_of_order_demux(void)
 {
     int pair[2];
-    fake_daemon daemon;
     pthread_t server;
     pthread_t threads[WORKERS];
     caller callers[WORKERS];
     ksd_kwin_relay *relay;
 
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
-    daemon.descriptor = pair[1];
-    daemon.answered = 0u;
-    daemon.reorder = true;
     relay = ksd_kwin_relay_create(pair[0]);
     assert(relay != NULL);
-    assert(pthread_create(&server, NULL, daemon_thread, &daemon) == 0);
+    assert(pthread_create(&server, NULL, daemon_thread, &pair[1]) == 0);
 
     for (unsigned index = 0u; index < WORKERS; index++) {
         callers[index].relay = relay;
@@ -258,45 +238,6 @@ static void check_out_of_order_demux(void)
         assert(callers[index].ok);
         assert(callers[index].echoed == callers[index].opcode);
     }
-    assert(daemon.answered == WORKERS);
-    ksd_kwin_relay_retire(relay);
-    close(pair[1]);
-}
-
-/* A daemon that never answers. The caller gives up on its own deadline rather
- * than waiting for ever, and reports TIMEOUT and not BUSY: the request went
- * down the socket and may have run, which is what makes close and move-resize
- * unsafe to retry. */
-static void check_deadline_reports_timeout(void)
-{
-    int pair[2];
-    ksd_kwin_relay *relay;
-    ksd_frame request;
-    ksd_operation_result result;
-    struct timespec now;
-    uint64_t deadline;
-
-    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
-    relay = ksd_kwin_relay_create(pair[0]);
-    assert(relay != NULL);
-
-    memset(&request, 0, sizeof(request));
-    request.magic[0] = KSD_FRAME_MAGIC_0;
-    request.magic[1] = KSD_FRAME_MAGIC_1;
-    request.magic[2] = KSD_FRAME_MAGIC_2;
-    request.magic[3] = KSD_FRAME_MAGIC_3;
-    request.major = KSD_PROTOCOL_MAJOR;
-    request.minor = KSD_PROTOCOL_MINOR;
-    request.opcode = KSD_OP_WINDOW_FOCUS;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    deadline = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u
-        + 200u;
-    ksd_result_init(&result);
-    assert(ksd_kwin_relay_call(relay, &request, deadline, &result));
-    assert(result.status == KSD_STATUS_TIMEOUT);
-    ksd_result_clear(&result);
-
     ksd_kwin_relay_retire(relay);
     close(pair[1]);
 }
@@ -367,15 +308,22 @@ static void check_response_waiter_deadline(void)
     assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
     ksd_kwin_relay *relay = ksd_kwin_relay_create(pair[0]);
     assert(relay != NULL);
-    deadline_caller reader = { .relay = relay, .timeout_ms = 1000u,
+    deadline_caller reader = { .relay = relay, .timeout_ms = 100u,
         .request = { .magic = { 'K', 'S', 'D', 'P' }, .major = KSD_PROTOCOL_MAJOR,
             .minor = KSD_PROTOCOL_MINOR, .opcode = KSD_OP_WINDOW_FOCUS } };
-    pthread_t thread;
-    assert(pthread_create(&thread, NULL, deadline_caller_thread, &reader) == 0);
+    /* A sent request with no response times out without breaking the channel. */
+    deadline_caller_thread(&reader);
+    assert(reader.status == KSD_STATUS_TIMEOUT && reader.elapsed_ms < 350u);
+    assert(!ksd_kwin_relay_is_broken(relay));
     uint8_t header[KSD_FRAME_HEADER_SIZE];
     assert(ksd_transfer_until(pair[1], header, sizeof(header), false,
         ksd_monotonic_milliseconds() + 1000u) == (ssize_t)sizeof(header));
+    reader.timeout_ms = 1000u;
     deadline_caller waiting = reader; waiting.timeout_ms = 100u;
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, deadline_caller_thread, &reader) == 0);
+    assert(ksd_transfer_until(pair[1], header, sizeof(header), false,
+        ksd_monotonic_milliseconds() + 1000u) == (ssize_t)sizeof(header));
     deadline_caller_thread(&waiting);
     assert(waiting.status == KSD_STATUS_TIMEOUT && waiting.elapsed_ms < 350u);
     assert(!ksd_kwin_relay_is_broken(relay));
@@ -418,11 +366,7 @@ static void check_closed_channel(void)
     ksd_kwin_relay_retire(relay);
 }
 
-/* A daemon that writes half a header and then stalls. ksd_read_all has no
- * deadline, so before this was bounded the caller holding the reader role
- * blocked in it for ever -- and because it was the reader, every other caller
- * waited on it too. One stalled write would have wedged the backend for that
- * uid permanently and parked a root thread. */
+/* A partial response must not hold the reader role past its deadline. */
 static void check_partial_write_does_not_wedge(void)
 {
     int pair[2];
@@ -461,10 +405,7 @@ static void check_partial_write_does_not_wedge(void)
     close(pair[1]);
 }
 
-/* A relay retired while a caller is inside a call must not be freed under
- * them. Before it was reference counted, unregister_backend freed it while a
- * call was in flight, and the window was exactly as wide as an operation is
- * slow -- a use-after-free in the root process. */
+/* A caller's reference keeps a retired relay alive until the call finishes. */
 static void check_retire_during_call_is_safe(void)
 {
     int pair[2];
@@ -605,7 +546,6 @@ int main(void)
     check_request_translation();
     check_response_translation();
     check_out_of_order_demux();
-    check_deadline_reports_timeout();
     check_write_deadlines();
     check_response_waiter_deadline();
     for (unsigned scenario = 0u; scenario < 3u; scenario++)

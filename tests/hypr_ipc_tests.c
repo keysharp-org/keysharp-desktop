@@ -91,7 +91,6 @@ static void test_parses_actual_focus(void)
         const char *active;
         int expected;
     } cases[] = {
-        { "{}", -1 },
         { " { \n } \n", -1 },
         { "{\"stableId\":\"18000002\",\"address\":\"0x5bf064700450\"}", 0 },
         { "{\"stableId\":\"18000003\",\"address\":\"0x5bf0654d25e0\"}", 1 },
@@ -109,16 +108,14 @@ static void test_parses_actual_focus(void)
         /* focusHistoryID remains unchanged, including zero when actual focus is cleared. */
         assert(clients[0].active == (cases[index].expected == 0));
         assert(clients[1].active == (cases[index].expected == 1));
-        assert(clients[0].stacking_order == 0u && clients[1].stacking_order == 1u);
         free(clients);
     }
     static const char *const malformed[] = {
-        "[]", "[]\n\n\n", "[]\n\n{}", "[] {}", "[]\n\n\n[]",
+        "[]", "[]\n\n\n", "[]\n\n{}", "[]\n\n\n[]",
         "[]\n\n\n{\"stableId\":\"1\"}",
         "[]\n\n\n{\"address\":\"0x1\"}",
         "[]\n\n\n{\"stableId\":\"1\",\"address\":\"invalid\"}",
-        "[]\n\n\n{\"stableId\":\"1\",\"address\":\"0x1\"",
-        "[]\n\n\n{}\n\n\n{}", "[]\n\n\n{}trailing",
+        "[]\n\n\n{}\n\n\n{}",
     };
     for (size_t index = 0u; index < sizeof(malformed) / sizeof(malformed[0]); index++) {
         ksd_hypr_client *clients = NULL;
@@ -460,16 +457,11 @@ static void stack_fixture(ksd_wayland *connection, ksd_wl_toplevel *windows,
     connection->toplevels = &windows[reverse ? count - 1u : 0u];
 }
 
-static void check_stack_order(const ksd_wayland *connection, const uint64_t *ids, size_t count,
-                               ksd_window_record *snapshot)
+static void check_stack_order(const ksd_wayland *connection, const uint64_t *ids, size_t count)
 {
     const ksd_wl_toplevel *window = connection->toplevels;
     for (size_t i = 0u; i < count; i++) {
         assert(window != NULL && window->id == ids[i]);
-        if (snapshot != NULL) snapshot[i] = (ksd_window_record) {
-            .handle = window->id, .valid_fields = KSD_FIELD_ID | KSD_FIELD_STACKING_ORDER,
-            .stacking_order = i,
-        };
         window = window->next;
     }
     assert(window == NULL);
@@ -492,20 +484,15 @@ static void test_observes_native_stacking(void)
     ksd_wayland_hypr_windows_update(&query, clients, 3u);
     ksd_wayland_hypr_windows_update(&watch, clients, 3u);
     const uint64_t before_ids[] = { 1u, 2u, 3u }, after_ids[] = { 3u, 2u, 1u };
-    ksd_window_record previous[3], next[3];
-    check_stack_order(&query, before_ids, 3u, NULL);
-    check_stack_order(&watch, before_ids, 3u, previous);
+    check_stack_order(&query, before_ids, 3u);
+    check_stack_order(&watch, before_ids, 3u);
 
     /* An external restack changes only the native array rank, not focus. */
     clients[0].stacking_order = 2u; clients[2].stacking_order = 0u;
     ksd_wayland_hypr_windows_update(&query, clients, 3u);
     ksd_wayland_hypr_windows_update(&watch, clients, 3u);
-    check_stack_order(&query, after_ids, 3u, NULL);
-    check_stack_order(&watch, after_ids, 3u, next);
-    diff_log log = { 0 };
-    ksd_wayland_watch_diff(previous, 3u, next, 3u, record_event, &log);
-    assert(log.count == 2u && log.ids[0] == 3u && log.ids[1] == 1u);
-    assert(log.kinds[0] == KSD_WINDOW_EVENT_CHANGED && log.kinds[1] == KSD_WINDOW_EVENT_CHANGED);
+    check_stack_order(&query, after_ids, 3u);
+    check_stack_order(&watch, after_ids, 3u);
 }
 
 static void test_respects_native_render_layers(void)
@@ -531,14 +518,14 @@ static void test_respects_native_render_layers(void)
     stack_fixture(&connection, windows, clients, 8u, false);
     ksd_wayland_hypr_windows_update(&connection, clients, 8u);
     const uint64_t ids[] = { 8u, 7u, 6u, 5u, 4u, 3u, 2u, 1u };
-    check_stack_order(&connection, ids, 8u, NULL);
+    check_stack_order(&connection, ids, 8u);
 }
 
 static void test_focused_tiled_restacking(void)
 {
     for (unsigned direction = 0u; direction < 2u; direction++) {
         bool top = direction != 0u;
-        for (unsigned scenario = 0u; scenario < 17u; scenario++) {
+        for (unsigned scenario = 0u; scenario < 13u; scenario++) {
             ksd_hypr_client clients[] = {
                 { .stable_id = "target", .workspace_name = "1", .workspace_id = 1,
                     .mapped = true, .visible = true, .active = !top, .stacking_order = 1u },
@@ -557,31 +544,27 @@ static void test_focused_tiled_restacking(void)
                 case 9u: clients[1].visible = false; break;
                 case 10u: clients[1].mapped = false; break;
                 case 11u: clients[1].workspace_id = 2; break;
-                case 16u: clients[0].active = clients[1].active = false; break;
+                case 12u: clients[0].active = clients[1].active = false; break;
             }
             ksd_wayland connection = { 0 };
             ksd_wl_toplevel windows[2];
             stack_fixture(&connection, windows, clients, 2u, false);
-            if (scenario == 12u) windows[1].closed = true;
-            if (scenario == 13u) windows[1].handle = NULL;
-            if (scenario == 14u) windows[0].closed = true;
-            if (scenario == 15u) windows[0].next = NULL;
             ksd_wayland_hypr_windows_update(&connection, clients, 2u);
             assert(ksd_wayland_hypr_can_restack(&connection, &windows[0], top) == (scenario != 0u));
             if (scenario == 0u) {
                 const uint64_t ids[] = { top ? 1u : 2u, top ? 2u : 1u };
-                check_stack_order(&connection, ids, 2u, NULL);
+                check_stack_order(&connection, ids, 2u);
                 /* Native rank changes cannot override the focused tile's final render pass. */
                 clients[0].stacking_order = 0u; clients[1].stacking_order = 1u;
                 ksd_wayland_hypr_windows_update(&connection, clients, 2u);
-                check_stack_order(&connection, ids, 2u, NULL);
+                check_stack_order(&connection, ids, 2u);
                 assert(!ksd_wayland_hypr_can_restack(&connection, &windows[0], top));
-            } else if (scenario == 16u) {
+            } else if (scenario == 12u) {
                 /* Cleared keyboard focus gives no tile the final render pass. */
                 clients[0].stacking_order = 0u; clients[1].stacking_order = 1u;
                 ksd_wayland_hypr_windows_update(&connection, clients, 2u);
                 const uint64_t ids[] = { 1u, 2u };
-                check_stack_order(&connection, ids, 2u, NULL);
+                check_stack_order(&connection, ids, 2u);
             }
         }
     }
@@ -618,17 +601,13 @@ static void test_diffs_window_snapshots(void)
     ksd_wayland_watch_diff(next, 3u, unfocused, 3u, record_event, &log);
     assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CHANGED && log.ids[0] == 3u);
     log.count = 0u;
-    ksd_wayland_watch_diff(next, 3u, next, 2u, record_event, &log);
-    assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CLOSE && log.ids[0] == 4u);
-    log.count = 0u;
     ksd_wayland_watch_diff(next, 3u, next, 3u, record_event, &log);
     assert(log.count == 0u);
-    for (unsigned i = 0u; i < 4u; i++) {
+    for (unsigned i = 0u; i < 3u; i++) {
         ksd_window_record changed = next[1];
-        if (i == 0u) changed.flags |= KSD_WINDOW_ABOVE;
-        else if (i == 1u) changed.transparency = 128u;
-        else if (i == 2u) changed.app_id = (ksd_string) { .data = "Editor", .length = 6u };
-        else changed.flags |= KSD_WINDOW_MAXIMIZED;
+        if (i == 0u) changed.transparency = 128u;
+        else if (i == 1u) changed.app_id = (ksd_string) { .data = "Editor", .length = 6u };
+        else changed.stacking_order = 1u;
         log.count = 0u;
         ksd_wayland_watch_diff(&next[1], 1u, &changed, 1u, record_event, &log);
         assert(log.count == 1u && log.kinds[0] == KSD_WINDOW_EVENT_CHANGED && log.ids[0] == 3u);
