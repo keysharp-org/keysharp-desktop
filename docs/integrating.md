@@ -36,6 +36,12 @@ polkit in a system installation, or a local consent dialog in a user installatio
 A zero-scope connection reports the backend and available operations
 without reading the permission store.
 
+If polkit reports no session authentication agent, `ksd_connect` or `ksd_authorize`
+with `KSD_AUTH_REQUEST` returns `KSD_STATUS_UNAVAILABLE` and
+`error.detail == KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT`. Show `error.message`
+and retry after the user starts an agent; this result does not indicate a lost
+service connection. Existing grants and `KSD_AUTH_CHECK` do not need an agent.
+
 Requested, listed, and revoked scopes are the six desktop scopes plus shared
 InputControl. This authority never grants InputMonitoring, and a zero-valued
 permission entry is rejected.

@@ -49,6 +49,9 @@
 #include <unistd.h>
 
 #define KSD_POLKIT_ACTION "org.keysharp.desktop.grant"
+static const char no_authentication_agent[] =
+    "No polkit authentication agent is available for this session. "
+    "Install and start your desktop authentication agent, then retry.";
 /* Both live in worker_pool.h, beside the admission rules that use them. */
 #define KSD_MAX_BACKEND_REGISTRATIONS 128u
 #define KSD_BACKEND_REGISTRATION_POLL_MS 1000
@@ -1486,7 +1489,7 @@ static ksp_polkit_result user_consent(authority_session *session,
 
 static uint32_t authorize_scopes(authority_session *session,
                                  uint32_t requested, uint16_t auth_mode,
-                                 uint32_t *granted)
+                                 uint32_t *granted, uint32_t *detail)
 {
     uint32_t allowed = 0u;
     uint64_t generation;
@@ -1494,6 +1497,7 @@ static uint32_t authorize_scopes(authority_session *session,
     ksp_identity verified;
     uint32_t status = KSD_STATUS_INTERNAL;
 
+    if (detail != NULL) *detail = 0u;
     *granted = session->granted_scopes;
     if (requested == 0u
         || (requested & ~(uint32_t)KSD_DESKTOP_ACCEPTED_SCOPES) != 0u
@@ -1551,6 +1555,8 @@ static uint32_t authorize_scopes(authority_session *session,
                                 authority_disconnected, session)
         : user_consent(session, missing);
     if (decision != KSP_POLKIT_GRANTED) {
+        if (decision == KSP_POLKIT_NO_AGENT && detail != NULL)
+            *detail = KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT;
         status = decision == KSP_POLKIT_DENIED ? KSD_STATUS_DENIED
             : decision == KSP_POLKIT_CANCELLED
                 || decision == KSP_POLKIT_IDENTITY_CHANGED
@@ -1789,12 +1795,15 @@ static bool handle_authorize(authority_session *session,
         return forward_response(session, request, KSD_STATUS_INVALID_REQUEST, 0u,
             "authorization belongs to the lease connection", NULL, 0u, false);
     if (!session_refresh(session, true, true, NULL)) return false;
-    uint32_t status = authorize_scopes(session, scopes, mode, &granted);
+    uint32_t detail = 0u;
+    uint32_t status = authorize_scopes(session, scopes, mode, &granted, &detail);
     if (!complete_authorization(session, scopes, &status)) return false;
+    if (status != KSD_STATUS_UNAVAILABLE) detail = 0u;
     granted = session->granted_scopes;
     if (status != KSD_STATUS_OK)
-        return forward_response(session, request, status, 0u,
-            status == KSD_STATUS_DENIED ? "permission is not granted"
+        return forward_response(session, request, status, detail,
+            detail == KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT ? no_authentication_agent
+            : status == KSD_STATUS_DENIED ? "permission is not granted"
             : status == KSD_STATUS_CANCELLED ? "authorization was cancelled"
             : status == KSD_STATUS_REVOKED
                 ? "permission changed during authorization"
@@ -2743,6 +2752,7 @@ static bool start_public_session(authority_session *session)
     uint32_t granted = 0u;
     uint64_t lease_id = 0u;
     uint32_t status = KSD_STATUS_INVALID_REQUEST;
+    uint32_t detail = 0u;
     uint8_t tail[32] = { 0 };
 
     int received = ksd_frame_read(session->client_fd, public_magic,
@@ -2764,7 +2774,7 @@ static bool start_public_session(authority_session *session)
         if (lease_id != 0u || ksp_identity_capture(session->peer.pid, session->peer.uid, &session->identity) != 0)
             status = KSD_STATUS_DENIED;
         if (status == KSD_STATUS_OK && scopes != 0u)
-            status = authorize_scopes(session, scopes, auth_mode, &granted);
+            status = authorize_scopes(session, scopes, auth_mode, &granted, &detail);
         if (status == KSD_STATUS_OK && (session->lease = lease_create(session)) == NULL)
             status = KSD_STATUS_RESOURCE_EXHAUSTED;
     } else {
@@ -2785,8 +2795,10 @@ static bool start_public_session(authority_session *session)
         replied = forward_response(session, &hello, KSD_STATUS_OK, 0u,
                                    NULL, tail, sizeof(tail), false);
     } else {
-        replied = forward_response(session, &hello, status, 0u,
-                                   status_diagnostic(status),
+        if (status != KSD_STATUS_UNAVAILABLE) detail = 0u;
+        replied = forward_response(session, &hello, status, detail,
+                                   detail == KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT
+                                       ? no_authentication_agent : status_diagnostic(status),
                                    NULL, 0u, false);
     }
     ksd_frame_clear(&hello);
@@ -3423,7 +3435,7 @@ bool ksd_authority_test_authorization_race(ksp_store *store)
     bool ok = ksp_identity_capture(getpid(), getuid(), &pending.identity) == 0
         && ksp_store_generation(store, getuid(), &generation) == 0
         && ksp_store_grant_if_generation(store, &pending.identity, scopes, generation) == 0
-        && authorize_scopes(&pending, scopes, KSD_AUTH_CHECK, &granted) == KSD_STATUS_OK;
+        && authorize_scopes(&pending, scopes, KSD_AUTH_CHECK, &granted, NULL) == KSD_STATUS_OK;
     if (!ok || (pending.lease = lease_create(&pending)) == NULL) { close(sockets[0]); close(sockets[1]); return false; }
     pending.lease->epoch = 99u;
     struct ucred peer = { .pid = getpid(), .uid = getuid(), .gid = getgid() };
@@ -3471,18 +3483,41 @@ bool ksd_authority_test_scope_cache(ksp_store *store)
         || ksp_store_generation(store, getuid(), &generation) != 0
         || ksp_store_grant_if_generation(store, &session.identity, scopes,
                                           generation) != 0
-        || authorize_scopes(&session, scopes, KSD_AUTH_CHECK, &granted)
+        || authorize_scopes(&session, scopes, KSD_AUTH_REQUEST, &granted, NULL)
             != KSD_STATUS_OK || granted != scopes
         || ksp_store_revoke(store, getuid(), session.identity.hash,
                             KSP_SCOPE_WINDOW_CONTROL) != 0)
         return false;
     bool ok = authorize_scopes(&session, KSP_SCOPE_WINDOW_MONITORING,
-                                KSD_AUTH_CHECK, &granted) == KSD_STATUS_OK
+                                KSD_AUTH_CHECK, &granted, NULL) == KSD_STATUS_OK
         && granted == KSP_SCOPE_WINDOW_MONITORING
         && session_refresh(&session, false, false, NULL)
         && session.granted_scopes == KSP_SCOPE_WINDOW_MONITORING;
     return ksp_store_revoke(store, getuid(), session.identity.hash, scopes) == 0
         && ok;
+}
+
+bool ksd_authority_test_authorization(ksp_store *store, int descriptor,
+                                      const ksd_frame *request)
+{
+    authority_state state = { .store = store, .mutex = PTHREAD_MUTEX_INITIALIZER };
+    authority_session session = {
+        .state = &state, .client_fd = descriptor,
+        .peer = { .pid = getpid(), .uid = getuid(), .gid = getgid() },
+        .role = KSD_ROLE_AUTHORIZATION_LEASE,
+        .source_fd = { -1, -1, -1 },
+    };
+    bool ok;
+    if (request->opcode == KSD_OP_HELLO) {
+        ok = start_public_session(&session);
+    } else {
+        ok = ksp_identity_capture(getpid(), getuid(), &session.identity) == 0
+            && (session.lease = lease_create(&session)) != NULL
+            && handle_authorize(&session, request);
+    }
+    lease_release(&state, session.lease);
+    pthread_mutex_destroy(&state.mutex);
+    return ok;
 }
 
 int ksd_authority_test_capture_budget(unsigned int uid, unsigned int pid,

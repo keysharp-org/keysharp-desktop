@@ -28,6 +28,7 @@ Depends: ${misc:Depends},
          ${shlibs:Depends},
          polkitd | policykit-1,
          systemd
+Recommends: mate-polkit | polkit-1-auth-agent
 Provides: ${client-abi:Provides}
 Breaks: keysharp (<< 0.0.0.17)
 Replaces: keysharp (<< 0.0.0.17)

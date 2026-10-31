@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(keysharp-desktop
-    VERSION 1.0.4
+    VERSION 1.0.5
     DESCRIPTION "Per-application desktop capability broker for Linux"
     HOMEPAGE_URL "https://github.com/keysharp-org/keysharp-desktop"
     LANGUAGES C)
@@ -503,6 +503,7 @@ if(KEYSHARP_DESKTOP_SETUP_ON_INSTALL)
             message(STATUS
                 \"keysharp-desktop: on GNOME or Cinnamon, finish the install by running this as yourself, not with sudo:\")
             message(STATUS \"    keysharp-desktop enable-extension\")
+            message(STATUS \"Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See ${CMAKE_CURRENT_SOURCE_DIR}/docs/install.md.\")
         endif()
     ")
 endif()
@@ -758,7 +759,9 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(generic-session-tests PRIVATE
-        KSD_AUTHORITY_TESTING KSD_PKCHECK_PATH="${KSD_PKCHECK_PATH}")
+        KSD_AUTHORITY_TESTING KSD_PKCHECK_PATH="${KSD_PKCHECK_PATH}"
+        ksp_polkit_authorize=ksd_test_polkit_authorize
+        ksd_install_is_system=ksd_test_install_is_system)
     target_link_libraries(generic-session-tests PRIVATE
         keysharp-desktop-common keysharp-desktop-capture
         PkgConfig::GIO Threads::Threads)
@@ -881,6 +884,7 @@ set(CPACK_PACKAGE_FILE_NAME "keysharp-desktop-${PROJECT_VERSION}-${CMAKE_SYSTEM_
 set(CPACK_GENERATOR "DEB")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libglib2.0-0 (>= 2.56) | libglib2.0-0t64, polkitd | policykit-1, systemd")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "mate-polkit | polkit-1-auth-agent")
 set(CPACK_DEBIAN_PACKAGE_PROVIDES "keysharp-desktop-client-abi-1 (= 1.${KEYSHARP_DESKTOP_ABI_MINOR})")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_BREAKS "keysharp (<< 0.0.0.17)")

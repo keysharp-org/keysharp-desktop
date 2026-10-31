@@ -3,17 +3,17 @@
     "keysharp-permissions": {
       "flake": false,
       "locked": {
-        "lastModified": 1788591063,
-        "narHash": "sha256-FCVcLQ86bR88NQn8QqJZtUyoeHquihnLG4W5742CQgs=",
+        "lastModified": 1793449187,
+        "narHash": "sha256-/ov20kevq2iW21LesxBfK3/HUQJo6/lijLyrb+6uKcc=",
         "owner": "keysharp-org",
         "repo": "keysharp-permissions",
-        "rev": "b8f31942dd2c286608d390634a9916bffce55ddf",
+        "rev": "1fa566406087483c92b059d11d5657cfe3d5ed18",
         "type": "github"
       },
       "original": {
         "owner": "keysharp-org",
         "repo": "keysharp-permissions",
-        "rev": "b8f31942dd2c286608d390634a9916bffce55ddf",
+        "rev": "1fa566406087483c92b059d11d5657cfe3d5ed18",
         "type": "github"
       }
     },

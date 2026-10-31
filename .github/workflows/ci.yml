@@ -37,8 +37,8 @@ jobs:
 
       - name: Verify permission dependency pin
         run: |
-          test "$(git rev-parse HEAD:third_party/keysharp-permissions)" = b8f31942dd2c286608d390634a9916bffce55ddf
-          test "$(git -C third_party/keysharp-permissions rev-parse HEAD)" = b8f31942dd2c286608d390634a9916bffce55ddf
+          test "$(git rev-parse HEAD:third_party/keysharp-permissions)" = 1fa566406087483c92b059d11d5657cfe3d5ed18
+          test "$(git -C third_party/keysharp-permissions rev-parse HEAD)" = 1fa566406087483c92b059d11d5657cfe3d5ed18
 
       - name: Install build dependencies
         run: |

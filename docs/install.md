@@ -76,6 +76,24 @@ The NixOS module uses a login helper for the same once-per-user-and-desktop setu
 the helper briefly retries while the graphical session starts. Its
 `autoEnableExtension` option can disable automatic activation.
 
+## Authentication prompts
+
+Graphical system permission prompts need a polkit authentication agent running
+in the requesting user's session. Installing `polkitd` alone does not provide a
+password dialog.
+
+Debian packages recommend `mate-polkit | polkit-1-auth-agent`, so an installed
+desktop provider satisfies the recommendation. With `--no-install-recommends`,
+or a source/archive installation, install an agent through your package manager
+if your desktop does not already provide one.
+
+Configure the agent to start as your graphical user with the session, or log out
+and back in if your desktop manages its autostart. Reuse your desktop's existing
+agent. Installing an agent does not prove it is running; existing grants can be
+used without one, but new grants may need its authentication prompt.
+When polkit reports a missing agent, authorization returns an unavailable error
+asking you to install and start the agent, then retry.
+
 ## Check and repair
 
 ```sh
@@ -87,7 +105,10 @@ keysharp-desktop probe
 
 `info` reports the local library version and ABI without contacting a service.
 Run `probe` as your graphical user to inspect the session backend and available
-operations. An inactive authority service is normal before the first connection
+operations. Its zero requested scopes do not test whether an application can open
+an authentication prompt. If requests are denied without a dialog, check the
+[authentication agent](#authentication-prompts) in that user's session.
+An inactive authority service is normal before the first connection
 if its socket is active. To repair disabled units:
 
 ```sh

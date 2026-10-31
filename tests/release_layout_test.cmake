@@ -10,6 +10,7 @@ file(READ "${SOURCE_DIR}/CMakeLists.txt" cmake_source)
 file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.service.in" authority_unit)
 file(READ "${SOURCE_DIR}/data/keysharp-desktop.service.in" broker_unit)
 file(READ "${SOURCE_DIR}/packaging/debian/postrm" debian_postrm)
+file(READ "${SOURCE_DIR}/packaging/debian/control" debian_control)
 file(READ "${SOURCE_DIR}/nix/module.nix" nix_module)
 
 execute_process(
@@ -270,7 +271,7 @@ foreach(required
 endforeach()
 foreach(workflow_source ci_workflow release_workflow)
     foreach(required
-            "b8f31942dd2c286608d390634a9916bffce55ddf"
+            "1fa566406087483c92b059d11d5657cfe3d5ed18"
             "git rev-parse HEAD:third_party/keysharp-permissions"
             "libkeysharp-desktop.so.1")
         string(FIND "${${workflow_source}}" "${required}" found)
@@ -281,7 +282,7 @@ foreach(workflow_source ci_workflow release_workflow)
 endforeach()
 foreach(required
         "inputs.keysharp-permissions"
-        "b8f31942dd2c286608d390634a9916bffce55ddf"
+        "1fa566406087483c92b059d11d5657cfe3d5ed18"
         "flake = false")
     file(READ "${SOURCE_DIR}/flake.nix" flake_source)
     string(FIND "${flake_source}" "${required}" found)
@@ -428,3 +429,10 @@ foreach(required
         message(FATAL_ERROR "Debian ownership transition is missing ${required}")
     endif()
 endforeach()
+
+string(FIND "${debian_control}" "Recommends: mate-polkit | polkit-1-auth-agent" agent_recommendation)
+string(FIND "${cmake_source}"
+    "CPACK_DEBIAN_PACKAGE_RECOMMENDS \"mate-polkit | polkit-1-auth-agent\"" cpack_agent_recommendation)
+if(agent_recommendation EQUAL -1 OR cpack_agent_recommendation EQUAL -1)
+    message(FATAL_ERROR "both Debian build paths must recommend a compatible authentication agent")
+endif()

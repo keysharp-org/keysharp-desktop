@@ -33,6 +33,8 @@ extern "C" {
 #define KSD_DEFAULT_SOCKET_PATH "/run/keysharp-desktop/keysharp-desktop.sock"
 #define KSD_SOCKET_ENV "KEYSHARP_DESKTOP_SOCKET"
 #define KSD_ERROR_MESSAGE_CAPACITY 256u
+/* An interactive authorization needs a session agent; retry after starting it. */
+#define KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT 0x00010000u
 #define KSD_PERMISSION_HASH_HEX_SIZE 65u
 #define KSD_EXECUTABLE_PATH_SIZE 4096u
 #define KSD_DEFAULT_REQUEST_TIMEOUT_MS 130000u

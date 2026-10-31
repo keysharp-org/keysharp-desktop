@@ -60,6 +60,9 @@ needs a new grant. Input Control is shared with the system `keysharp-input` serv
 so granting or revoking it affects both. [Permission details](docs/permissions.md)
 explain individual scopes and revocation.
 
+Graphical permission prompts need a polkit authentication agent running in the
+user's session; see [authentication setup](docs/install.md#authentication-prompts).
+
 A [user installation](docs/install.md#install-for-one-user) is also available. Its
 consent records are user-owned, cannot enforce isolation against same-user programs,
 and do not share grants with system services. See [security](SECURITY.md) for the

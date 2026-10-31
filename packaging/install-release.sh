@@ -750,5 +750,6 @@ fi
 
 printf '%s\n' \
     "Installed keysharp-desktop." \
-    "Uninstall with /usr/local/share/doc/keysharp-desktop/uninstall.sh."
+    "Uninstall with /usr/local/share/doc/keysharp-desktop/uninstall.sh." \
+    "Graphical permission prompts need a polkit authentication agent running in your user session; configure its autostart if needed. See /usr/local/share/doc/keysharp-desktop/docs/install.md."
 refresh_or_handoff_user_service true /usr/local/bin/keysharp-desktop

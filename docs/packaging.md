@@ -104,6 +104,15 @@ partial, package-managed, or differently rooted installation. Compatibility
 reuse requires the ABI library and development metadata plus every service,
 policy, provider, and root-only worker resource.
 
+Polkit's system authority and its session authentication agent are separate
+dependencies. Both Debian build paths recommend `mate-polkit | polkit-1-auth-agent`.
+Source and archive installers print a session-agent reminder; agent selection
+and autostart belong to the desktop or user session. See [installation](install.md#authentication-prompts).
+
+The NixOS module enables the polkit authority and leaves the authentication agent
+to the graphical session. A minimal session must configure an agent and its
+autostart separately.
+
 The standalone uninstaller removes only this project's manifest and its unchanged
 `/usr/local/lib` linker registration, then refreshes the cache. It preserves custom
 or modified linker configuration. It retains

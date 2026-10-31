@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "provider.h"
 #include "protocol_io.h"
+#include "install_mode.h"
 
 #include "capture_worker.h"
 #include "x11_worker.h"
@@ -32,6 +33,8 @@ bool ksd_authority_test_backend_matches(uint32_t backend, pid_t pid);
 bool ksd_session_is_x11_process(pid_t pid);
 bool ksd_authority_test_scope_cache(ksp_store *store);
 bool ksd_authority_test_authorization_race(ksp_store *store);
+bool ksd_authority_test_authorization(ksp_store *store, int descriptor,
+                                      const ksd_frame *request);
 bool ksd_authority_test_display_lanes(void);
 bool ksd_authority_test_state_model(void);
 bool ksd_authority_test_state_watch_request(void);
@@ -211,6 +214,77 @@ static const uint8_t public_magic[4] = {
     KSD_FRAME_MAGIC_2, KSD_FRAME_MAGIC_3,
 };
 
+static ksp_polkit_result polkit_result;
+static unsigned polkit_calls;
+
+bool ksd_test_install_is_system(void) { return true; }
+
+ksp_polkit_result ksd_test_polkit_authorize(const ksp_polkit_config *config,
+    const ksp_identity *identity, uint32_t scopes, ksp_cancel_fn cancelled,
+    void *user_data)
+{
+    (void)config; (void)identity; (void)scopes; (void)cancelled; (void)user_data;
+    polkit_calls++;
+    return polkit_result;
+}
+
+static void check_authorization_diagnostics(ksp_store *store)
+{
+    static const struct {
+        ksp_polkit_result result;
+        uint32_t status;
+        const char *message;
+        bool check_only;
+    } cases[] = {
+        { KSP_POLKIT_NO_AGENT, KSD_STATUS_UNAVAILABLE,
+          "No polkit authentication agent is available for this session. "
+          "Install and start your desktop authentication agent, then retry.", false },
+        { KSP_POLKIT_DENIED, KSD_STATUS_DENIED, "permission is not granted", false },
+        { KSP_POLKIT_CANCELLED, KSD_STATUS_CANCELLED, "authorization was cancelled", false },
+        { KSP_POLKIT_IDENTITY_CHANGED, KSD_STATUS_CANCELLED, "authorization was cancelled", false },
+        { KSP_POLKIT_UNAVAILABLE, KSD_STATUS_UNAVAILABLE, "authorization service unavailable", false },
+        { KSP_POLKIT_NO_AGENT, KSD_STATUS_DENIED, "permission is not granted", true },
+    };
+    const uint16_t opcodes[] = { KSD_OP_HELLO, KSD_OP_AUTHORIZE };
+    for (size_t path = 0u; path < sizeof(opcodes) / sizeof(opcodes[0]); path++) {
+        for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            int sockets[2];
+            assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+            struct timeval timeout = { .tv_sec = 1 };
+            assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+            uint8_t payload[16] = { 0 };
+            bool hello = opcodes[path] == KSD_OP_HELLO;
+            uint16_t mode = cases[i].check_only ? KSD_AUTH_CHECK : KSD_AUTH_REQUEST;
+            ksd_encode_u16(payload, hello ? KSD_ROLE_AUTHORIZATION_LEASE : mode);
+            if (hello) ksd_encode_u16(payload + 2u, mode);
+            ksd_encode_u32(payload + 4u, KSD_SCOPE_WINDOW_CONTROL);
+            ksd_frame request = { .major = KSD_PROTOCOL_MAJOR, .minor = KSD_PROTOCOL_MINOR,
+                .opcode = opcodes[path], .request_id = 1u, .payload = payload,
+                .payload_length = sizeof(payload) };
+            memcpy(request.magic, public_magic, sizeof(request.magic));
+            polkit_result = cases[i].result;
+            polkit_calls = 0u;
+            if (hello) assert(ksd_frame_write(sockets[1], &request));
+            assert(ksd_authority_test_authorization(store, sockets[0], &request) == !hello);
+            assert(polkit_calls == (cases[i].check_only ? 0u : 1u));
+            ksd_frame response;
+            assert(ksd_frame_read(sockets[1], public_magic, KSD_PROTOCOL_MAJOR,
+                KSD_PROTOCOL_MINOR, KSD_MAX_TEXT_BYTES, true, &response) == 1);
+            assert(response.opcode == request.opcode && response.request_id == request.request_id);
+            size_t length = strlen(cases[i].message);
+            assert(response.payload_length == 12u + length);
+            assert(ksd_decode_u32(response.payload) == cases[i].status);
+            assert(ksd_decode_u32(response.payload + 4u)
+                == (!cases[i].check_only && cases[i].result == KSP_POLKIT_NO_AGENT
+                    ? KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT : 0u));
+            assert(ksd_decode_u32(response.payload + 8u) == length);
+            assert(memcmp(response.payload + 12u, cases[i].message, length) == 0);
+            ksd_frame_clear(&response);
+            close(sockets[0]); close(sockets[1]);
+        }
+    }
+}
+
 static void *authority_thread(void *argument)
 {
     authority_arguments *arguments = argument;
@@ -231,8 +305,12 @@ static bool store_available(const char *persistent, const char *runtime)
     bool available = ksp_store_create(&store, &store_config) == 0
         && ksp_store_prepare(store) == 0;
     if (available) {
+        polkit_result = KSP_POLKIT_NO_AGENT;
+        polkit_calls = 0u;
         assert(ksd_authority_test_scope_cache(store));
+        assert(polkit_calls == 0u);
         assert(ksd_authority_test_authorization_race(store));
+        check_authorization_diagnostics(store);
     }
     ksp_store_destroy(store);
     return available;
