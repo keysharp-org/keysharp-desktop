@@ -8,8 +8,11 @@ const core = fs.readFileSync(path.join(root, 'providers/shared/provider-core.js'
 const callbacks = new Map();
 const ioErrors = {NOT_SUPPORTED: 15};
 let nextSource = 1;
+let now = 0;
+const windowTypes = {NORMAL: 0, DIALOG: 1, MODAL_DIALOG: 2, UTILITY: 3, MENU: 4};
 const Shell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({
     Gio: {IOErrorEnum: ioErrors},
+    Meta: {WindowType: windowTypes},
     GLib: {
         PRIORITY_DEFAULT: 0,
         SOURCE_REMOVE: false,
@@ -20,6 +23,7 @@ const Shell = new Function('env', core + '\nreturn KeysharpExtensionCore;')({
             return id;
         },
         source_remove(id) { callbacks.delete(id); },
+        get_monotonic_time: () => now * 1000,
     },
     windowExtras: () => ({values: {}, validFields: []}),
     setDecorated: () => null,
@@ -200,6 +204,9 @@ for (const backend of ['shell', 'kwin']) {
         move_resize_frame(_user, x, y, width, height) {
             calls.push('geometry'); geometry = {x, y, width, height};
         },
+        move_frame(_user, x, y) {
+            calls.push('position'); geometry = {...geometry, x, y};
+        },
         unmaximize() {
             calls.push('restore');
             this.maximized_horizontally = this.maximized_vertically = false;
@@ -221,6 +228,78 @@ for (const backend of ['shell', 'kwin']) {
     window.maximized = window.maximized_horizontally = window.maximized_vertically = true;
     assert.equal(move(75, -2147483648, 0, 0), true);
     assert.deepEqual(geometry, {x: 75, y: 60, width: 160, height: 80});
-    assert.deepEqual(calls, ['restore', 'geometry']);
+    assert.deepEqual(calls, ['restore', backend === 'shell' ? 'position' : 'geometry']);
+}
+
+const dialogs = Object.create(Shell.prototype);
+dialogs._placements = [];
+dialogs._placed = {};
+dialogs._placementSources = new Set();
+dialogs._clientPid = win => win.pid;
+let dialogFrame = {x: 25, y: 35, width: 200, height: 100};
+const dialog = {
+    pid: 123,
+    get_stable_sequence: () => 71,
+    get_monitor: () => 0,
+    get_frame_rect: () => dialogFrame,
+    get_compositor_private: () => null,
+    move_frame(_user, x, y) { dialogFrame = {...dialogFrame, x, y}; },
+    move_resize_frame() { assert.fail('Moving a fixed-size dialog must not resize it'); },
+};
+for (const type of [windowTypes.DIALOG, windowTypes.MODAL_DIALOG, windowTypes.UTILITY]) {
+    dialog.window_type = type;
+    assert.equal(dialogs._isTrackedWindow(dialog), true);
+    assert.equal(dialogs._moveResizeWin(dialog, 70 + type, -2147483648, 0, 0), true);
+    assert.deepEqual(dialogFrame, {x: 70 + type, y: 35, width: 200, height: 100});
+}
+assert.equal(dialogs._isTrackedWindow({window_type: windowTypes.MENU}), false);
+
+assert.equal(dialogs._reserveWindow(123, 1, 100, 110, 1000), true);
+dialogs._placeOnMap({...dialog, pid: 456});
+assert.equal(dialogs._getReservedWindow(123, 1), '');
+dialogs._placeOnMap(dialog);
+assert.equal(dialogs._getReservedWindow(456, 1), '');
+assert.equal(dialogs._getReservedWindow(123, 1), '71');
+assert.equal(dialogs._getReservedWindow(123, 1), '');
+const place = [...dialogs._placementSources][0];
+callbacks.get(place)();
+assert.deepEqual(dialogFrame, {x: 100, y: 110, width: 200, height: 100});
+
+dialog.is_attached_dialog = () => true;
+assert.equal(dialogs._moveResizeWin(dialog, 120, 130, 0, 0), null);
+assert.equal(dialogs._moveResizeWin(dialog, -2147483648, -2147483648, 0, 0), true);
+assert.equal(dialogs._reserveWindow(123, 2, 120, 130, 1000), true);
+dialogs._placeOnMap(dialog);
+const attached = [...dialogs._placementSources].at(-1);
+const sourcesBefore = dialogs._placementSources.size;
+callbacks.get(attached)();
+assert.equal(dialog.__ksPlaceNow, undefined);
+assert.equal(dialogs._placementSources.size, sourcesBefore - 1);
+assert.deepEqual(dialogFrame, {x: 100, y: 110, width: 200, height: 100});
+assert.equal(dialogs._getReservedWindow(123, 2), '71');
+assert.equal(dialogs._reserveWindow(123, 3, 120, 130, 1000), true);
+now = 1001;
+dialogs._placeOnMap(dialog);
+assert.equal(dialogs._getReservedWindow(123, 3), '');
+
+const kwinDialogs = ['normalWindow', 'dialog', 'utility'].map((kind, index) => ({
+    [kind]: true,
+    internalId: 'dialog-' + index,
+    caption: kind,
+    pid: 123,
+    maximized: false,
+    frameGeometry: {x: 25, y: 35, width: 200, height: 100},
+}));
+const excluded = ['dock', 'desktopWindow', 'splash', 'menu', 'dropdownMenu',
+    'popupMenu', 'popupWindow', 'tooltip', 'notification'].map(kind => ({[kind]: true}));
+kwin.api.windowList = () => kwinDialogs.concat(excluded);
+const listed = JSON.parse(kwin.executeJob({opcode: 0x2010, body: '1', sequence: '1'}).body);
+assert.deepEqual(listed.windows.map(win => win.title), ['normalWindow', 'dialog', 'utility']);
+const handles = JSON.parse(kwin.executeJob({opcode: 0x2013, body: '', sequence: '1'}).body);
+assert.equal(handles.handles.length, 3);
+for (const window of kwinDialogs) {
+    kwin.findWindow = () => window;
+    assert.equal(kwin.executeJob({opcode: 0x2025, body: '1 75 -2147483648 0 0', sequence: '1'}).status, 0);
+    assert.deepEqual({...window.frameGeometry}, {x: 75, y: 35, width: 200, height: 100});
 }
 console.log('Shell and KWin window-state tests passed.');

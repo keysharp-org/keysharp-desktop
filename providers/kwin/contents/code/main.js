@@ -440,8 +440,8 @@ function isOrdinary(window) {
     if (window.deleted)
         return false;
     return !(window.specialWindow || window.dock || window.desktopWindow
-        || window.splash || window.utility || window.dropdownMenu
-        || window.popupMenu || window.toolbar || window.tooltip
+        || window.splash || window.dropdownMenu || window.menu
+        || window.popupMenu || window.popupWindow || window.toolbar || window.tooltip
         || window.notification || window.onScreenDisplay);
 }
 

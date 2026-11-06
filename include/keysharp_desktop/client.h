@@ -556,6 +556,9 @@ KSD_API ksd_status ksd_window_set_decorated(ksd_connection *connection,
 KSD_API ksd_status ksd_window_set_skip_taskbar(ksd_connection *connection,
                                     uint64_t handle,
                                     uint32_t skip, ksd_error *error);
+/* GNOME/Cinnamon: correlate the next normal, dialog, or utility window created
+ * by this connection's process. Call before showing it; INT32_MIN preserves an
+ * axis. Attached modal dialogs retain their compositor-constrained position. */
 KSD_API ksd_status ksd_window_reserve(ksd_connection *connection,
                               uint64_t cookie,
                               int32_t x, int32_t y, uint32_t ttl_ms,

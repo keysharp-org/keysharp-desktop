@@ -156,6 +156,32 @@ synthetic X11 events. `ksd_window_focus_child` sets
 focus on a child window, while `ksd_window_focus` requests window-manager
 activation. These calls require WindowControl, including on X11.
 
+## Dialog positioning on Wayland
+
+GNOME, Cinnamon, and KWin expose normal windows, dialogs, and utility windows
+through the same list, query, and move operations. Menus and other popup surfaces
+remain compositor-managed. A position-only move preserves the dialog's current
+size; pass zero for width and height and `INT32_MIN` for an unchanged axis.
+
+On GNOME and Cinnamon, call `ksd_window_reserve` immediately before creating
+the native window. Reservations are consumed in creation order for the
+authenticated caller's process, including dialogs; serialize creation when using
+them. Supply a unique nonzero cookie and a short lifetime in milliseconds.
+`ksd_window_get_reserved` returns `KSD_STATUS_NOT_FOUND` until the window appears
+or after expiry, and consumes a successful lookup. Both calls require WindowControl.
+They neither match a title nor claim dialogs created by another process, such as
+a desktop file-chooser portal. KWin does not provide reservations; identify the
+mapped dialog through the window list before moving it. Check the corresponding
+operation bits on other compositors.
+
+GNOME and Cinnamon can attach a modal dialog to its transient parent. Such a
+dialog remains centered on that parent: an independent position change returns
+`KSD_STATUS_UNSUPPORTED`, and a reservation still correlates it but does not
+override its placement. Applications needing independent dialog coordinates
+should create a dialog without transient ownership. The service does not change
+the desktop's attachment preference or move the parent to compensate. See
+[Mutter's attached-dialog contract](https://mutter.gnome.org/meta/method.Window.is_attached_dialog.html).
+
 ## Generic Wayland compositors
 
 `ksd_window_set_state` accepts `KSD_WINDOW_STATE_NORMAL` (0),

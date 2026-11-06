@@ -1806,13 +1806,17 @@ class KeysharpExtensionCore {
         if (nx === frame.x && ny === frame.y && nw === frame.width && nh === frame.height)
             return true;
 
-        // move_resize_frame is the single Mutter call for both move and resize;
-        // win.resize() does not exist as a standalone public API in Mutter/GJS.
-        // user_op = true marks this a user action, so Mutter applies the looser "keep-minimal on
-        // screen" constraint of an interactive drag (allowing off-screen placement) instead of the
-        // strict fully-on-screen clamp it forces on app ConfigureRequests. It does not steal focus.
+        // Attached dialogs are constrained to their parent's center even for user operations.
+        if ((nx !== frame.x || ny !== frame.y) && win.is_attached_dialog?.())
+            return null;
+
+        // A position-only request must not negotiate a new size with a fixed-size dialog.
+        // user_op allows the same off-screen placement as an interactive drag, without taking focus.
         try {
-            win.move_resize_frame(true, nx, ny, nw, nh);
+            if (nw === frame.width && nh === frame.height)
+                win.move_frame(true, nx, ny);
+            else
+                win.move_resize_frame(true, nx, ny, nw, nh);
             return true;
         } catch (_e) {
             return false;
@@ -1996,6 +2000,11 @@ class KeysharpExtensionCore {
         const attempt = () => {
             try {
                 if (--left <= 0) {
+                    delete win.__ksPlaceNow;
+                    return;
+                }
+
+                if (win.is_attached_dialog?.()) {
                     delete win.__ksPlaceNow;
                     return;
                 }
