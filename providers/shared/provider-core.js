@@ -2192,6 +2192,12 @@ class KeysharpExtensionCore {
             actor.connect('notify::visible', () =>
                 this._emitWindowEvent(actor.visible ? 'show' : 'hide', win)),
             actor.connect('notify::opacity', () => this._emitWindowEvent('changed', win)),
+            // Without a close animation the compositor destroys the actor before the window's 'unmanaged',
+            // and disposal already dropped its handlers; disconnecting them afterwards only logs errors.
+            actor.connect('destroy', () => {
+                win._keysharpVisibleActor = null;
+                win._keysharpActorSignalIds = [];
+            }),
         ];
     }
 
