@@ -1798,7 +1798,6 @@ static bool handle_authorize(authority_session *session,
     uint32_t detail = 0u;
     uint32_t status = authorize_scopes(session, scopes, mode, &granted, &detail);
     if (!complete_authorization(session, scopes, &status)) return false;
-    if (status != KSD_STATUS_UNAVAILABLE) detail = 0u;
     granted = session->granted_scopes;
     if (status != KSD_STATUS_OK)
         return forward_response(session, request, status, detail,
@@ -2795,7 +2794,6 @@ static bool start_public_session(authority_session *session)
         replied = forward_response(session, &hello, KSD_STATUS_OK, 0u,
                                    NULL, tail, sizeof(tail), false);
     } else {
-        if (status != KSD_STATUS_UNAVAILABLE) detail = 0u;
         replied = forward_response(session, &hello, status, detail,
                                    detail == KSD_ERROR_DETAIL_NO_AUTHENTICATION_AGENT
                                        ? no_authentication_agent : status_diagnostic(status),

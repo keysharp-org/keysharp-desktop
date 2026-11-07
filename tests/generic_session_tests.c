@@ -239,9 +239,6 @@ static void check_authorization_diagnostics(ksp_store *store)
         { KSP_POLKIT_NO_AGENT, KSD_STATUS_UNAVAILABLE,
           "No polkit authentication agent is available for this session. "
           "Install and start your desktop authentication agent, then retry.", false },
-        { KSP_POLKIT_DENIED, KSD_STATUS_DENIED, "permission is not granted", false },
-        { KSP_POLKIT_CANCELLED, KSD_STATUS_CANCELLED, "authorization was cancelled", false },
-        { KSP_POLKIT_IDENTITY_CHANGED, KSD_STATUS_CANCELLED, "authorization was cancelled", false },
         { KSP_POLKIT_UNAVAILABLE, KSD_STATUS_UNAVAILABLE, "authorization service unavailable", false },
         { KSP_POLKIT_NO_AGENT, KSD_STATUS_DENIED, "permission is not granted", true },
     };

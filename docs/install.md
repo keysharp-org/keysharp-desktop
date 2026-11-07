@@ -78,21 +78,11 @@ the helper briefly retries while the graphical session starts. Its
 
 ## Authentication prompts
 
-Graphical system permission prompts need a polkit authentication agent running
-in the requesting user's session. Installing `polkitd` alone does not provide a
-password dialog.
-
-Debian packages recommend `mate-polkit | polkit-1-auth-agent`, so an installed
-desktop provider satisfies the recommendation. With `--no-install-recommends`,
-or a source/archive installation, install an agent through your package manager
-if your desktop does not already provide one.
-
-Configure the agent to start as your graphical user with the session, or log out
-and back in if your desktop manages its autostart. Reuse your desktop's existing
-agent. Installing an agent does not prove it is running; existing grants can be
-used without one, but new grants may need its authentication prompt.
-When polkit reports a missing agent, authorization returns an unavailable error
-asking you to install and start the agent, then retry.
+Permission prompts need a polkit authentication agent running in the user's
+graphical session; `polkitd` alone shows no dialog. Debian packages recommend
+`mate-polkit | polkit-1-auth-agent`. Otherwise use your desktop's agent, or
+install one and start it with the session. Existing grants work without an
+agent; a new request without one fails with an error saying so.
 
 ## Check and repair
 

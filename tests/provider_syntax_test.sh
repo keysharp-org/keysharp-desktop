@@ -28,7 +28,7 @@ for provider in gnome cinnamon kwin; do
 
     # Script mode must reject module-only constructs that Cinnamon and KWin
     # cannot load; GNOME's extension uses ES modules.
-    if grep -qE '^[[:space:]]*(import|export)[[:space:]]' "$file"; then
+    if [ "$provider" = gnome ]; then
         mode=module
     else
         mode=script

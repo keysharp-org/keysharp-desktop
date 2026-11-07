@@ -212,17 +212,15 @@ enabled after startup.
 
 ## Forward compatibility
 
-From `ksd_client_abi_minor() >= 2` the library accepts a service whose
-vocabulary is newer than its own. Framing stays strict in both directions:
-reserved fields, trailing bytes, unknown flags, and a malformed tail all fail
-closed and invalidate the connection. Enumerated values do not:
+The library accepts a service whose vocabulary is newer than its own. Framing
+stays strict in both directions: reserved fields, trailing bytes, unknown flags,
+and a malformed tail all fail closed and invalidate the connection. Enumerated
+values do not:
 
 - `service.backend` may hold a value this header does not name. It is
   delivered verbatim, is never `KSD_BACKEND_NONE` in that case, and
   `ksd_backend_name` reports it as `unknown`. Never infer support from the
   backend value; read `available_operations`, which the service computes.
-  `KSD_BACKEND_GENERIC` is named from `ksd_client_abi_minor() >= 3`; an older
-  library reports that same session as `unknown` with the same operation mask.
 - `available_operations` may carry bits this header does not name. They are
   delivered verbatim and match no `KSD_OPERATION_*` test.
 - `service.granted_scopes` and the mask from `ksd_authorize` are narrowed to
@@ -260,16 +258,6 @@ unknown status or malformed result invalidates the connection.
 
 Use separate connections for concurrency. Watch timeouts are 1 through 60000
 milliseconds. Finite lease timeouts make shutdown straightforward.
-
-A caller that only needs its grants at the moment it acts does not have to
-wait on the lease at all. `ksd_lease_refresh`, from `ksd_client_abi_minor() >= 9`,
-applies the revocations that have already arrived and reports the scopes the
-lease still holds, without waiting. It can be called from any thread, including
-while another thread is asking for more scopes on the same lease with
-`ksd_authorize`: that request applies any revocation that arrives before its
-answer, so the refresh reports the grants as they stand instead of waiting for
-it. A lease the service has ended is reported as a failure, after which the
-connection is closed.
 
 One connection carries one request at a time, and the service answers each on
 that connection's own thread. A capture holds its thread for as long as the

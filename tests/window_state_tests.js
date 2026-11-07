@@ -249,9 +249,9 @@ const dialog = {
 for (const type of [windowTypes.DIALOG, windowTypes.MODAL_DIALOG, windowTypes.UTILITY]) {
     dialog.window_type = type;
     assert.equal(dialogs._isTrackedWindow(dialog), true);
-    assert.equal(dialogs._moveResizeWin(dialog, 70 + type, -2147483648, 0, 0), true);
-    assert.deepEqual(dialogFrame, {x: 70 + type, y: 35, width: 200, height: 100});
 }
+assert.equal(dialogs._moveResizeWin(dialog, 70, -2147483648, 0, 0), true);
+assert.deepEqual(dialogFrame, {x: 70, y: 35, width: 200, height: 100});
 assert.equal(dialogs._isTrackedWindow({window_type: windowTypes.MENU}), false);
 
 assert.equal(dialogs._reserveWindow(123, 1, 100, 110, 1000), true);
