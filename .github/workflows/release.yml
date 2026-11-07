@@ -69,8 +69,8 @@ jobs:
             echo "Checked-out source does not match refs/tags/$RELEASE_TAG." >&2
             exit 1
           fi
-          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "1fa566406087483c92b059d11d5657cfe3d5ed18" \
-             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "1fa566406087483c92b059d11d5657cfe3d5ed18" ]]; then
+          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "151f9e81ff406aca75b16d8ee578836bee2968e1" \
+             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "151f9e81ff406aca75b16d8ee578836bee2968e1" ]]; then
             echo "keysharp-permissions submodule is not at the reviewed pin." >&2
             exit 1
           fi

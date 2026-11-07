@@ -271,7 +271,7 @@ foreach(required
 endforeach()
 foreach(workflow_source ci_workflow release_workflow)
     foreach(required
-            "1fa566406087483c92b059d11d5657cfe3d5ed18"
+            "151f9e81ff406aca75b16d8ee578836bee2968e1"
             "git rev-parse HEAD:third_party/keysharp-permissions"
             "libkeysharp-desktop.so.1")
         string(FIND "${${workflow_source}}" "${required}" found)
@@ -282,7 +282,7 @@ foreach(workflow_source ci_workflow release_workflow)
 endforeach()
 foreach(required
         "inputs.keysharp-permissions"
-        "1fa566406087483c92b059d11d5657cfe3d5ed18"
+        "151f9e81ff406aca75b16d8ee578836bee2968e1"
         "flake = false")
     file(READ "${SOURCE_DIR}/flake.nix" flake_source)
     string(FIND "${flake_source}" "${required}" found)
