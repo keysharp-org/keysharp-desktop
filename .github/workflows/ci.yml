@@ -37,14 +37,14 @@ jobs:
 
       - name: Verify permission dependency pin
         run: |
-          test "$(git rev-parse HEAD:third_party/keysharp-permissions)" = 151f9e81ff406aca75b16d8ee578836bee2968e1
-          test "$(git -C third_party/keysharp-permissions rev-parse HEAD)" = 151f9e81ff406aca75b16d8ee578836bee2968e1
+          test "$(git rev-parse HEAD:third_party/keysharp-permissions)" = d1a0a3024730d3a92d24555d0286928974e0a812
+          test "$(git -C third_party/keysharp-permissions rev-parse HEAD)" = d1a0a3024730d3a92d24555d0286928974e0a812
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            cmake gcc pkg-config polkitd shellcheck xvfb \
+            cmake gcc pkg-config polkitd shellcheck xvfb libssl-dev \
             libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-composite0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
             libwayland-dev libwayland-bin wayland-protocols

@@ -5,6 +5,7 @@
   pkg-config,
   dbus,
   glib,
+  openssl,
   polkit,
   libxcb,
   libxkbcommon,
@@ -34,6 +35,7 @@ stdenv.mkDerivation {
   # as glib. libxcb carries both the xcb and xcb-shm pkg-config files.
   buildInputs = [
     glib
+    openssl
     libxcb
     libxkbcommon
     wayland

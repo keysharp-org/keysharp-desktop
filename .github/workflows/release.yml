@@ -69,8 +69,8 @@ jobs:
             echo "Checked-out source does not match refs/tags/$RELEASE_TAG." >&2
             exit 1
           fi
-          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "151f9e81ff406aca75b16d8ee578836bee2968e1" \
-             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "151f9e81ff406aca75b16d8ee578836bee2968e1" ]]; then
+          if [[ "$(git rev-parse HEAD:third_party/keysharp-permissions)" != "d1a0a3024730d3a92d24555d0286928974e0a812" \
+             || "$(git -C third_party/keysharp-permissions rev-parse HEAD)" != "d1a0a3024730d3a92d24555d0286928974e0a812" ]]; then
             echo "keysharp-permissions submodule is not at the reviewed pin." >&2
             exit 1
           fi
@@ -144,7 +144,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             cmake gcc pkg-config polkitd xvfb \
-            libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-composite0-dev \
+            libglib2.0-dev libssl-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-composite0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev \
             libwayland-dev libwayland-bin wayland-protocols
 
@@ -160,6 +160,7 @@ jobs:
           cmake -S . -B build-portable \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DBUILD_TESTING=ON \
             -DKEYSHARP_DESKTOP_WAYLAND_PROTOCOL_DIR="$RUNNER_TEMP/wayland-protocols"
           cmake --build build-portable --parallel
@@ -195,6 +196,10 @@ jobs:
           archive_root="dist/${archive_name}"
           mkdir -p "$archive_root/payload"
           cp -a "$STAGE/usr" "$archive_root/payload/usr"
+          install -Dm 0644 /usr/share/doc/libssl-dev/copyright \
+            "$archive_root/payload/usr/local/share/doc/keysharp-desktop/OpenSSL.copyright"
+          install -m 0644 /usr/share/common-licenses/Apache-2.0 \
+            "$archive_root/payload/usr/local/share/doc/keysharp-desktop/Apache-2.0"
           install -m 0755 packaging/install-release.sh "$archive_root/install.sh"
           install -m 0755 packaging/check-runtime.sh "$archive_root/check-runtime.sh"
           install -m 0755 packaging/configure-library-path.sh "$archive_root/configure-library-path.sh"

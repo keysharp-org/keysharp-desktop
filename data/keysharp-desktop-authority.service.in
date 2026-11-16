@@ -16,5 +16,5 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/keysharp-permissions /run/keysharp-desktop /run/keysharp-permissions
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_ALG
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 LockPersonality=true

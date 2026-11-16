@@ -30,7 +30,7 @@ sudo ./install.sh
 The archive installer checks runtime dependencies before copying files. If needed,
 it installs them through apt, dnf, zypper or pacman. They are GLib, XCB (including
 SHM, RandR, Shape, XKB and Composite), xkbcommon and xkbcommon-x11, Wayland,
-polkit and systemd.
+polkit and systemd. The archive binaries include OpenSSL libcrypto.
 A running systemd system manager is required. `./check-runtime.sh` checks without
 changing anything; `sudo ./check-runtime.sh --install` installs missing dependencies.
 Other distributions must supply them through their package manager. Archives target
@@ -138,7 +138,7 @@ Revoke unwanted grants with `keysharp-desktop permissions revoke` before removal
 ```sh
 git clone --recurse-submodules https://github.com/keysharp-org/keysharp-desktop
 cd keysharp-desktop
-sudo apt install cmake make gcc pkg-config polkitd libglib2.0-dev \
+sudo apt install cmake make gcc pkg-config polkitd libglib2.0-dev libssl-dev \
   libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-composite0-dev \
   libxkbcommon-dev libxkbcommon-x11-dev libxcb-xkb-dev libwayland-dev libwayland-bin wayland-protocols
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

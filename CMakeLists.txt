@@ -757,7 +757,8 @@ if(BUILD_TESTING)
         src/provider.c)
     target_include_directories(generic-session-tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${KEYSHARP_PERMISSIONS_SOURCE_DIR}/tests)
     target_compile_definitions(generic-session-tests PRIVATE
         KSD_AUTHORITY_TESTING KSD_PKCHECK_PATH="${KSD_PKCHECK_PATH}"
         ksp_polkit_authorize=ksd_test_polkit_authorize

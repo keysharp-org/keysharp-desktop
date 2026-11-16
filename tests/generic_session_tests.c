@@ -4,6 +4,7 @@
 #include "provider.h"
 #include "protocol_io.h"
 #include "install_mode.h"
+#include "deny_af_alg.h"
 
 #include "capture_worker.h"
 #include "x11_worker.h"
@@ -504,6 +505,7 @@ static void check_worker_admits_each_backend(void)
 
 int main(void)
 {
+    assert(ksp_test_deny_af_alg() == 0);
     char root[1024];
     char persistent[1024];
     char runtime[1024];

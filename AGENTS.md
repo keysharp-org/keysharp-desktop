@@ -72,9 +72,9 @@ tests/                      # ctest sources and policy checks
 
 ## Build and test
 
-Needs CMake 3.20+, a C11 compiler, and GLib (`gio-2.0`, `gio-unix-2.0`); polkit is
-needed at run time for authorization prompts. Clone recursively for the
-`keysharp-permissions` submodule.
+Needs CMake 3.20+, a C11 compiler, GLib (`gio-2.0`, `gio-unix-2.0`), and OpenSSL
+libcrypto development files. Polkit is needed at run time for authorization prompts.
+Clone recursively for the `keysharp-permissions` submodule.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

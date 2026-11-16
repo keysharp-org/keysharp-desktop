@@ -465,7 +465,7 @@ endif()
 file(READ "${SOURCE_DIR}/data/keysharp-desktop-authority.service.in" unit)
 foreach(required
         "User=root"
-        "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_ALG"
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK"
         "ReadWritePaths=/var/lib/keysharp-permissions")
     string(FIND "${unit}" "${required}" position)
     if(position EQUAL -1)

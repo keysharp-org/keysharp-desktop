@@ -77,7 +77,6 @@ in
         RestrictAddressFamilies = [
           "AF_UNIX"
           "AF_NETLINK"
-          "AF_ALG"
         ];
         LockPersonality = true;
       };
